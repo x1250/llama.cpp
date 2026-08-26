@@ -4227,11 +4227,6 @@ static bool ggml_vk_fa_type_needs_shmem(ggml_type type) {
     switch (type) {
     case GGML_TYPE_IQ4_NL:
         return true;
-    case GGML_TYPE_Q4_0_ROCMFP4:
-    case GGML_TYPE_Q6_0_ROCMFPX:
-    case GGML_TYPE_Q3_0_ROCMFPX:
-        // codebook and/or the UE4M3 scale table
-        return true;
     default:
         return false;
     }
@@ -18707,14 +18702,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_IQ4_NL:
                         return true;
-                    case GGML_TYPE_Q4_0_ROCMFP4:
-                    case GGML_TYPE_Q6_0_ROCMFPX:
-                    case GGML_TYPE_Q3_0_ROCMFPX:
-                        // decode lives in flash_attn_dequant.glsl, which only the
-                        // scalar and coopmat1 shaders include. coopmat2 has its own
-                        // buffer_reference decode path that is not wired up for the
-                        // ROCmFPx types yet, and would silently return zeros.
-                        return !coopmat2;
                     default:
                         return false;
                     }
