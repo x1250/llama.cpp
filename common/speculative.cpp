@@ -1172,6 +1172,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        auto * mem_dft = llama_get_memory(ctx_dft);
+
+        // whether each sequence was already seeded within the current chunk
+        std::vector<bool>      sync_checked(n_seq);
+        // next free position on each sequence's continuous draft stream
+        std::vector<llama_pos> next_stream_pos(n_seq);
+
         // Flatten token-wise encoder work into shared chunks while preserving each row's position and sequence.
         for (int32_t offset = 0; offset < n_tokens; offset += n_ubatch) {
             const int32_t n_chunk = std::min(n_ubatch, n_tokens - offset);
@@ -1208,17 +1215,37 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
             GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
+            // The input-position validator rejects any decode whose batch is not
+            // exactly consecutive with the cache tail (dup from replays, gaps
+            // between the generic prefill path and the mtmd path). Write each
+            // row onto the sequence's own continuous stream instead: healthy
+            // prefills are already consecutive and keep their original
+            // positions bit-for-bit, while anomalous input gets packed flush
+            // onto the cache tail instead of killing the request.
             batch_inject.n_tokens = n_chunk;
             std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+            std::fill(sync_checked.begin(), sync_checked.end(), false);
+            llama_pos n_remapped = 0;
             for (int32_t i = 0; i < n_chunk; ++i) {
                 const int32_t j = offset + i;
                 GGML_ASSERT(batch_in.n_seq_id[j] == 1);
                 const llama_seq_id seq_id = batch_in.seq_id[j][0];
                 GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
-                batch_inject.pos[i]       = batch_in.pos[j];
+                if (!sync_checked[seq_id]) {
+                    sync_checked[seq_id]    = true;
+                    next_stream_pos[seq_id] = llama_memory_seq_pos_max(mem_dft, seq_id) + 1;
+                }
+                const llama_pos src = batch_in.pos[j];
+                const llama_pos dst = next_stream_pos[seq_id]++;
+                batch_inject.pos[i]       = dst;
                 batch_inject.n_seq_id[i]  = 1;
                 batch_inject.seq_id[i][0] = seq_id;
                 batch_inject.logits[i]    = false;
+                n_remapped += dst != src;
+            }
+            if (n_remapped > 0) {
+                LOG_WRN("%s: repacked %lld draft inject rows out of sync with the draft stream\n",
+                        __func__, (long long) n_remapped);
             }
 
             rc = llama_decode(ctx_dft, batch_inject);
@@ -1252,7 +1279,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             common_sampler_reset(smpls[seq_id].get());
 
-            const int32_t n = (int32_t) dp.n_past;
+            // Pack the noise block flush onto the draft stream. When the cache
+            // is aligned with the target this lands exactly on n and the block
+            // is placed as before; if anything drifted, packing keeps the
+            // decode alive instead of writing over occupied positions.
+            const llama_pos block_base = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id) + 1;
 
             // DFlash decodes the whole block in one pass, so a shorter block does
             // not save draft time -- but it does shrink the target's verification
@@ -1263,7 +1294,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2);
+                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, block_base + i, { seq_id }, !is_dflash2);
             }
         }
 
