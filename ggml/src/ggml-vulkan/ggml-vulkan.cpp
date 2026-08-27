@@ -4868,6 +4868,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             w = t;
         };
 
+        // The mmid quant pipelines share the dense warptile_mmq tiles. Shadow them BEFORE the
+        // dense retile: DENSE_WAVE32 pins the dense pipelines to subgroup 32, and a copy taken
+        // after the retile would hand mul_mat_id WARP-32 tiles with no pin, so the driver's
+        // default subgroup size no longer matches the shader's WARP and every MoE matmul reads
+        // garbage.
+        auto l_warptile_mmq_id = l_warptile_mmq;
+        auto m_warptile_mmq_id = m_warptile_mmq;
+        auto s_warptile_mmq_id = s_warptile_mmq;
+
         if (dense_wave32_active) {
             retile(l_warptile_mmq, 10, 32);
             retile(m_warptile_mmq, 10, 32);
@@ -4975,11 +4984,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         GGML_ASSERT(device->subgroup_ballot);
 
-        // The mmid quant pipelines share the dense warptile_mmq tiles. Shadow them so the
-        // MoE knobs can move the mul_mat_id tiles without touching dense.
-        auto l_warptile_mmq_id = l_warptile_mmq;
-        auto m_warptile_mmq_id = m_warptile_mmq;
-        auto s_warptile_mmq_id = s_warptile_mmq;
+        // The mmid quant pipelines use the shadowed tiles; the MoE knobs below can move
+        // mul_mat_id without touching dense.
         uint32_t mmid_req_sgs = 0;
         {
             // GGML_VK_MMID_WG256=1: the dense large tile runs 256 threads on its 128x128 tile but
