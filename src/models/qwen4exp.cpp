@@ -548,10 +548,6 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             n_embd, hc, n_tokens, 1);
     cb(res_hc, "hc_init", -1);
 
-    // per-token residual of the final layer, before the out-ids filter drops rows:
-    // this is what an MTP head consumes (t_h_nextn contract: one row per token)
-    ggml_tensor * res_hc_all = nullptr;
-
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = res_hc;
 
@@ -575,9 +571,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
-            // everything below is per token, so drop the rows that produce no output
-            res_hc_all = res_hc;
+        if (il == n_layer - 1 && inp_out_ids &&
+                (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
+            // everything below is per token, so drop the rows that produce no output. An
+            // unmasked MTP hand-over needs every position of the completed trunk, so in that
+            // case the last layer runs uncropped and the rows are gathered after the hand-over
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
 
@@ -604,13 +602,22 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         cb(res_hc, "l_last", il);
     }
 
-    // Hand the wide residual to an MTP head, before the final mix collapses it. The draft
-    // reads all hc streams, which is what its hnorm is sized for. The per-token snapshot
-    // taken before the out-ids filter is what the readback expects: one row per token.
-    // It is passed as is rather than reshaped: a bare view is not a node the scheduler
-    // places, and the extraction is a flat copy, for which [n_embd, hc, T] and
-    // [hc*n_embd, T] are identical.
-    res->t_h_nextn = res_hc_all ? res_hc_all : res_hc;
+    // Hand the wide residual to an MTP head once the last layer has folded its attention and
+    // FFN into it: the head was trained on the trunk's final residual, not on the last layer's
+    // input. The final mix below is the output norm of the LM head, so capture before it. An
+    // unmasked request wants every position, so the last layer ran uncropped above and the
+    // rows for the final mix are gathered only after this hand-over. It is passed as is: the
+    // extraction is a flat copy, for which [n_embd, hc, T] and [hc*n_embd, T] are identical.
+    if (cparams.embeddings_nextn) {
+        res->t_h_nextn = res_hc;
+        cb(res->t_h_nextn, "h_nextn", -1);
+
+        if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+            res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
+            res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
+        }
+    }
 
     // the final mixer is the output norm: there is no separate one
     ggml_tensor * cur = build_hc_mix(res_hc,
