@@ -546,7 +546,7 @@ void server_tokens::insert(const llama_tokens & inp_tokens) {
 }
 
 const llama_tokens & server_tokens::get_tokens() const {
-    GGML_ASSERT(!has_mtmd);
+    GGML_ASSERT(!has_media()); // the plain token array is the full truth only without media chunks
     return tokens;
 }
 
@@ -629,7 +629,7 @@ llama_tokens server_tokens::get_text_tokens() const {
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {
-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    GGML_ASSERT(!has_media()); // token positions only map 1:1 without media chunks
     tokens[pos] = id;
 }
 
