@@ -491,6 +491,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             n_embd, hc, n_tokens, 1);
     cb(res_hc, "hc_init", -1);
 
+    // per-token residual of the final layer, before the out-ids filter drops rows:
+    // this is what an MTP head consumes (t_h_nextn contract: one row per token)
+    ggml_tensor * res_hc_all = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = res_hc;
 
@@ -516,6 +520,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         if (il == n_layer - 1 && inp_out_ids) {
             // everything below is per token, so drop the rows that produce no output
+            res_hc_all = res_hc;
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
 
@@ -543,10 +548,12 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     // Hand the wide residual to an MTP head, before the final mix collapses it. The draft
-    // reads all hc streams, which is what its hnorm is sized for. res_hc is passed as is
-    // rather than reshaped: a bare view is not a node the scheduler places, and the
-    // extraction is a flat copy, for which [n_embd, hc, T] and [hc*n_embd, T] are identical.
-    res->t_h_nextn = res_hc;
+    // reads all hc streams, which is what its hnorm is sized for. The per-token snapshot
+    // taken before the out-ids filter is what the readback expects: one row per token.
+    // It is passed as is rather than reshaped: a bare view is not a node the scheduler
+    // places, and the extraction is a flat copy, for which [n_embd, hc, T] and
+    // [hc*n_embd, T] are identical.
+    res->t_h_nextn = res_hc_all ? res_hc_all : res_hc;
 
     // the final mixer is the output norm: there is no separate one
     ggml_tensor * cur = build_hc_mix(res_hc,
