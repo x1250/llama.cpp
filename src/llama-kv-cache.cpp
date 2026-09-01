@@ -575,7 +575,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+    GGML_ASSERT(hparams.can_shift_scalar_pos() && "seq_add() is only supported when a scalar position shift is exact");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -605,6 +605,11 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
 
         if (cells.seq_has(i, seq_id)) {
+            // multimodal cells carry 2D positions; a scalar shift cannot rotate their keys
+            if (hparams.n_pos_per_embd() > 1 && cells.ext_get(i).tok == LLAMA_TOKEN_NULL) {
+                GGML_ABORT("seq_add() cannot shift multimodal cells");
+            }
+
             if (cells.pos_add(i, shift)) {
                 if (new_head == cells.size()) {
                     new_head = i;
@@ -625,7 +630,7 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
+    GGML_ASSERT(hparams.can_shift_scalar_pos() && "seq_div() is only supported when a scalar position shift is exact");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
 
@@ -652,6 +657,11 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         }
 
         if (cells.seq_has(i, seq_id)) {
+            // multimodal cells carry 2D positions; a scalar shift cannot rotate their keys
+            if (hparams.n_pos_per_embd() > 1 && cells.ext_get(i).tok == LLAMA_TOKEN_NULL) {
+                GGML_ABORT("seq_div() cannot shift multimodal cells");
+            }
+
             cells.pos_div(i, d);
         }
     }
@@ -1191,7 +1201,7 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
-    if (hparams.n_pos_per_embd() > 1) {
+    if (!hparams.can_shift_scalar_pos()) {
         return false;
     }
     return true;

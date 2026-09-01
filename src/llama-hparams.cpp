@@ -261,6 +261,12 @@ uint32_t llama_hparams::n_pos_per_embd() const {
     return rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? 4 : 1;
 }
 
+bool llama_hparams::can_shift_scalar_pos() const {
+    // text tokens fill the M-RoPE positions as (t, t, t, 0), so when the 4th section has no
+    // dims, every section with dims moves by the same delta and a scalar K-shift stays exact
+    return n_pos_per_embd() == 1 || rope_sections[3] == 0;
+}
+
 bool llama_hparams::is_swa(uint32_t il) const {
     if (il < n_layer_all) {
         return is_swa_impl[il];

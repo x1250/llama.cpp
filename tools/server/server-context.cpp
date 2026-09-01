@@ -1171,15 +1171,8 @@ private:
             init_opt.video_params.ffmpeg_bin_dir = params_base.video_ffmpeg_bin_dir.empty()
                                 ? nullptr : params_base.video_ffmpeg_bin_dir.c_str();
 
-            if (params_base.ctx_shift) {
-                params_base.ctx_shift = false;
-                SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
-            }
-
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
-            }
+            // note: ctx_shift and cache_reuse stay allowed with multimodal, but each operation
+            // checks the slot tokens for media chunks and skips itself when it finds any
         }
 
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
@@ -2892,10 +2885,11 @@ private:
                     return;
                 }
 
-                if (mctx) {
-                    // we should never reach this because params_base.ctx_shift is automatically disabled if mmproj is loaded
-                    // we don't support ctx_shift because an image chunk may contains multiple tokens
-                    GGML_ABORT("not supported by multimodal");
+                // media chunks span several tokens per position, so the slot tokens cannot be rebuilt after a shift
+                if (slot.prompt.tokens.has_media()) {
+                    send_error(slot, "context shift is not supported for prompts with media", ERROR_TYPE_SERVER);
+                    slot.release();
+                    return;
                 }
 
                 if (slot.task->is_parent() || slot.task->is_child()) {
@@ -2927,7 +2921,7 @@ private:
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
                 {
-                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                    GGML_ASSERT(!slot.prompt.tokens.has_media());
 
                     llama_tokens new_tokens = slot.prompt.tokens.get_tokens(); // copy
                     for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
@@ -3201,7 +3195,8 @@ private:
 
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_media() &&
+                                    !input_tokens.has_media();
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -3209,15 +3204,10 @@ private:
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
                                 if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                                    GGML_ASSERT(!slot.prompt.tokens.has_media());
 
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
-
-                                    if (mctx) {
-                                        // we should never reach this
-                                        GGML_ABORT("not supported by multimodal");
-                                    }
 
                                     SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
 

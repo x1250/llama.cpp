@@ -178,6 +178,9 @@ public:
     // for debugging
     std::string str() const;
 
+    // true when the tokens contain at least one media chunk (has_mtmd only says the context supports media)
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     // the next position after n_tokens. if n_tokens < 0, return the next position after all tokens.
     llama_pos pos_next(int64_t n_tokens = -1) const;
 

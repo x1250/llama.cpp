@@ -421,6 +421,9 @@ struct llama_hparams {
 
     uint32_t n_pos_per_embd() const;
 
+    // true when a scalar position shift is exact for text tokens (see llama-graph.cpp, llm_graph_input_pos)
+    bool can_shift_scalar_pos() const;
+
     // note: currently only support if either all or none of the layers are MLA
     bool is_mla() const;
 
