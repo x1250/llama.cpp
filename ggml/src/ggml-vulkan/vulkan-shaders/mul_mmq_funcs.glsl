@@ -217,6 +217,41 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
 }
 #endif
 
+#if defined(DATA_A_IQ4_NL)
+// 2-byte loads for iq4_nl blocks (18 bytes); the nibbles map through the kvalues table, so the quants are signed int8
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+    const uint32_t qs = pack32(u16vec2(data_a_packed16[ib].qs[iqs * 2],
+                                       data_a_packed16[ib].qs[iqs * 2 + 1]));
+
+    const u8vec4 i_a0 = unpack8( qs       & 0x0F0F0F0F);
+    const u8vec4 i_a1 = unpack8((qs >> 4) & 0x0F0F0F0F);
+
+    buf_a[buf_ib].qs[iqs    ] = pack32(i8vec4(kvalues_iq4nl_i8[i_a0.x], kvalues_iq4nl_i8[i_a0.y], kvalues_iq4nl_i8[i_a0.z], kvalues_iq4nl_i8[i_a0.w]));
+    buf_a[buf_ib].qs[iqs + 4] = pack32(i8vec4(kvalues_iq4nl_i8[i_a1.x], kvalues_iq4nl_i8[i_a1.y], kvalues_iq4nl_i8[i_a1.z], kvalues_iq4nl_i8[i_a1.w]));
+
+    if (iqs == 0) {
+        buf_a[buf_ib].dm = FLOAT_TYPE(data_a_packed16[ib].d);
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    int32_t q_sum = 0;
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+
+    return ACC_TYPE(float(cache_a[ib_a].dm) * float(cache_b.ds.x) * float(q_sum));
+}
+#endif
+
 // For k-quants, ib and iqs still assume 32-wide blocks, but k-quants are 256-wide
 // iqs still refers to a 32-bit integer, meaning 0..7 for 32-wide quants
 #if defined(DATA_A_Q2_K)

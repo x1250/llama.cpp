@@ -9312,6 +9312,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // quantized matmuls at prefill batch sizes (integer dot / MMQ paths): Qwen3.8-Flash-Next and Qwen3.6-MoE shapes
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int64_t n : {512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,     4, n, 10240, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, n,   320, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, n,  2560, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  2560, n,  6144, {1, 1}, {1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 2048, 2560, {1, 1}, {1, 1})); // output head
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false,  640, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, 2048,  640));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K,   GGML_TYPE_F32, 256,  8, false, 2048, 2048,  512));
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
