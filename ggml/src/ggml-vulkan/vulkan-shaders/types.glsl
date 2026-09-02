@@ -1811,6 +1811,8 @@ const int8_t kvalues_iq4nl_const[16] = {
 };
 
 shared FLOAT_TYPE kvalues_iq4nl[16];
+// int8 copy for the integer dot product paths
+shared int8_t kvalues_iq4nl_i8[16];
 
 #define NEEDS_INIT_IQ_SHMEM
 void init_iq_shmem(uvec3 wgsize)
@@ -1818,6 +1820,7 @@ void init_iq_shmem(uvec3 wgsize)
     // copy the table into shared memory and sync
     for (uint i = gl_LocalInvocationIndex.x; i < kvalues_iq4nl.length(); i += wgsize.x) {
         kvalues_iq4nl[i] = FLOAT_TYPE(kvalues_iq4nl_const[i]);
+        kvalues_iq4nl_i8[i] = kvalues_iq4nl_const[i];
     }
     barrier();
 }

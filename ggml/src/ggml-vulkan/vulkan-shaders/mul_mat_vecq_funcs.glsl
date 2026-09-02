@@ -157,6 +157,24 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
 }
 #endif
 
+#if defined(DATA_A_IQ4_NL)
+// 2-byte loads for iq4_nl blocks (18 bytes); the nibbles map through the kvalues table, so the quants are signed int8
+i32vec2 repack(uint ib, uint iqs) {
+    const uint32_t vui = pack32(u16vec2(data_a_packed16[ib].qs[iqs * 2    ],
+                                        data_a_packed16[ib].qs[iqs * 2 + 1]));
+
+    const u8vec4 i_a0 = unpack8( vui       & 0x0F0F0F0F);
+    const u8vec4 i_a1 = unpack8((vui >> 4) & 0x0F0F0F0F);
+
+    return i32vec2(pack32(i8vec4(kvalues_iq4nl_i8[i_a0.x], kvalues_iq4nl_i8[i_a0.y], kvalues_iq4nl_i8[i_a0.z], kvalues_iq4nl_i8[i_a0.w])),
+                   pack32(i8vec4(kvalues_iq4nl_i8[i_a1.x], kvalues_iq4nl_i8[i_a1.y], kvalues_iq4nl_i8[i_a1.z], kvalues_iq4nl_i8[i_a1.w])));
+}
+
+FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
+    return FLOAT_TYPE(da * dsb.x * float(q_sum));
+}
+#endif
+
 #if defined(DATA_A_Q2_0)
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     int32_t q_sum = 0;
@@ -169,7 +187,7 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     // 16 quants per call => divide sums by 32/16 = 2
     return mul_q8_1(q_sum, get_dm(ib_a), cache_b_ds, 2);
 }
-#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
+#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4) || defined(DATA_A_IQ4_NL)
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     int32_t q_sum = 0;
 #if QUANT_R == 2
