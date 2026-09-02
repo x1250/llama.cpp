@@ -671,6 +671,27 @@ void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 
+void llama_madvise_willneed(void * addr, size_t len) {
+#if defined(_POSIX_MAPPED_FILES) && defined(POSIX_MADV_WILLNEED)
+    if (addr == nullptr || len == 0) {
+        return;
+    }
+    // madvise wants a page-aligned start; the length is rounded up by the kernel
+    const long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) {
+        return;
+    }
+    const size_t page = (size_t) ps;
+    uintptr_t beg = (uintptr_t) addr;
+    const uintptr_t end = beg + len;
+    beg &= ~(uintptr_t) (page - 1);
+    posix_madvise((void *) beg, (size_t) (end - beg), POSIX_MADV_WILLNEED);
+#else
+    (void) addr;
+    (void) len;
+#endif
+}
+
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
 #else
