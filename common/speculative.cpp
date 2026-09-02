@@ -1570,6 +1570,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!ok) {
                 return false;
             }
+
+            // nothing here reads the draft outputs, so without a sync the draft stays in
+            // flight while the target resumes its own decode. two contexts with work in
+            // flight at the same time deadlocks the Vulkan device (syncobj interlock)
+            llama_synchronize(ctx_dft);
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
