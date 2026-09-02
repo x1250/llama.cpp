@@ -62,6 +62,9 @@ private:
     std::unique_ptr<impl> pimpl;
 };
 
+// hint the OS to read a byte range ahead (async); no-op where unsupported
+void llama_madvise_willneed(void * addr, size_t len);
+
 struct llama_mlock {
     llama_mlock();
     ~llama_mlock();

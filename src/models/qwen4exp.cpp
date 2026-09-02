@@ -1225,6 +1225,48 @@ public:
     std::vector<llama_token> prev;
 };
 
+// read the gathered rows ahead when the PLE table is a lazy on-disk mmap.
+// the gather is a single-threaded CPU get_rows, so without this it would fault
+// the random rows in one at a time and starve the GPU; a resident table skips this.
+static void prefetch_ple_rows(const ggml_tensor * t, const std::vector<int32_t> & idx) {
+    if (t == nullptr || t->data == nullptr || t->buffer == nullptr ||
+            !ggml_backend_buffer_is_host(t->buffer)) {
+        return;
+    }
+
+    const size_t  row_size = t->nb[1];
+    const int64_t n_rows   = t->ne[1];
+    char * const  base     = (char *) t->data;
+
+    // page-aligned byte spans of the needed rows, sorted and merged to cut syscalls
+    std::vector<std::pair<size_t, size_t>> spans;
+    spans.reserve(idx.size());
+    for (int32_t r : idx) {
+        if (r < 0 || (int64_t) r >= n_rows) {
+            continue;
+        }
+        const size_t beg = (size_t) r * row_size;
+        spans.emplace_back(beg, beg + row_size);
+    }
+    if (spans.empty()) {
+        return;
+    }
+
+    std::sort(spans.begin(), spans.end());
+    size_t cur_beg = spans[0].first;
+    size_t cur_end = spans[0].second;
+    for (size_t i = 1; i < spans.size(); ++i) {
+        if (spans[i].first <= cur_end) {
+            cur_end = std::max(cur_end, spans[i].second);
+        } else {
+            llama_madvise_willneed(base + cur_beg, cur_end - cur_beg);
+            cur_beg = spans[i].first;
+            cur_end = spans[i].second;
+        }
+    }
+    llama_madvise_willneed(base + cur_beg, cur_end - cur_beg);
+}
+
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
@@ -1284,6 +1326,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+
+    prefetch_ple_rows(pmodel.per_layer_tok_embd, idx);
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
