@@ -64,6 +64,8 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <unordered_map>
 #include <shared_mutex>
 #include <mutex>
+#include <chrono>
+#include <cstdarg>
 #include <future>
 #include <condition_variable>
 #include <thread>
@@ -2192,6 +2194,24 @@ std::mutex vk_memory_logger::log_mutex;
 
 static bool vk_perf_logger_enabled = false;
 static bool vk_perf_logger_concurrent = false;
+// GGML_VK_TRACE_SYNC: trace every submission, fence wait and event per backend context (deadlock diagnosis)
+static bool vk_trace_sync = false;
+static uint64_t vk_trace_seq = 0;
+GGML_ATTRIBUTE_FORMAT(1, 2)
+static void vk_trace(const char * fmt, ...) {
+    if (!vk_trace_sync) {
+        return;
+    }
+    static const auto t0 = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "VKTRACE %llu %.3f %s\n", (unsigned long long) vk_trace_seq++, ms, buf);
+    fflush(stderr);
+}
 static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
@@ -2702,10 +2722,13 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
     if (ctx->almost_ready_fence_pending) {
+        vk_trace("wait-almost-ready ctx=%p fence=%p", (void *) ctx, (void *) (VkFence) ctx->almost_ready_fence);
         VK_CHECK(ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX), "almost_ready_fence", ctx->device);
         ctx->device->device.resetFences({ ctx->almost_ready_fence });
         ctx->almost_ready_fence_pending = false;
+        vk_trace("wait-almost-ready-done ctx=%p", (void *) ctx);
     }
+    vk_trace("wait-fence ctx=%p fence=%p", (void *) ctx, (void *) (VkFence) ctx->fence);
 
     // Spin (w/pause) waiting for the graph to finish executing.
     vk::Result result;
@@ -2738,6 +2761,7 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         }
     }
     ctx->device->device.resetFences({ ctx->fence });
+    vk_trace("wait-fence-done ctx=%p", (void *) ctx);
 }
 
 static constexpr uint32_t kSpvOpCooperativeMatrixLoadTensorNV = 5367;
@@ -3272,6 +3296,7 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
 static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
     if (ctx->seqs.empty()) {
         if (fence) {
+            vk_trace("submit-empty pool=%p qf=%u fence=%p", (void *) ctx->p, ctx->p->q->queue_family_index, (void *) (VkFence) fence);
             ctx->p->q->handle->submit({}, fence);
         }
         return;
@@ -3341,6 +3366,21 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
         }
     }
 
+    if (vk_trace_sync) {
+        for (const auto& sequence : ctx->seqs) {
+            for (const auto& submission : sequence) {
+                std::string w, sg;
+                for (const auto& sem : submission.wait_semaphores) {
+                    w += " " + std::to_string((uintptr_t) (VkSemaphore) sem.s) + ":" + std::to_string(sem.value);
+                }
+                for (const auto& sem : submission.signal_semaphores) {
+                    sg += " " + std::to_string((uintptr_t) (VkSemaphore) sem.s) + ":" + std::to_string(sem.value);
+                }
+                vk_trace("submit pool=%p qf=%u buf=%p waits=[%s] signals=[%s] fence=%p", (void *) ctx->p, ctx->p->q->queue_family_index,
+                         (void *) (VkCommandBuffer) submission.buffer->buf, w.c_str(), sg.c_str(), (void *) (VkFence) fence);
+            }
+        }
+    }
     ctx->p->q->handle->submit(submit_infos, fence);
 
     ctx->seqs.clear();
@@ -3479,6 +3519,7 @@ static vk::Event ggml_vk_create_event(ggml_backend_vk_context * ctx) {
 
 static void ggml_vk_command_pool_cleanup(vk_device& device, vk_command_pool& p) {
     VK_LOG_DEBUG("ggml_vk_command_pool_cleanup()");
+    vk_trace("pool-cleanup pool=%p in_use=%zu", (void *) &p, p.buffers_in_use());
 
     // Requires command buffers to be done
     device->device.resetCommandPool(p.pool);
@@ -7836,6 +7877,7 @@ static void ggml_vk_instance_init() {
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
+    vk_trace_sync = getenv("GGML_VK_TRACE_SYNC") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
@@ -17187,6 +17229,8 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
 
     bool do_transfer = !ctx->compute_ctx.expired();
+    vk_trace("synchronize ctx=%p pool=%p pending=%d compute_ctx=%d almost_ready_pending=%d", (void *) ctx, (void *) &ctx->compute_cmd_pool,
+             (int) ctx->submit_pending, (int) do_transfer, (int) ctx->almost_ready_fence_pending);
 
     if (ggml_vk_submit_transfer_ctx(ctx)) {
         ctx->submit_pending = true;
@@ -17234,6 +17278,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             ctx->device->compute_queue->handle->submit({ si }, ctx->fence);
             ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
         } else {
+            vk_trace("submit-fence ctx=%p fence=%p", (void *) ctx, (void *) (VkFence) ctx->fence);
             ctx->device->compute_queue->handle->submit({}, ctx->fence);
         }
         if (!ctx->device->serialize_submissions) {
@@ -17929,6 +17974,8 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    vk_trace("graph-compute ctx=%p pool=%p n_nodes=%d pending=%d almost_ready_pending=%d", (void *) ctx, (void *) &ctx->compute_cmd_pool, cgraph->n_nodes,
+             (int) ctx->submit_pending, (int) ctx->almost_ready_fence_pending);
 
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
@@ -18692,6 +18739,7 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
     VK_LOG_DEBUG("ggml_backend_vk_event_record(backend=" << backend << ", event=" << event << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     vk_event *vkev = (vk_event *)event->context;
+    vk_trace("event-record ctx=%p event=%p tlsem=%p next=%llu", (void *) ctx, (void *) event, (void *) (VkSemaphore) vkev->tl_semaphore.s, (unsigned long long) vkev->tl_semaphore.value + 1);
 
     ggml_vk_submit_transfer_ctx(ctx);
 
@@ -18730,6 +18778,7 @@ static void ggml_backend_vk_event_wait(ggml_backend_t backend, ggml_backend_even
     VK_LOG_DEBUG("ggml_backend_vk_event_wait(backend=" << backend << ", event=" << event << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     vk_event *vkev = (vk_event *)event->context;
+    vk_trace("event-wait ctx=%p event=%p has=%d vkevent=%p", (void *) ctx, (void *) event, (int) vkev->has_event, vkev->has_event ? (void *) (VkEvent) vkev->event : nullptr);
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
@@ -19663,6 +19712,7 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
     if (vkev->has_event) {
         vk::Semaphore sem = vkev->tl_semaphore.s;
         uint64_t val = vkev->tl_semaphore.value;
+        vk_trace("event-host-wait event=%p tlsem=%p value=%llu", (void *) event, (void *) (VkSemaphore) sem, (unsigned long long) val);
         vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, sem, val};
         VK_CHECK(device->device.waitSemaphores(swi, UINT64_MAX), "event_synchronize", device);
 
