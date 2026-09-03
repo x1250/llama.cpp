@@ -36,6 +36,8 @@ struct llama_file {
 
     size_t read_alignment() const;
     bool has_direct_io() const;
+    // drop the clean page-cache pages of [offs, offs + len) once their bytes were copied out; no-op where unsupported
+    void drop_cache(size_t offs, size_t len) const;
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
@@ -54,6 +56,10 @@ struct llama_mmap {
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
+    // ask the OS to read [first, last) ahead (async), skipping the lazy ranges; no-op where unsupported
+    void advise_willneed(size_t first, size_t last);
+    // unmap the whole pages inside [first, last) and drop them from the page cache
+    void drop_fragment(size_t first, size_t last);
 
     static const bool SUPPORTED;
 
