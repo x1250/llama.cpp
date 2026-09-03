@@ -240,7 +240,7 @@ struct llama_model_loader {
 
     void done_getting_tensors(bool partial = false) const;
 
-    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
+    void init_mappings(llama_mlocks * mlock_mmaps = nullptr);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
 

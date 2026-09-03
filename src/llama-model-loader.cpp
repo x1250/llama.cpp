@@ -1400,7 +1400,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
-void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+void llama_model_loader::init_mappings(llama_mlocks * mlock_mmaps) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1419,9 +1419,8 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
-
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
+            // no read-ahead of the whole file here: load_all_data streams it through a bounded window
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), 0, is_numa,
                     lazy.for_file(idx));
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
@@ -1482,6 +1481,10 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
 
     return data;
 }
+
+// read-ahead window of the mapped file while its tensors are being loaded: deep enough to keep the disk busy,
+// small enough that the page cache never holds more than a few tensors that are not needed yet
+static constexpr size_t LOAD_PREFETCH_WINDOW = 256ull * 1024 * 1024;
 
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
@@ -1623,6 +1626,9 @@ bool llama_model_loader::load_all_data(
             }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
+            // stream the file: read a bounded window ahead of this tensor (the lazy ranges are skipped)
+            mapping->advise_willneed(weight->offs, weight->offs + n_size + LOAD_PREFETCH_WINDOW);
+
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                     return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
@@ -1644,6 +1650,14 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+
+                // uploaded to a device buffer: the file pages are a second copy that only competes with the
+                // memory the device is pinning (on a UMA desktop a load exhausted the free memory and froze
+                // the machine); drop them now. Kept while the host still needs them: an async validation
+                // reads them, and mlock expects a contiguous mapping.
+                if (!check_tensors && !lmlocks) {
+                    mapping->drop_fragment(weight->offs, weight->offs + n_size);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1651,6 +1665,8 @@ bool llama_model_loader::load_all_data(
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
+                // the bytes are in the tensor now: the page-cache copy only competes with the memory the device pins
+                file->drop_cache(weight->offs, n_size);
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -1710,11 +1726,14 @@ bool llama_model_loader::load_all_data(
                         ++buffer_idx;
                         buffer_idx %= n_buffers;
                     }
+                    // every chunk went through the pinned staging buffers: drop the page-cache copy
+                    file->drop_cache(weight->offs, n_size);
                 } else {
                     read_buf.resize(n_size);
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                    file->drop_cache(weight->offs, n_size);
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
