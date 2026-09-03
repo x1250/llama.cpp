@@ -540,34 +540,32 @@ struct llama_mmap::impl {
     void unmap_fragment(size_t first, size_t last) {
         int page_size = sysconf(_SC_PAGESIZE);
         align_range(&first, &last, page_size);
-        size_t len = last - first;
 
-        if (len == 0) {
+        if (last <= first) {
             return;
         }
 
         GGML_ASSERT(first % page_size == 0);
         GGML_ASSERT(last % page_size == 0);
-        GGML_ASSERT(last > first);
 
-        void * next_page_start = (uint8_t *) addr + first;
-
-        if (munmap(next_page_start, len)) {
-            LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
-        }
-
+        // unmap only what is still mapped: a fragment dropped earlier is a hole in the address space that the
+        // kernel may already have reused for another mapping (a device buffer, another model's file)
         std::vector<std::pair<size_t, size_t>> new_mapped_fragments;
         for (const auto & frag : mapped_fragments) {
-            if (frag.first < first && frag.second > last) {
-                new_mapped_fragments.emplace_back(frag.first, first);
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first < first && frag.second > first) {
-                new_mapped_fragments.emplace_back(frag.first, first);
-            } else if (frag.first < last && frag.second > last) {
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first >= first && frag.second <= last) {
-            } else {
+            const size_t beg = std::max(frag.first, first);
+            const size_t end = std::min(frag.second, last);
+            if (beg >= end) {
                 new_mapped_fragments.push_back(frag);
+                continue;
+            }
+            if (munmap((uint8_t *) addr + beg, end - beg)) {
+                LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
+            }
+            if (frag.first < beg) {
+                new_mapped_fragments.emplace_back(frag.first, beg);
+            }
+            if (end < frag.second) {
+                new_mapped_fragments.emplace_back(end, frag.second);
             }
         }
         mapped_fragments = std::move(new_mapped_fragments);
