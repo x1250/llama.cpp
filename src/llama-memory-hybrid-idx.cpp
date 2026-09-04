@@ -965,15 +965,20 @@ uint32_t llama_memory_hybrid_idx_context::qsa_pooled_n_dirty_max(const llama_uba
     const uint32_t n_ns  = get_n_stream();
     const uint32_t n_tps = ubatch.n_tokens/n_ns;
 
-    // the cells already hold this ubatch (apply precedes the graph build), so the sequence's
-    // highest position bounds its complete blocks; at least 1 keeps the tables stable across decode steps
+    // the cells already hold this ubatch (apply precedes the graph build). set_input_qsa groups the
+    // cells by position, or by rank when mrope repeats one position across an image: the image's
+    // cells then complete blocks without adding positions, so the cell count bounds the complete
+    // blocks in that case and the highest position in the other. At least 1 keeps the tables
+    // stable across decode steps
     int64_t res = 1;
 
     for (uint32_t s = 0; s < n_ns; ++s) {
         const llama_seq_id seq = ubatch.seq_id[s*n_tps][0];
         const auto & cells = mem->get_mem_idx()->get_cells(seq);
 
-        const int64_t n_complete = (int64_t) (cells.seq_pos_max(seq) + 1)/ratio;
+        // qsa_pooled_usable holds, so every cell of the stream belongs to seq
+        const int64_t n_cells    = std::max<int64_t>(cells.seq_pos_max(seq) + 1, cells.get_used());
+        const int64_t n_complete = n_cells/ratio;
         const int64_t w          = std::min(mem->pooled_valid(ratio, seq), n_complete);
 
         res = std::max(res, n_complete - w);
