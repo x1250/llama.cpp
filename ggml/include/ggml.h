@@ -574,6 +574,8 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_HC_GATED_MEAN,
+        GGML_OP_HC_INJECT,
 
         GGML_OP_UNARY,
 
@@ -2666,6 +2668,28 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Hyper-connections with a sigmoid gate and a stream mean (Qwen3.8-Flash-Next)
+    //
+    // hc_gated_mean: x [n_embd, hc, n_tokens], gate [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
+    //   result[i, t] = (1/hc) * sum_h x[i, h, t]*sigmoid(gate[i, h, t])
+    //
+    GGML_API struct ggml_tensor * ggml_hc_gated_mean(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate);
+
+    // hc_inject: residual [n_embd, hc, n_tokens], x [n_embd, n_tokens], inject [hc, n_tokens]
+    //            -> [n_embd, hc, n_tokens]
+    //   result[i, h, t] = residual[i, h, t] + x[i, t]*mult*sigmoid(scale*inject[h, t])
+    //
+    GGML_API struct ggml_tensor * ggml_hc_inject(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * inject,
+            float                 scale,
+            float                 mult);
 
     // custom operators
 

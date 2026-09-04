@@ -1115,6 +1115,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_hc_gated_mean_f32;
+    vk_pipeline pipeline_hc_inject_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1952,6 +1954,25 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
+};
+
+// strides in elements; the rows (ne0) are contiguous
+struct vk_op_hc_gated_mean_push_constants {
+    uint32_t ne0, ne1, ne2;   // n_embd, hc, n_tokens
+    uint32_t nb01, nb02;      // x: stream, token
+    uint32_t nb11, nb12;      // gate: stream, token
+    uint32_t nb21;            // dst: token
+    float    inv_hc;
+};
+
+struct vk_op_hc_inject_push_constants {
+    uint32_t ne0, ne1, ne2;   // n_embd, hc, n_tokens
+    uint32_t nb01, nb02;      // residual: stream, token
+    uint32_t nb11;            // x: token
+    uint32_t nb21;            // inject: token
+    uint32_t nb31, nb32;      // dst: stream, token
+    float    scale;
+    float    mult;
 };
 
 struct vk_op_conv2d_push_constants {
@@ -6359,6 +6380,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_hc_gated_mean_f32, "hc_gated_mean_f32", hc_gated_mean_f32_len, hc_gated_mean_f32_data, "main", 3, sizeof(vk_op_hc_gated_mean_push_constants), {256, 1, 1}, {256}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_hc_inject_f32,     "hc_inject_f32",     hc_inject_f32_len,     hc_inject_f32_data,     "main", 4, sizeof(vk_op_hc_inject_push_constants),     {256, 1, 1}, {256}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -12232,6 +12256,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             }
         }
         return nullptr;
+    case GGML_OP_HC_GATED_MEAN:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_hc_gated_mean_f32;
+        }
+        return nullptr;
+    case GGML_OP_HC_INJECT:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_hc_inject_f32;
+        }
+        return nullptr;
     case GGML_OP_OPT_STEP_ADAMW:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_opt_step_adamw_f32;
@@ -12863,6 +12897,14 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             elements = { nr, n_t, n_s };
         }
         break;
+    case GGML_OP_HC_GATED_MEAN:
+        // one thread per output element: (n_embd, n_tokens)
+        elements = { (uint32_t)dst->ne[0], (uint32_t)dst->ne[1], 1 };
+        break;
+    case GGML_OP_HC_INJECT:
+        // one thread per output element: (n_embd, hc, n_tokens)
+        elements = { (uint32_t)dst->ne[0], (uint32_t)dst->ne[1], (uint32_t)dst->ne[2] };
+        break;
     default:
         elements = { (uint32_t)ggml_nelements(src0), 1, 1 };
         break;
@@ -13470,6 +13512,32 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
         (uint32_t)src0->ne[1],
         (uint32_t)dst->ne[1],
         (uint32_t)dst->ne[2],
+    });
+}
+
+static void ggml_vk_hc_gated_mean(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const uint32_t ts = ggml_type_size(src0->type);
+
+    ggml_vk_op_f32<vk_op_hc_gated_mean_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_HC_GATED_MEAN, {
+        (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],
+        (uint32_t)(src0->nb[1] / ts), (uint32_t)(src0->nb[2] / ts),
+        (uint32_t)(src1->nb[1] / ts), (uint32_t)(src1->nb[2] / ts),
+        (uint32_t)(dst->nb[1] / ts),
+        1.0f / (float) src0->ne[1],
+    });
+}
+
+static void ggml_vk_hc_inject(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
+    const uint32_t ts = ggml_type_size(src0->type);
+
+    ggml_vk_op_f32<vk_op_hc_inject_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_HC_INJECT, {
+        (uint32_t)dst->ne[0], (uint32_t)dst->ne[1], (uint32_t)dst->ne[2],
+        (uint32_t)(src0->nb[1] / ts), (uint32_t)(src0->nb[2] / ts),
+        (uint32_t)(src1->nb[1] / ts),
+        (uint32_t)(src2->nb[1] / ts),
+        (uint32_t)(dst->nb[1] / ts), (uint32_t)(dst->nb[2] / ts),
+        ggml_get_op_params_f32(dst, 0),
+        ggml_get_op_params_f32(dst, 1),
     });
 }
 
@@ -16567,6 +16635,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_HC_GATED_MEAN:
+        ggml_vk_hc_gated_mean(ctx, compute_ctx, src0, src1, node);
+
+        break;
+
+    case GGML_OP_HC_INJECT:
+        ggml_vk_hc_inject(ctx, compute_ctx, src0, src1, src2, node);
+
+        break;
+
     case GGML_OP_OPT_STEP_ADAMW:
         ggml_vk_opt_step_adamw(ctx, compute_ctx, node);
 
@@ -19580,6 +19658,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_HC_GATED_MEAN:
+        case GGML_OP_HC_INJECT:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_COL2IM_1D:
@@ -20559,6 +20640,11 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                                          src_clone[3], src_clone[4], src_clone[5], src_clone[6], K);
         } else if (tensor->op == GGML_OP_SSM_CONV) {
             tensor_clone = ggml_ssm_conv(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_HC_GATED_MEAN) {
+            tensor_clone = ggml_hc_gated_mean(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_HC_INJECT) {
+            tensor_clone = ggml_hc_inject(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                                          ggml_get_op_params_f32(tensor, 0), ggml_get_op_params_f32(tensor, 1));
         } else if (tensor->op == GGML_OP_ROLL) {
             const int32_t s0 = tensor->op_params[0];
             const int32_t s1 = tensor->op_params[1];

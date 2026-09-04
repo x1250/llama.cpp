@@ -1,0 +1,42 @@
+#version 450
+
+// hyper-connection injection:
+//   dst[i, h, t] = residual[i, h, t] + x[i, t] * mult * sigmoid(scale * inject[h, t])
+// one thread per output element; the rows are contiguous, the stream and token strides come in elements
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Residual { float data_r[]; };
+layout(binding = 1) readonly  buffer X        { float data_x[]; };
+layout(binding = 2) readonly  buffer Inject   { float data_s[]; };
+layout(binding = 3) writeonly buffer Dst      { float data_d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint ne0; uint ne1; uint ne2;
+    uint nb01; uint nb02;
+    uint nb11;
+    uint nb21;
+    uint nb31; uint nb32;
+    float scale;
+    float mult;
+};
+
+void main() {
+    const uint i0 = gl_GlobalInvocationID.x;
+    const uint ih = gl_GlobalInvocationID.y;
+    const uint it = gl_GlobalInvocationID.z;
+
+    if (i0 >= ne0 || ih >= ne1 || it >= ne2) {
+        return;
+    }
+
+    const float sv = data_s[ih + it*nb21];
+    const float w  = mult * (1.0f / (1.0f + exp(-scale*sv)));
+
+    // precise keeps the product and the sum as two roundings, bit-identical to the unfused MUL and ADD nodes
+    precise float value = data_r[i0 + ih*nb01 + it*nb02] + data_x[i0 + it*nb11]*w;
+
+    data_d[i0 + ih*nb31 + it*nb32] = value;
+}

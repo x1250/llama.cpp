@@ -47,6 +47,8 @@ struct llama_cparams {
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
+    bool fused_hc_gated_mean; // use the fused hyper-connection gated stream mean
+    bool fused_hc_inject;     // use the fused hyper-connection injection
     bool auto_fhc;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
