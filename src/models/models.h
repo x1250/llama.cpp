@@ -2314,7 +2314,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         // rotate q/k/v for a quantized cache and store k/v; returns the rotated q
-        ggml_tensor * build_attn_qsa_store(
+        ggml_tensor * build_attn_store(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
