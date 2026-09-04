@@ -2313,13 +2313,21 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
-        // dense self-attention restricted to the cells that top_k names
-        ggml_tensor * build_attn_qsa(
+        // rotate q/k/v for a quantized cache and store k/v; returns the rotated q
+        ggml_tensor * build_attn_qsa_store(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
+                            int   il);
+
+        // dense self-attention of one query block restricted to the cells that top_k names
+        ggml_tensor * build_attn_qsa(
+                    ggml_tensor * q,
+                    ggml_tensor * k,
+                    ggml_tensor * v,
                     ggml_tensor * top_k,
+                    ggml_tensor * kq_mask,
                           float   kq_scale,
                             int   il);
 
@@ -2327,13 +2335,37 @@ struct llama_model_qwen4exp : public llama_model_base {
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 
-        // QSA: token indices this layer's queries may attend to, or nullptr for dense
-        ggml_tensor * build_qsa_top_k(
+        // what every query block of a QSA layer scores against: the block summary keys of the
+        // cache and the indexer queries of the ubatch
+        struct qsa_layer {
+            llm_graph_input_qsa * inp    = nullptr;
+            ggml_tensor *         pooled = nullptr; // F32 [idx_dim, n_blocks, n_stream]
+            ggml_tensor *         q      = nullptr; // F32 [idx_dim, n_idx_h, n_tokens]
+            int64_t               n_kv     = 0;
+            int64_t               n_blocks = 0;
+            int64_t               width    = 0;     // cells each query attends to
+        };
+
+        qsa_layer build_qsa_keys(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
+                            int   il);
+
+        // QSA: the cells one block of queries may attend to, [width, n_t, 1, ns]. The tensors
+        // are the layer's own or their single-stream views; q holds the block's indexer
+        // queries as [idx_dim, n_idx_h*n_t, ns]
+        ggml_tensor * build_qsa_select(
+                const qsa_layer & lay,
+                    ggml_tensor * pooled,
+                    ggml_tensor * q,
+                    ggml_tensor * cell_blk,
+                    ggml_tensor * bias,
+                    ggml_tensor * kq_mask,
+                        int64_t   n_t,
+                        int64_t   ns,
                             int   il);
 
         ggml_tensor * build_layer_attn_linear(
