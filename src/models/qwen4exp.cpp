@@ -977,10 +977,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_select(
     return top_k;
 }
 
-// Rotate q/k/v before they reach a quantized cache, as the dense path does, and store k/v.
-// The indexer has already scored with its own query in build_qsa_keys, so the selection is
-// unaffected by the rotation. Returns the rotated q.
-ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_store(
+// Rotate q/k/v before they reach a quantized cache, as llm_graph_context::build_attn does, and
+// store k/v. A QSA layer has already scored with the indexer's own query in build_qsa_keys, so
+// its selection is unaffected by the rotation. Returns the rotated q.
+ggml_tensor * llama_model_qwen4exp::graph::build_attn_store(
         llm_graph_input_attn_kv * inp,
         ggml_tensor *             q_cur,
         ggml_tensor *             k_cur,
@@ -1074,27 +1074,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // The MTP draft block hands a null mctx in: it attends dense over a plain KV cache.
     const bool qsa = mctx_hyb && mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
-    // the cells the queries may attend to are selected before the projections, as the dense
-    // path orders its graph. A ubatch too big for one block selects next to each block instead
     qsa_layer lay;
-    int64_t   n_stream = 1;
-    int64_t   n_q_max  = 0;
-
-    ggml_tensor * top_k = nullptr;
-
     if (qsa) {
         lay = build_qsa_keys(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il);
+    }
 
-        n_stream = mctx_hyb->get_n_stream();
-        n_q_max  = qsa_query_block(lay.n_kv);
+    // the attention work of a ubatch grows with queries x cells whether the layer selects its
+    // cells or attends densely (the MTP draft block), so both split into query blocks the same way
+    const int64_t n_stream = qsa ? mctx_hyb->get_n_stream() : inp->get_kq_mask()->ne[3];
+    const int64_t n_q_max  = qsa_query_block(qsa ? lay.n_kv : (int64_t) inp->mctx->get_n_kv());
+    const bool    split    = n_q_max > 0 && n_tokens > n_q_max;
 
-        if (n_q_max == 0 || n_tokens <= n_q_max) {
-            const int64_t n_tps = n_tokens/n_stream;
+    // the cells the queries may attend to are selected before the projections, as the dense
+    // path orders its graph. A split ubatch selects next to each block instead
+    ggml_tensor * top_k = nullptr;
 
-            ggml_tensor * q = ggml_reshape_3d(ctx0, lay.q, lay.q->ne[0], lay.q->ne[1]*n_tps, n_stream);
+    if (qsa && !split) {
+        const int64_t n_tps = n_tokens/n_stream;
 
-            top_k = build_qsa_select(lay, lay.pooled, q, lay.inp->cell_blk, lay.inp->bias, inp->get_kq_mask(), n_tps, n_stream, il);
-        }
+        ggml_tensor * q = ggml_reshape_3d(ctx0, lay.q, lay.q->ne[0], lay.q->ne[1]*n_tps, n_stream);
+
+        top_k = build_qsa_select(lay, lay.pooled, q, lay.inp->cell_blk, lay.inp->bias, inp->get_kq_mask(), n_tps, n_stream, il);
     }
 
     // Qwen3Next uses a single Q projection that outputs query + gate
@@ -1147,14 +1147,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    if (qsa) {
-        Qcur = build_attn_qsa_store(inp, Qcur, Kcur, Vcur, il);
+    if (!qsa && !split) {
+        cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    } else {
+        Qcur = build_attn_store(inp, Qcur, Kcur, Vcur, il);
 
         ggml_tensor * k       = inp->mctx->get_k(ctx0, il);
         ggml_tensor * v       = inp->mctx->get_v(ctx0, il);
         ggml_tensor * kq_mask = inp->get_kq_mask();
 
-        if (top_k) {
+        if (!split) {
             cur = build_attn_qsa(Qcur, k, v, top_k, kq_mask, kq_scale, il);
         } else {
             // one block of at most n_q_max queries at a time, stream by stream, so that the
@@ -1164,10 +1168,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
             cur = nullptr;
 
             for (int64_t s = 0; s < n_stream; ++s) {
-                ggml_tensor * pooled_s   = ggml_view_3d(ctx0, lay.pooled, lay.pooled->ne[0], lay.pooled->ne[1], 1,
-                        lay.pooled->nb[1], lay.pooled->nb[2], s*lay.pooled->nb[2]);
-                ggml_tensor * cell_blk_s = ggml_view_2d(ctx0, lay.inp->cell_blk, lay.inp->cell_blk->ne[0], 1,
-                        lay.inp->cell_blk->nb[1], s*lay.inp->cell_blk->nb[1]);
+                ggml_tensor * pooled_s   = nullptr;
+                ggml_tensor * cell_blk_s = nullptr;
+                if (qsa) {
+                    pooled_s   = ggml_view_3d(ctx0, lay.pooled, lay.pooled->ne[0], lay.pooled->ne[1], 1,
+                            lay.pooled->nb[1], lay.pooled->nb[2], s*lay.pooled->nb[2]);
+                    cell_blk_s = ggml_view_2d(ctx0, lay.inp->cell_blk, lay.inp->cell_blk->ne[0], 1,
+                            lay.inp->cell_blk->nb[1], s*lay.inp->cell_blk->nb[1]);
+                }
                 ggml_tensor * k_s = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], k->ne[2], 1, k->nb[1], k->nb[2], k->nb[3], s*k->nb[3]);
                 ggml_tensor * v_s = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], v->ne[2], 1, v->nb[1], v->nb[2], v->nb[3], s*v->nb[3]);
 
@@ -1175,17 +1183,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
                     const int64_t n_t = std::min(n_q_max, n_tps - t0);
                     const int64_t g0  = s*n_tps + t0; // first token of the block in the ubatch
 
-                    ggml_tensor * q_idx_b = ggml_view_3d(ctx0, lay.q, lay.q->ne[0], lay.q->ne[1]*n_t, 1,
-                            lay.q->nb[1], n_t*lay.q->nb[2], g0*lay.q->nb[2]);
-                    ggml_tensor * bias_b  = ggml_view_3d(ctx0, lay.inp->bias, lay.inp->bias->ne[0], n_t, 1,
-                            lay.inp->bias->nb[1], lay.inp->bias->nb[2], s*lay.inp->bias->nb[2] + t0*lay.inp->bias->nb[1]);
-                    ggml_tensor * mask_b  = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], n_t, 1, 1,
+                    ggml_tensor * mask_b = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], n_t, 1, 1,
                             kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], s*kq_mask->nb[3] + t0*kq_mask->nb[1]);
-                    ggml_tensor * q_b     = ggml_view_3d(ctx0, Qcur, Qcur->ne[0], Qcur->ne[1], n_t,
+                    ggml_tensor * q_b    = ggml_view_3d(ctx0, Qcur, Qcur->ne[0], Qcur->ne[1], n_t,
                             Qcur->nb[1], Qcur->nb[2], g0*Qcur->nb[2]);
 
-                    ggml_tensor * top_k_b = build_qsa_select(lay, pooled_s, q_idx_b, cell_blk_s, bias_b, mask_b, n_t, 1, il);
-                    ggml_tensor * out_b   = build_attn_qsa(q_b, k_s, v_s, top_k_b, mask_b, kq_scale, il);
+                    ggml_tensor * out_b = nullptr;
+                    if (qsa) {
+                        ggml_tensor * q_idx_b = ggml_view_3d(ctx0, lay.q, lay.q->ne[0], lay.q->ne[1]*n_t, 1,
+                                lay.q->nb[1], n_t*lay.q->nb[2], g0*lay.q->nb[2]);
+                        ggml_tensor * bias_b  = ggml_view_3d(ctx0, lay.inp->bias, lay.inp->bias->ne[0], n_t, 1,
+                                lay.inp->bias->nb[1], lay.inp->bias->nb[2], s*lay.inp->bias->nb[2] + t0*lay.inp->bias->nb[1]);
+
+                        ggml_tensor * top_k_b = build_qsa_select(lay, pooled_s, q_idx_b, cell_blk_s, bias_b, mask_b, n_t, 1, il);
+
+                        out_b = build_attn_qsa(q_b, k_s, v_s, top_k_b, mask_b, kq_scale, il);
+                    } else {
+                        out_b = build_attn_mha(q_b, k_s, v_s, nullptr, mask_b, nullptr, nullptr, 0, kq_scale, il);
+                        cb(out_b, "kqv_out", il);
+                    }
 
                     cur = cur ? ggml_concat(ctx0, cur, out_b, 1) : out_b;
                 }
@@ -1197,10 +1213,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         if (inp->self_v_rot) {
             cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
         }
-    } else {
-        cur = build_attn(inp,
-                    nullptr, nullptr, nullptr,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     }
     cb(cur, "attn_pregate", il);
 
