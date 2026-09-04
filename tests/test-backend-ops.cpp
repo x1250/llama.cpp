@@ -4131,6 +4131,76 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_HC_GATED_MEAN
+struct test_hc_gated_mean : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+    const bool    strided;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, hc, n_tokens, strided);
+    }
+
+    test_hc_gated_mean(int64_t n_embd = 31, int64_t hc = 4, int64_t n_tokens = 17, bool strided = false)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens), strided(strided) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // strided: the streams are read out of a wider buffer, as a view of the residual is
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, strided ? hc + 1 : hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(gate, "gate");
+
+        if (strided) {
+            x = ggml_view_3d(ctx, x, n_embd, hc, n_tokens, x->nb[1], x->nb[2], 0);
+            ggml_set_name(x, "x_view");
+        }
+
+        ggml_tensor * out = ggml_hc_gated_mean(ctx, x, gate);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_HC_INJECT
+struct test_hc_inject : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+    const float   scale;
+    const float   mult;
+    const bool    strided;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_embd, hc, n_tokens, scale, mult, strided);
+    }
+
+    test_hc_inject(int64_t n_embd = 31, int64_t hc = 4, int64_t n_tokens = 17, float scale = 0.25f, float mult = 2.0f, bool strided = false)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens), scale(scale), mult(mult), strided(strided) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, strided ? hc + 1 : hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(inject, "inject");
+
+        if (strided) {
+            residual = ggml_view_3d(ctx, residual, n_embd, hc, n_tokens, residual->nb[1], residual->nb[2], 0);
+            ggml_set_name(residual, "residual_view");
+        }
+
+        ggml_tensor * out = ggml_hc_inject(ctx, residual, x, inject, scale, mult);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -8619,6 +8689,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
+
+    for (bool strided : {false, true}) {
+        test_cases.emplace_back(new test_hc_gated_mean(1,    1, 1,   strided));
+        test_cases.emplace_back(new test_hc_gated_mean(31,   4, 17,  strided));
+        test_cases.emplace_back(new test_hc_gated_mean(64,   3, 5,   strided));
+        test_cases.emplace_back(new test_hc_gated_mean(2560, 4, 21,  strided));
+        test_cases.emplace_back(new test_hc_gated_mean(2560, 4, 512, strided));
+
+        test_cases.emplace_back(new test_hc_inject(1,    1, 1,   1.0f,      1.0f, strided));
+        test_cases.emplace_back(new test_hc_inject(31,   4, 17,  0.25f,     2.0f, strided));
+        test_cases.emplace_back(new test_hc_inject(64,   3, 5,   1.0f/3.0f, 2.0f, strided));
+        test_cases.emplace_back(new test_hc_inject(2560, 4, 21,  0.25f,     2.0f, strided));
+        test_cases.emplace_back(new test_hc_inject(2560, 4, 512, 0.25f,     2.0f, strided));
+    }
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

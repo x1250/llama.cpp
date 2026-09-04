@@ -1083,6 +1083,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "HC_GATED_MEAN",
+    "HC_INJECT",
 
     "UNARY",
 
@@ -1100,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1198,6 +1200,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "hc_gated_mean(x, gate)",
+    "hc_inject(residual, x, inject)",
 
     "unary(x)",
 
@@ -1215,7 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6524,6 +6528,80 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_hc_gated_mean
+
+struct ggml_tensor * ggml_hc_gated_mean(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gate) {
+    GGML_ASSERT(x->type    == GGML_TYPE_F32);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(x, gate));
+    GGML_ASSERT(x->ne[1] > 0);
+    GGML_ASSERT(x->ne[3] == 1);
+
+    // the rows are read contiguously; the stream and token strides are free
+    GGML_ASSERT(x->nb[0]    == ggml_type_size(x->type));
+    GGML_ASSERT(gate->nb[0] == ggml_type_size(gate->type));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[2]);
+
+    result->op     = GGML_OP_HC_GATED_MEAN;
+    result->src[0] = x;
+    result->src[1] = gate;
+
+    return result;
+}
+
+// ggml_hc_inject
+
+struct ggml_tensor * ggml_hc_inject(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * inject,
+        float                 scale,
+        float                 mult) {
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->type        == GGML_TYPE_F32);
+    GGML_ASSERT(inject->type   == GGML_TYPE_F32);
+
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t hc       = residual->ne[1];
+    const int64_t n_tokens = residual->ne[2];
+
+    GGML_ASSERT(hc > 0);
+    GGML_ASSERT(residual->ne[3] == 1);
+
+    GGML_ASSERT(x->ne[0] == n_embd);
+    GGML_ASSERT(x->ne[1] == n_tokens);
+    GGML_ASSERT(x->ne[2] == 1);
+    GGML_ASSERT(x->ne[3] == 1);
+
+    GGML_ASSERT(inject->ne[0] == hc);
+    GGML_ASSERT(inject->ne[1] == n_tokens);
+    GGML_ASSERT(inject->ne[2] == 1);
+    GGML_ASSERT(inject->ne[3] == 1);
+
+    // the rows are read contiguously; the stream and token strides are free
+    GGML_ASSERT(residual->nb[0] == ggml_type_size(residual->type));
+    GGML_ASSERT(x->nb[0]        == ggml_type_size(x->type));
+    GGML_ASSERT(inject->nb[0]   == ggml_type_size(inject->type));
+
+    float params[2] = { scale, mult };
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_HC_INJECT;
+    result->src[0] = residual;
+    result->src[1] = x;
+    result->src[2] = inject;
 
     return result;
 }
