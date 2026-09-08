@@ -27,6 +27,32 @@
 #include <utility>
 #include <fstream>
 
+// LLAMA_SPEC_TIMING=1: host-side timing of the speculative loop by stage, printed every 128
+// verification steps (ms per step): draft checkpoint save, drafting, draft restore + re-eval,
+// target checkpoint save, verification decode, sampling, rollback, and the wall between steps
+struct server_spec_timing {
+    const bool enabled = getenv("LLAMA_SPEC_TIMING") != nullptr;
+    int64_t steps = 0, tokens = 0, last_step_us = 0;
+    double dft_save = 0, draft = 0, dft_restore = 0, tgt_save = 0, verify = 0, sample = 0, rollback = 0, accept = 0, post = 0, wall = 0;
+    double smpl_clone = 0, lora_embd = 0, update_slots = 0;
+    void end_step(size_t n_accepted) {
+        if (!enabled) { return; }
+        const int64_t now = ggml_time_us();
+        if (last_step_us) { wall += (now - last_step_us) / 1000.0; }
+        last_step_us = now;
+        steps++; tokens += n_accepted;
+        if (steps % 128 == 0) {
+            const double n = steps;
+            SRV_INF("spec timing: %" PRId64 " steps, %.2f accepted/step | per step ms: wall %.2f = dft_save %.2f + draft %.2f + dft_restore %.2f + tgt_save %.2f + verify %.2f + sample %.2f + rollback %.2f + accept %.2f + post %.2f + gaps %.2f | smpl_clone %.2f lora_embd %.2f update_slots %.2f\n",
+                    steps, tokens / n, wall / n, dft_save / n, draft / n, dft_restore / n, tgt_save / n, verify / n, sample / n, rollback / n, accept / n, post / n,
+                    (wall - dft_save - draft - dft_restore - tgt_save - verify - sample - rollback - accept - post) / n, smpl_clone / n, lora_embd / n, update_slots / n);
+        }
+    }
+};
+static server_spec_timing g_spec_timing;
+#define SPEC_T0() const int64_t spec_t0_ = g_spec_timing.enabled ? ggml_time_us() : 0
+#define SPEC_ADD(field) do { if (g_spec_timing.enabled) { g_spec_timing.field += (ggml_time_us() - spec_t0_) / 1000.0; } } while (0)
+
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -2768,6 +2794,7 @@ private:
 #endif
 
     void update_slots() {
+        struct spec_us_timer { int64_t t0 = g_spec_timing.enabled ? ggml_time_us() : 0; ~spec_us_timer() { if (g_spec_timing.enabled) { g_spec_timing.update_slots += (ggml_time_us() - t0) / 1000.0; } } } spec_us_timer_;
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -2822,6 +2849,7 @@ private:
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
 
+        const int64_t spec_lora_t0 = g_spec_timing.enabled ? ggml_time_us() : 0;
         if (batch.slot_batched) {
             auto & slot_batched      = batch.slot_batched;
             auto & alora_scale       = batch.alora_scale;
@@ -2840,6 +2868,7 @@ private:
 
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
+        if (g_spec_timing.enabled) { g_spec_timing.lora_embd += (ggml_time_us() - spec_lora_t0) / 1000.0; }
 
         llama_batch batch_view;
         int32_t off_next = 0;
@@ -2998,7 +3027,9 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
+                            SPEC_T0();
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            SPEC_ADD(dft_save);
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -3021,7 +3052,9 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
+                SPEC_T0();
                 common_speculative_draft(spec.get());
+                SPEC_ADD(draft);
             });
         }
 
@@ -3036,6 +3069,7 @@ private:
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
             if (ctx_dft) {
+                SPEC_T0();
                 if (use_ckpt_dft) {
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
@@ -3043,6 +3077,7 @@ private:
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
+                SPEC_ADD(dft_restore);
             }
 
             if (!draft.empty()) {
@@ -3056,10 +3091,9 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
+                    SPEC_T0();
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                    //const int64_t t_total = ggml_time_us() - t_start;
-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
+                    SPEC_ADD(tgt_save);
 
                     SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
                             ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
@@ -3653,9 +3687,13 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            SPEC_T0();
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
+            }
+            if (batch_view.n_tokens <= 16) {
+                SPEC_ADD(verify);
             }
         });
 
@@ -3882,15 +3920,19 @@ private:
 
             // verify and try to accept the draft
             {
+                const int64_t spec_clone_t0 = g_spec_timing.enabled ? ggml_time_us() : 0;
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                if (g_spec_timing.enabled) { g_spec_timing.smpl_clone += (ggml_time_us() - spec_clone_t0) / 1000.0; }
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                SPEC_T0();
                 auto accepted = synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                SPEC_ADD(sample);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3916,16 +3958,21 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        {
+                            SPEC_T0();
+                            ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                        if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            if (slot.ctx_dft) {
+                                ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            }
+
+                            slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                            SPEC_ADD(rollback);
                         }
-
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        g_spec_timing.end_step(slot.spec_draft.size() - 1);
 
                         return;
                     }
@@ -3935,11 +3982,16 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                {
+                    SPEC_T0();
+                    common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                    SPEC_ADD(accept);
+                }
 
                 slot.spec_draft = std::move(accepted);
             }
 
+            const int64_t spec_post_t0 = g_spec_timing.enabled ? ggml_time_us() : 0;
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
@@ -3992,6 +4044,11 @@ private:
             }
 
             slot.print_timings_tg();
+
+            if (g_spec_timing.enabled) {
+                g_spec_timing.post += (ggml_time_us() - spec_post_t0) / 1000.0;
+                g_spec_timing.end_step(n_accepted);
+            }
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
