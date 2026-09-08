@@ -325,6 +325,13 @@ static bool qwen4exp_fused_hc_enabled() {
     return enabled;
 }
 
+// LLAMA_QSA_NO_SPARSE_FA=1 withholds the finite-entry bound from the attention op, so a backend
+// with sparse flash attention attends the whole cache under the mask instead, for A/B runs
+static bool qsa_sparse_fa_enabled() {
+    static const bool enabled = getenv("LLAMA_QSA_NO_SPARSE_FA") == nullptr;
+    return enabled;
+}
+
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
@@ -1081,7 +1088,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // combine with the original kq mask
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
+    // every mask row keeps at most n_top_k finite cells, so a backend with sparse flash attention
+    // can attend those cells only (ggml_flash_attn_ext_set_n_kv_max); the others ignore the bound
+    const int64_t n_kv_max = qsa_sparse_fa_enabled() ? top_k->ne[0] : 0;
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, n_kv_max, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     return cur;
