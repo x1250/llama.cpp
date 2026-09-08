@@ -1,0 +1,117 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+#include "types.glsl"
+
+// Compact K/V/mask for the sparse flash attention. For the tiles [tile0, tile0 + n) of batch batch0, the
+// cells of each tile's list (flash_attn_sparse_idx.comp) are gathered once into f16 rows, one region of
+// compact_cap rows per (tile, head), and the tile's Br mask rows into [Br][compact_cap]. The rows past
+// the list's length up to the next multiple of Bc are zero K/V and -inf mask, so the attention shader
+// runs its aligned dense path over [0, round_up(count, Bc)). One workgroup per (tile, chunk of Bc rows).
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 256;
+layout (constant_id = 1) const uint KTYPE = 1;   // ggml_type of K: 1 = f16, 8 = q8_0
+layout (constant_id = 2) const uint VTYPE = 1;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer IDX {uint data_idx[];};
+layout (binding = 1) readonly buffer K16 {f16vec4 k_f16[];};
+layout (binding = 1) readonly buffer K8  {block_q8_0_packed16 k_q8[];};
+layout (binding = 2) readonly buffer V16 {f16vec4 v_f16[];};
+layout (binding = 2) readonly buffer V8  {block_q8_0_packed16 v_q8[];};
+layout (binding = 3) readonly buffer M   {float16_t data_m[];};
+layout (binding = 4) writeonly buffer KC {f16vec4 kc[];};
+layout (binding = 5) writeonly buffer VC {f16vec4 vc[];};
+layout (binding = 6) writeonly buffer MC {float16_t mc[];};
+
+layout (push_constant) uniform parameter {
+    uint nem1;          // mask rows
+    uint n_lists;       // lists start after the counts
+    uint list_stride;
+    uint list_tiles;
+    uint compact_cap;   // rows per (tile, head) in the compact regions
+    uint tile0;
+    uint list_batch;    // mask batch of the lists
+    uint n_head_kv;
+    uint hsk;
+    uint hsv;
+    uint k_row;         // K strides and batch base in elements of the typed view: f16vec4 for f16, blocks for q8_0
+    uint k_head;
+    uint k_base;
+    uint v_row;
+    uint v_head;
+    uint v_base;
+    uint m_row;         // mask row stride and batch base in elements
+    uint m_base;
+    uint Br;
+    uint Bc;
+};
+
+f16vec4 load4(const bool is_k, const uint base, const uint e) {
+    // base: row start in the typed view; e: first of 4 elements in the row
+    if ((is_k ? KTYPE : VTYPE) == 8u) {
+        const uint ib = base + e / 32u;
+        const uint iq = e % 32u;
+        const float d = float(is_k ? k_q8[ib].d : v_q8[ib].d);
+        const int  w0 = int(is_k ? k_q8[ib].qs[iq / 2u]      : v_q8[ib].qs[iq / 2u]);
+        const int  w1 = int(is_k ? k_q8[ib].qs[iq / 2u + 1u] : v_q8[ib].qs[iq / 2u + 1u]);
+        // int16 words hold two int8 each; sign-extend through the shifts
+        const vec4 q = vec4(float((w0 << 24) >> 24), float((w0 << 16) >> 24), float((w1 << 24) >> 24), float((w1 << 16) >> 24));
+        return f16vec4(d * q);
+    }
+    return is_k ? k_f16[base + e / 4u] : v_f16[base + e / 4u];
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint g   = gl_WorkGroupID.x;            // tile within the dispatch
+    const uint j0  = gl_WorkGroupID.y * Bc;       // first row of this workgroup's chunk
+    const uint i   = tile0 + g;                   // tile within the batch
+
+    const uint li     = list_batch * list_tiles + i;
+    const uint count  = min(data_idx[li], list_stride);
+    const uint n_rows = ((count + Bc - 1u) / Bc) * Bc;
+
+    if (j0 >= n_rows) {
+        return;
+    }
+
+    const uint hsk4 = hsk / 4u;
+    const uint hsv4 = hsv / 4u;
+    const uint list = n_lists + li * list_stride;
+    // padding columns: -inf like a masked cell, so the attention skips whole blocks of them;
+    // rows past the mask: 0 like the attention's own out-of-range rows (their output is not stored)
+    const float16_t NEG_INF16 = float16_t(uintBitsToFloat(0xFF800000u));
+
+    for (uint jj = 0; jj < Bc; ++jj) {
+        const uint j = j0 + jj;
+        if (j >= n_rows) {
+            break;
+        }
+        const bool valid = j < count;
+        const uint cell  = valid ? data_idx[list + j] : 0u;
+
+        for (uint t = tid; t < n_head_kv * (hsk4 + hsv4); t += BLOCK_SIZE) {
+            const uint h  = t / (hsk4 + hsv4);
+            const uint e4 = t % (hsk4 + hsv4);
+            if (e4 < hsk4) {
+                kc[((g * n_head_kv + h) * compact_cap + j) * hsk4 + e4] =
+                    valid ? load4(true, k_base + h * k_head + cell * k_row, e4 * 4u) : f16vec4(0.0);
+            } else {
+                const uint v4 = e4 - hsk4;
+                vc[((g * n_head_kv + h) * compact_cap + j) * hsv4 + v4] =
+                    valid ? load4(false, v_base + h * v_head + cell * v_row, v4 * 4u) : f16vec4(0.0);
+            }
+        }
+
+        if (tid < Br) {
+            const uint r = i * Br + tid;
+            mc[(g * Br + tid) * compact_cap + j] = !valid ? NEG_INF16 : (r < nem1 ? data_m[m_base + r * m_row + cell] : float16_t(0.0));
+        }
+    }
+}

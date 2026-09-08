@@ -10698,11 +10698,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // sparse K/V (n_kv_max > 0): a backend may attend the finite mask entries only; the reference stays dense.
     // qwen4exp shapes: head 256, 2 KV heads, GQA 12; the bounds keep kv >= 8 x n_kv_max, where the Vulkan
-    // sparse path runs, and the 2051-cell cases use the model's own selection up to the production depth
-    // (3, 128 and 512 rows at 131072 cells: the verification, block and serial-prepass shapes)
+    // sparse path runs, and the last pairs use the model's own 2051-cell selection. Batches of 64 rows
+    // and more take the compact mode (per-tile gathered rows), the rest the index mode
     for (const auto & c : std::vector<std::tuple<int64_t, int, int64_t>>{{4096, 1, 64}, {4096, 3, 512}, {4096, 512, 64}, {16384, 1, 1024},
-                                                                          {16384, 16, 64}, {32768, 1, 2051}, {32768, 3, 2051},
-                                                                          {131072, 3, 2051}, {131072, 128, 2051}, {131072, 512, 2051}}) {
+                                                                          {16384, 16, 64}, {16384, 64, 1024}, {32768, 1, 2051}, {32768, 3, 2051},
+                                                                          {32768, 128, 2051}, {131072, 3, 2051}, {131072, 128, 2051}, {131072, 512, 2051}}) {
         for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, std::get<0>(c), std::get<1>(c), true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, std::get<2>(c)));
         }

@@ -1172,6 +1172,7 @@ struct vk_device_struct {
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
     std::map<uint32_t, vk_pipeline> pipeline_fa_sparse_idx;   // keyed by Br
+    std::map<std::pair<ggml_type, ggml_type>, vk_pipeline> pipeline_fa_sparse_gather;   // keyed by (K type, V type)
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     vk_pipeline pipeline_count_experts;
@@ -1480,6 +1481,30 @@ struct vk_flash_attn_sparse_push_constants {
     vk_flash_attn_push_constants base;
     uint32_t list_stride;
     uint32_t list_tiles;
+    // compact mode: rows per (tile, head) of the compact regions and the dispatch's first tile and batch
+    uint32_t compact_cap;
+    uint32_t tile0;
+    uint32_t batch0;
+};
+
+// compact mode gather (see flash_attn_sparse_gather.comp): the cells of each tile's list copied into
+// f16 rows, one region of compact_cap rows per (tile, head), plus the tile's mask rows
+struct vk_op_flash_attn_sparse_gather_push_constants {
+    uint32_t nem1;
+    uint32_t n_lists;
+    uint32_t list_stride;
+    uint32_t list_tiles;
+    uint32_t compact_cap;
+    uint32_t tile0;
+    uint32_t list_batch;
+    uint32_t n_head_kv;
+    uint32_t hsk;
+    uint32_t hsv;
+    uint32_t k_row, k_head, k_base;   // strides in elements of the typed view (f16vec4 or q8_0 blocks)
+    uint32_t v_row, v_head, v_base;
+    uint32_t m_row, m_base;           // in f16 elements
+    uint32_t Br;
+    uint32_t Bc;
 };
 
 struct vk_op_flash_attn_sparse_idx_push_constants {
@@ -1491,8 +1516,11 @@ struct vk_op_flash_attn_sparse_idx_push_constants {
     uint32_t chunk_pass;   // chunked: 1 = write the chunk counts, 2 = place the cells after the chunks before
 };
 
-// flag bit of vk_fa_pipeline_state for the sparse K/V shader variant
+// flag bits of vk_fa_pipeline_state for the sparse K/V shader variant and its compact mode
 #define FA_PIPELINE_FLAG_SPARSE 16u
+#define FA_PIPELINE_FLAG_SPARSE_COMPACT 32u
+// compact scratch per FA node: the tiles of a dispatch fit their (K, V, mask) regions in this budget
+#define FA_SPARSE_COMPACT_BUDGET (1024ull * 1024 * 1024)
 // columns per fa_sparse_idx workgroup: 128 threads x FA_SPARSE_IDX_ITERS (must match the shader's staging size)
 #define FA_SPARSE_IDX_ITERS 16u
 #define FA_SPARSE_IDX_CHUNK (128u * FA_SPARSE_IDX_ITERS)
@@ -4226,7 +4254,8 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 }
 
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type, bool use_sparse) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type,
+                                                  bool use_sparse, bool use_sparse_compact) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -4234,7 +4263,8 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
-                     (use_sparse        ? FA_PIPELINE_FLAG_SPARSE : 0);
+                     (use_sparse        ? FA_PIPELINE_FLAG_SPARSE : 0) |
+                     (use_sparse_compact ? FA_PIPELINE_FLAG_SPARSE_COMPACT : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -4963,10 +4993,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 continue;
 #endif
             } else if (sparse) {
-                GGML_ASSERT(!aligned);
+                // index mode bounds every tile by its list length, which only the unaligned variant checks;
+                // compact mode reads rows padded to Bc and takes the aligned variant
+                const bool compact = (fa.first.flags & FA_PIPELINE_FLAG_SPARSE_COMPACT) != 0;
+                GGML_ASSERT(aligned == compact);
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm1_sparse_data;        spv_size = flash_attn_f32_f16_cm1_sparse_len; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_sparse_data; spv_size = flash_attn_f32_f16_f16acc_cm1_sparse_len; }
-                name = "flash_attn_f32_f16_cm1_sparse";
+                name = compact ? "flash_attn_f32_f16_cm1_sparse_compact" : "flash_attn_f32_f16_cm1_sparse";
             } else {
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
@@ -6114,6 +6147,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     for (auto &it : device->pipeline_fa_sparse_idx) {
         ggml_vk_create_pipeline(device, it.second, "fa_sparse_idx", fa_sparse_idx_len, fa_sparse_idx_data, "main", 2, sizeof(vk_op_flash_attn_sparse_idx_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, it.first, FA_SPARSE_IDX_ITERS}, 1, true, true, device->subgroup_size);
+    }
+
+    for (auto &it : device->pipeline_fa_sparse_gather) {
+        ggml_vk_create_pipeline(device, it.second, "fa_sparse_gather", fa_sparse_gather_len, fa_sparse_gather_data, "main", 7, sizeof(vk_op_flash_attn_sparse_gather_push_constants), {1, 1, 1}, {256, (uint32_t) it.first.first, (uint32_t) it.first.second}, 1, true);
     }
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
@@ -11708,6 +11745,16 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                   ctx->device->coopmat1_fa_support && ctx->device->subgroup_ballot &&
                                   ctx->device->properties.limits.maxPushConstantsSize >= sizeof(vk_flash_attn_sparse_push_constants);
 
+    // compact mode: a prefill's tiles (many query rows, one mask slice per batch) gather the cells of
+    // their lists into f16 rows once and attend them with the aligned dense loop; a decode's tiles keep
+    // the index mode (one gather of the whole row set would cost more than the attention itself)
+    static const bool disable_sparse_fa_compact = getenv("GGML_VK_DISABLE_SPARSE_FA_COMPACT") != nullptr;
+    auto gather_type_ok = [](ggml_type t) { return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0; };
+    // (the aligned attention variant needs 8-element strides: the compact rows are HSK/HSV wide)
+    const bool compact_candidate = !disable_sparse_fa_compact && sparse_candidate && neq1 >= 64 && nem2 == 1 && (HSK % 8) == 0 && (HSV % 8) == 0 &&
+                                   ((nbq1 / ggml_type_size(q->type)) % 8) == 0 &&
+                                   gather_type_ok(k->type) && gather_type_ok(v->type);
+
     const bool use_dequant_kv = !sparse_candidate && k_quant && v_quant && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
@@ -11719,8 +11766,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                 // Intel Xe1 regresses, see PR 25494
                                 (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
                                  (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
-    const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;
-    const ggml_type v_type_eff = use_dequant_kv ? GGML_TYPE_F16 : v->type;
+    // the attention shader reads f16 rows from the scratch in the dequant and compact modes
+    ggml_type k_type_eff = (use_dequant_kv || compact_candidate) ? GGML_TYPE_F16 : k->type;
+    ggml_type v_type_eff = (use_dequant_kv || compact_candidate) ? GGML_TYPE_F16 : v->type;
 
     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
@@ -11739,7 +11787,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
 
-    const bool use_sparse = sparse_candidate && tuning_params.path == FA_COOPMAT1;
+    const bool use_sparse  = sparse_candidate  && tuning_params.path == FA_COOPMAT1;
+    const bool use_compact = compact_candidate && use_sparse;
+    if (compact_candidate && !use_compact) {
+        // the coopmat1 path was not taken: attend the cache with its own types
+        k_type_eff = k->type;
+        v_type_eff = v->type;
+        tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+    }
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
@@ -11755,6 +11810,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     uint32_t nbk2_eff = (uint32_t)nbk2, nbk3_eff = (uint32_t)nbk3;
     uint32_t nbv2_eff = (uint32_t)nbv2, nbv3_eff = (uint32_t)nbv3;
+    if (use_compact) {
+        // the compact regions are contiguous f16 rows; the shader derives the head and tile offsets itself
+        k_stride = HSK;
+        v_stride = HSV;
+    }
     if (use_dequant_kv) {
         k_stride = HSK;
         v_stride = HSV;
@@ -11774,9 +11834,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         aligned = false;
     }
 
-    // the sparse shader bounds every tile by the list length, which the aligned variant does not check
+    // the sparse index mode bounds every tile by the list length, which the aligned variant does not
+    // check; the compact mode reads rows padded to Bc and always takes the aligned variant
     if (use_sparse) {
-        aligned = false;
+        aligned = use_compact;
     }
 
     float scale         = 1.0f;
@@ -11796,7 +11857,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256)
                         && !use_sparse;
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff, use_sparse);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff, use_sparse, use_compact);
 
     vk_pipeline pipeline = nullptr;
 
@@ -11846,7 +11907,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     // Try to use split_k when KV is large enough to be worth the overhead.
-    if (gqa_ratio > 1 && workgroups_x <= Br) {
+    if (use_compact) {
+        // the compact tiles run as groups of whole tiles
+    } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
@@ -11922,6 +11985,46 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
         if (ctx->prealloc_y_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+    }
+
+    // compact mode: prealloc_x holds the (K, V, mask) regions of one group of tiles at a time,
+    // [tiles][nek2][C][HSK] f16, [tiles][nev2][C][HSV] f16, [tiles][Br][C] f16 with C = list_stride;
+    // the groups of one node are gathered and attended in turn
+    const uint32_t compact_cap     = use_compact ? list_stride : 0;
+    const uint64_t compact_k_tile  = (uint64_t) nek2 * compact_cap * HSK * sizeof(ggml_fp16_t);
+    const uint64_t compact_v_tile  = (uint64_t) nev2 * compact_cap * HSV * sizeof(ggml_fp16_t);
+    const uint64_t compact_m_tile  = (uint64_t) Br * compact_cap * sizeof(ggml_fp16_t);
+    const uint64_t compact_tile    = compact_k_tile + compact_v_tile + compact_m_tile;
+    const uint32_t compact_group   = use_compact ? (uint32_t) std::max<uint64_t>(1, std::min<uint64_t>(list_tiles, FA_SPARSE_COMPACT_BUDGET / compact_tile)) : 0;
+    const uint64_t compact_size    = compact_group * compact_tile;
+    const uint32_t compact_batches = use_compact ? (uint32_t) neq3 : 0;
+    const uint32_t compact_groups  = use_compact ? CEIL_DIV(list_tiles, compact_group) * compact_batches : 0;
+
+    vk_pipeline pipeline_fa_sparse_gather = nullptr;
+    if (use_compact) {
+        GGML_ASSERT(compact_size <= ctx->device->properties.limits.maxStorageBufferRange);
+        {
+            std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
+            auto &pipelines = ctx->device->pipeline_fa_sparse_gather;
+            auto it = pipelines.find({k->type, v->type});
+            if (it != pipelines.end()) {
+                pipeline_fa_sparse_gather = it->second;
+            } else {
+                pipelines[{k->type, v->type}] = pipeline_fa_sparse_gather = std::make_shared<vk_pipeline_struct>();
+            }
+        }
+        assert(pipeline_fa_sparse_gather);
+        // one gather and one attention dispatch per group (the attention pipeline already holds one set)
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline_fa_sparse_gather, compact_groups);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, compact_groups - 1);
+
+        if (ctx->prealloc_size_x < compact_size) {
+            ctx->prealloc_size_x = compact_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_x_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
         }
     }
@@ -12030,9 +12133,49 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                               scale, max_bias, logit_softcap,
                                               mask_n_head_log2, m0, m1,
                                               gqa_ratio, split_kv, split_k };
-    const vk_flash_attn_sparse_push_constants pc_sparse = { pc, list_stride, list_tiles };
+    const vk_flash_attn_sparse_push_constants pc_sparse = { pc, list_stride, list_tiles, compact_cap, 0, 0 };
 
-    if (split_k > 1) {
+    if (use_compact) {
+        GGML_ASSERT(split_k == 1);
+        const uint32_t rk3 = (uint32_t) (neq3 / nek3);
+        const uint32_t rv3 = (uint32_t) (neq3 / nev3);
+        const uint32_t k_unit = k->type == GGML_TYPE_F16 ? 4 * sizeof(ggml_fp16_t) : (uint32_t) ggml_type_size(k->type);
+        const uint32_t v_unit = v->type == GGML_TYPE_F16 ? 4 * sizeof(ggml_fp16_t) : (uint32_t) ggml_type_size(v->type);
+        GGML_ASSERT(nbk1 % k_unit == 0 && nbk2 % k_unit == 0 && nbk3 % k_unit == 0);
+        GGML_ASSERT(nbv1 % v_unit == 0 && nbv2 % v_unit == 0 && nbv3 % v_unit == 0);
+
+        const vk_subbuffer kc_buf = { ctx->prealloc_x, 0,                                                 compact_group * compact_k_tile };
+        const vk_subbuffer vc_buf = { ctx->prealloc_x, compact_group * compact_k_tile,                    compact_group * compact_v_tile };
+        const vk_subbuffer mc_buf = { ctx->prealloc_x, compact_group * (compact_k_tile + compact_v_tile), compact_group * compact_m_tile };
+
+        for (uint32_t b = 0; b < compact_batches; ++b) {
+            for (uint32_t tile0 = 0; tile0 < list_tiles; tile0 += compact_group) {
+                const uint32_t n_g = std::min(compact_group, list_tiles - tile0);
+
+                const vk_op_flash_attn_sparse_gather_push_constants gather_pc = {
+                    nem1, n_lists, list_stride, list_tiles, compact_cap, tile0, b % nem3,
+                    (uint32_t) nek2, HSK, HSV,
+                    (uint32_t) (nbk1 / k_unit), (uint32_t) (nbk2 / k_unit), (uint32_t) ((b / rk3) * nbk3 / k_unit),
+                    (uint32_t) (nbv1 / v_unit), (uint32_t) (nbv2 / v_unit), (uint32_t) ((b / rv3) * nbv3 / v_unit),
+                    (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)), (uint32_t) ((b % nem3) * mask->nb[3] / sizeof(ggml_fp16_t)),
+                    Br, Bc,
+                };
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_sparse_gather,
+                                          { idx_buf, k_buf, v_buf, mask_buf, kc_buf, vc_buf, mc_buf }, gather_pc,
+                                          { n_g, compact_cap / Bc, 1 });
+                ggml_vk_sync_buffers(ctx, subctx);
+
+                vk_flash_attn_sparse_push_constants pc_group = pc_sparse;
+                pc_group.tile0  = tile0;
+                pc_group.batch0 = b;
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                          {q_buf, kc_buf, vc_buf, mc_buf, sinks_buf, dst_buf, mask_opt_buf, idx_buf},
+                                          pc_group, { n_g * Br, workgroups_y, 1 });
+                // the next group overwrites the regions
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+        }
+    } else if (split_k > 1) {
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
 
         if (ctx->prealloc_split_k_need_sync) {
@@ -12082,7 +12225,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         }
     }
 
-    if (use_dequant_kv) {
+    if (use_dequant_kv || use_compact) {
         ctx->prealloc_x_need_sync = true;
     }
     if (use_sparse) {

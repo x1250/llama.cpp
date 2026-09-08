@@ -23,11 +23,14 @@
 #endif
 
 #ifdef FA_SPARSE
-// the cache rows of the current tile, staged from the query tile's list
+// index mode gathers the cache rows named by the tile's list, staged per tile; compact mode reads the
+// tile's own contiguous rows (flash_attn_sparse_gather.comp)
 shared uint32_t idxsh[Bc];
-#define KV_ROW(c) idxsh[(c)]
+#define KV_ROW(c) (SPARSE_COMPACT ? (j * Bc + (c)) : idxsh[(c)])
+#define FA_COMPACT_ROWS SPARSE_COMPACT
 #else
 #define KV_ROW(c) (j * Bc + (c))
+#define FA_COMPACT_ROWS false
 #endif
 
 // These need to be supported N,M values for a MatBc x MatBr x 16 coopmatmuladd
@@ -163,6 +166,18 @@ void main() {
         m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * p.KV;
         mo_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * CEIL_DIV(p.nem1, Br) * mo_stride;
     }
+    // first mask row of this tile: the tile's own rows in compact mode
+    uint32_t m_row0 = i * Br;
+#ifdef FA_SPARSE
+    if (SPARSE_COMPACT) {
+        const uint32_t g = gl_WorkGroupID.x;
+        k_offset = (g * p.nek2 + ik2) * p.compact_cap * HSK;   // f16 rows, element units
+        v_offset = (g * p.nev2 + iv2) * p.compact_cap * HSV;
+        m_offset = g * Br * p.compact_cap;
+        m_stride = p.compact_cap;
+        m_row0   = 0;
+    }
+#endif
 
     uint32_t mask_opt = 0;
     uint32_t mask_opt_idx = ~0;
@@ -174,10 +189,12 @@ void main() {
 
 #ifdef FA_SPARSE
         // the previous tile's readers of idxsh are done after the barrier at the end of the loop body
-        if (tid < Bc) {
-            idxsh[tid] = (j * Bc + tid < KV) ? data_idx[list_base + j * Bc + tid] : 0;
+        if (!SPARSE_COMPACT) {
+            if (tid < Bc) {
+                idxsh[tid] = (j * Bc + tid < KV) ? data_idx[list_base + j * Bc + tid] : 0;
+            }
+            barrier();
         }
-        barrier();
 #endif
 
         [[unroll]] for (uint32_t idx = 0; idx < mask_cache.length(); ++idx) {
@@ -196,7 +213,7 @@ void main() {
             }
             // Only load if the block is not all zeros
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
-                bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
+                bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0 && !FA_COMPACT_ROWS;
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
                 [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
@@ -206,26 +223,26 @@ void main() {
                         if ((!KV_bounds_check || j * Bc + c < KV)) {
                             f16vec4 m;
                             float max_valid = NEG_FLT_MAX_OVER_2;
-                            if (!nem1_bounds_check || i * Br + r * 4 + 3 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + KV_ROW(c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + KV_ROW(c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + KV_ROW(c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 3) * m_stride + KV_ROW(c)]);
+                            if (!nem1_bounds_check || m_row0 + r * 4 + 3 < p.nem1) {
+                                m = f16vec4(data_m[m_offset + (m_row0 + r * 4    ) * m_stride + KV_ROW(c)],
+                                            data_m[m_offset + (m_row0 + r * 4 + 1) * m_stride + KV_ROW(c)],
+                                            data_m[m_offset + (m_row0 + r * 4 + 2) * m_stride + KV_ROW(c)],
+                                            data_m[m_offset + (m_row0 + r * 4 + 3) * m_stride + KV_ROW(c)]);
                                 max_valid = max(max(max(float(m[0]), float(m[1])), float(m[2])), float(m[3]));
-                            } else if (i * Br + r * 4 + 2 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + KV_ROW(c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + KV_ROW(c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + KV_ROW(c)],
+                            } else if (m_row0 + r * 4 + 2 < p.nem1) {
+                                m = f16vec4(data_m[m_offset + (m_row0 + r * 4    ) * m_stride + KV_ROW(c)],
+                                            data_m[m_offset + (m_row0 + r * 4 + 1) * m_stride + KV_ROW(c)],
+                                            data_m[m_offset + (m_row0 + r * 4 + 2) * m_stride + KV_ROW(c)],
                                             0.0);
                                 max_valid = max(max(float(m[0]), float(m[1])), float(m[2]));
-                            } else if (i * Br + r * 4 + 1 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + KV_ROW(c)],
-                                            data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + KV_ROW(c)],
+                            } else if (m_row0 + r * 4 + 1 < p.nem1) {
+                                m = f16vec4(data_m[m_offset + (m_row0 + r * 4    ) * m_stride + KV_ROW(c)],
+                                            data_m[m_offset + (m_row0 + r * 4 + 1) * m_stride + KV_ROW(c)],
                                             0.0,
                                             0.0);
                                 max_valid = max(float(m[0]), float(m[1]));
-                            } else if (i * Br + r * 4 < p.nem1) {
-                                m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + KV_ROW(c)],
+                            } else if (m_row0 + r * 4 < p.nem1) {
+                                m = f16vec4(data_m[m_offset + (m_row0 + r * 4    ) * m_stride + KV_ROW(c)],
                                             0.0,
                                             0.0,
                                             0.0);
