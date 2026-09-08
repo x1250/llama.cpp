@@ -11684,8 +11684,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         };
 
         if (chunked) {
-            // the chunks of a tile reserve their ranges with an atomic on the tile's count
-            ggml_vk_buffer_memset_async(subctx, ctx->prealloc_y, 0, 0, sizeof(uint32_t) * n_lists);
+            // the chunks of a tile reserve their ranges with an atomic on the tile's count, so the
+            // counts are zeroed in queue order right before the prepass. ggml_vk_buffer_memset_async
+            // would not do: on a UMA device it defers a host memset to the submission, ahead of every
+            // node of the command buffer, and the counts of the nodes already recorded would accumulate
+            subctx->s->buffer->buf.fillBuffer(ctx->prealloc_y->buffer, 0, sizeof(uint32_t) * n_lists, 0);
             ggml_vk_sync_buffers(ctx, subctx);
         }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_sparse_idx,
@@ -11782,7 +11785,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         ctx->prealloc_x_need_sync = true;
     }
     if (use_sparse) {
+        // the lists overwrote prealloc_y, where the matmul paths keep the last converted activations
+        // and reuse them for the next matmul of the same tensor: drop that cache
         ctx->prealloc_y_need_sync = true;
+        ctx->prealloc_y_last_pipeline_used = nullptr;
+        ctx->prealloc_y_last_tensor_used = nullptr;
     }
 }
 
