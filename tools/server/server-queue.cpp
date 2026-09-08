@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <thread>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -296,11 +297,17 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         return (now - time_last_task) >= idle_sleep_ms;
     };
 
+    // LLAMA_SPEC_TIMING=1: where the loop spends its time between two update_slots (ms per iteration)
+    static const bool loop_timing = getenv("LLAMA_SPEC_TIMING") != nullptr;
+    int64_t lt_iters = 0, lt_prev_end = 0; double lt_tasks = 0, lt_update = 0, lt_wait = 0, lt_between = 0;
+
     while (true) {
         QUE_DBG("%s", "processing new tasks\n");
+        const int64_t lt_t0 = loop_timing ? ggml_time_us() : 0;
         if (process_new_tasks(false)) {
             break; // terminate
         }
+        const int64_t lt_t1 = loop_timing ? ggml_time_us() : 0;
 
         // all tasks in the current loop is processed, slots data is now ready
         QUE_DBG("%s", "update slots\n");
@@ -308,6 +315,16 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         // this will run the main inference process for all slots
         const int64_t t_update_slots = ggml_time_ms();
         callback_update_slots();
+        const int64_t lt_t2 = loop_timing ? ggml_time_us() : 0;
+        if (loop_timing) {
+            lt_tasks += (lt_t1 - lt_t0) / 1000.0; lt_update += (lt_t2 - lt_t1) / 1000.0;
+            if (lt_prev_end) { lt_between += (lt_t0 - lt_prev_end) / 1000.0; }
+            lt_iters++;
+            if (lt_iters % 256 == 0) {
+                QUE_INF("loop timing: %" PRId64 " iterations | per iteration ms: tasks %.2f + update_slots %.2f + wait %.2f + between %.2f\n",
+                        lt_iters, lt_tasks / lt_iters, lt_update / lt_iters, lt_wait / lt_iters, lt_between / lt_iters);
+            }
+        }
         {
             // update_slots() may take a while to finish, we need to make sure it's not counted as idle
             // shift instead of reset, so that non-task_resets_idle_timer tasks do not delay the sleep
@@ -317,9 +334,11 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         }
 
         QUE_DBG("%s", "waiting for new tasks\n");
+        const int64_t lt_t3 = loop_timing ? ggml_time_us() : 0;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
             if (!running || !queue_tasks.empty()) {
+                if (loop_timing) { const int64_t now = ggml_time_us(); lt_wait += (now - lt_t3) / 1000.0; lt_prev_end = now; }
                 break; // go back to process new tasks or terminate
             }
 
