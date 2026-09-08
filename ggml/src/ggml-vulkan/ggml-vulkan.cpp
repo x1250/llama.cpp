@@ -1131,6 +1131,7 @@ struct vk_device_struct {
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
+    std::map<uint32_t, vk_pipeline> pipeline_fa_sparse_idx;   // keyed by Br
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     vk_pipeline pipeline_count_experts;
@@ -1432,6 +1433,28 @@ struct vk_flash_attn_push_constants {
     uint32_t k_num;
 };
 static_assert(sizeof(vk_flash_attn_push_constants) <= 128, "sizeof(vk_flash_attn_push_constants) must be <= 128");
+
+// sparse K/V flash attention: the base constants plus the per-tile cell lists (see flash_attn_sparse_idx.comp).
+// Only devices with maxPushConstantsSize >= sizeof(...) take the sparse path.
+struct vk_flash_attn_sparse_push_constants {
+    vk_flash_attn_push_constants base;
+    uint32_t list_stride;
+    uint32_t list_tiles;
+};
+
+struct vk_op_flash_attn_sparse_idx_push_constants {
+    uint32_t nem0, nem1, nem2, nem3;
+    uint32_t nbm1, nbm2, nbm3;
+    uint32_t list_stride;
+    uint32_t list_tiles;
+    uint32_t chunk_cols;   // 0: one workgroup per tile; else columns per workgroup (atomic append)
+};
+
+// flag bit of vk_fa_pipeline_state for the sparse K/V shader variant
+#define FA_PIPELINE_FLAG_SPARSE 16u
+// columns per fa_sparse_idx workgroup: 128 threads x FA_SPARSE_IDX_ITERS (must match the shader's staging size)
+#define FA_SPARSE_IDX_ITERS 16u
+#define FA_SPARSE_IDX_CHUNK (128u * FA_SPARSE_IDX_ITERS)
 
 struct vk_op_push_constants {
     uint32_t KX;
@@ -4059,14 +4082,15 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 }
 
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type, bool use_sparse) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
     uint32_t flags = (use_mask_opt      ? 1 : 0) |
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
-                     (old_amd_windows   ? 8 : 0);
+                     (old_amd_windows   ? 8 : 0) |
+                     (use_sparse        ? FA_PIPELINE_FLAG_SPARSE : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -4718,6 +4742,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     for (auto &fa : device->pipeline_flash_attn_f32_f16) {
         if (fa.first.path != FA_SCALAR) continue;
+        GGML_ASSERT((fa.first.flags & FA_PIPELINE_FLAG_SPARSE) == 0 && "sparse FA is a coopmat1 pipeline");
         const uint32_t Br = fa.first.Br;
         const uint32_t Bc = fa.first.Bc;
         const bool aligned = fa.first.aligned;
@@ -4774,6 +4799,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const uint32_t Bc = fa.first.Bc;
             const bool aligned = fa.first.aligned;
             const bool f32acc = fa.first.f32acc;
+            const bool sparse = (fa.first.flags & FA_PIPELINE_FLAG_SPARSE) != 0;
             const uint32_t fa_sgs = fa.first.subgroup_size;
             const bool fa_ds = fa.first.subgroup_size == 0;
 
@@ -4785,19 +4811,26 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (bf16_kv) {
 #if defined(VK_KHR_shader_bfloat16) && defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
                 if (!device->coopmat_bf16_support) continue;
+                GGML_ASSERT(!sparse && "sparse FA has no bf16 variant");
                 spv_data = flash_attn_f32_f16_bf16_cm1_data;
                 spv_size = flash_attn_f32_f16_bf16_cm1_len;
                 name = aligned ? "flash_attn_f32_bf16_aligned_cm1" : "flash_attn_f32_bf16_cm1";
 #else
                 continue;
 #endif
+            } else if (sparse) {
+                GGML_ASSERT(!aligned);
+                if (f32acc) { spv_data = flash_attn_f32_f16_cm1_sparse_data;        spv_size = flash_attn_f32_f16_cm1_sparse_len; }
+                else        { spv_data = flash_attn_f32_f16_f16acc_cm1_sparse_data; spv_size = flash_attn_f32_f16_f16acc_cm1_sparse_len; }
+                name = "flash_attn_f32_f16_cm1_sparse";
             } else {
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
                 name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
             }
-            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
-                                    sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
+            // the sparse variant binds the cell lists as an 8th buffer and carries their layout in the push constants
+            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", sparse ? 8 : 7,
+                                    sparse ? sizeof(vk_flash_attn_sparse_push_constants) : sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                     !fa_ds, !fa_ds ? fa_sgs : 0);
         }
@@ -4808,6 +4841,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->coopmat2) {
         for (auto &fa : device->pipeline_flash_attn_f32_f16) {
             if (fa.first.path != FA_COOPMAT2) continue;
+            GGML_ASSERT((fa.first.flags & FA_PIPELINE_FLAG_SPARSE) == 0 && "sparse FA is a coopmat1 pipeline");
             const uint32_t Br = fa.first.Br;
             const uint32_t Bc = fa.first.Bc;
             const bool aligned = fa.first.aligned;
@@ -5916,6 +5950,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     for (auto &it : device->pipeline_fa_mask_opt) {
         auto BrBc = it.first;
         ggml_vk_create_pipeline(device, it.second, "fa_mask_opt", fa_mask_opt_len, fa_mask_opt_data, "main", 2, sizeof(vk_op_flash_attn_mask_opt_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, BrBc.first, BrBc.second}, 1, true, true, device->subgroup_size);
+    }
+
+    for (auto &it : device->pipeline_fa_sparse_idx) {
+        ggml_vk_create_pipeline(device, it.second, "fa_sparse_idx", fa_sparse_idx_len, fa_sparse_idx_data, "main", 2, sizeof(vk_op_flash_attn_sparse_idx_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, it.first, FA_SPARSE_IDX_ITERS}, 1, true, true, device->subgroup_size);
     }
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
@@ -11356,7 +11394,23 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     };
     const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
     const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
-    const bool use_dequant_kv = k_quant && v_quant && neq1 >= 64 &&
+
+    // sparse K/V: the graph bounds the finite entries of every mask row (op_params[4]) and the
+    // coopmat1 shader attends the cells of each query tile's list instead of the whole cache.
+    // The gathered rows are dequantized in the shader: at 40k the whole-cache f16 scratch cost
+    // what the gather saved (107 s vs 95 s for a 39.5k prefill on gfx1151). Anything the sparse
+    // path cannot take runs dense.
+    static const bool disable_sparse_fa = getenv("GGML_VK_DISABLE_SPARSE_FA") != nullptr;
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    // below 8 x n_kv_max the tiles' cell unions cover most of the cache (52% at 8k, 33% at 16k for the
+    // 2051-cell QSA selection) and the list prepass costs more than the gather saves: measured -2% at 8k
+    // and neutral at 16k on gfx1151, so the sparse path starts at 8 x n_kv_max
+    const bool sparse_candidate = !disable_sparse_fa && n_kv_max > 0 && mask != nullptr && (uint64_t) n_kv_max * 8 <= KV &&
+                                  k->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_BF16 &&
+                                  ctx->device->coopmat1_fa_support && ctx->device->subgroup_ballot &&
+                                  ctx->device->properties.limits.maxPushConstantsSize >= sizeof(vk_flash_attn_sparse_push_constants);
+
+    const bool use_dequant_kv = !sparse_candidate && k_quant && v_quant && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
@@ -11386,6 +11440,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+
+    const bool use_sparse = sparse_candidate && tuning_params.path == FA_COOPMAT1;
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
@@ -11420,6 +11476,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         aligned = false;
     }
 
+    // the sparse shader bounds every tile by the list length, which the aligned variant does not check
+    if (use_sparse) {
+        aligned = false;
+    }
+
     float scale         = 1.0f;
     float max_bias      = 0.0f;
     float logit_softcap = 0.0f;
@@ -11434,9 +11495,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
     bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
-                        && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
+                        && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256)
+                        && !use_sparse;
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff, use_sparse);
 
     vk_pipeline pipeline = nullptr;
 
@@ -11470,6 +11532,17 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     GGML_ASSERT(Br == pipeline->wg_denoms[0]);
     const uint32_t Tr = CEIL_DIV(N, Br);
 
+    // sparse lists in prealloc_y: counts[n_lists] then lists[n_lists][list_stride]. A tile of Br
+    // mask rows holds at most Br * n_kv_max cells; split_k splits the list, not the cache
+    const uint32_t list_tiles  = use_sparse ? CEIL_DIV(nem1, Br) : 0;
+    const uint32_t list_stride = use_sparse ? ROUNDUP_POW2(std::min<uint32_t>(KV, (uint32_t) n_kv_max * Br), Bc) : 0;
+    const uint32_t n_lists     = list_tiles * nem2 * nem3;
+    const uint64_t sparse_size = use_sparse ? sizeof(uint32_t) * ((uint64_t) n_lists + (uint64_t) n_lists * list_stride) : 0;
+    const uint32_t KV_split    = use_sparse ? list_stride : KV;
+    if (use_sparse) {
+        split_kv = list_stride;
+    }
+
     // Try to use split_k when KV is large enough to be worth the overhead.
     if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
@@ -11483,8 +11556,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     if (split_k > 1) {
         // Try to evenly split KV into split_k chunks, but it needs to be a multiple
         // of "align", so recompute split_k based on that.
-        split_kv = ROUNDUP_POW2(std::max(1u, KV / split_k), alignment);
-        split_k = CEIL_DIV(KV, split_kv);
+        split_kv = ROUNDUP_POW2(std::max(1u, KV_split / split_k), alignment);
+        split_k = CEIL_DIV(KV_split, split_kv);
     }
 
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
@@ -11527,6 +11600,30 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         }
     }
 
+    vk_pipeline pipeline_fa_sparse_idx = nullptr;
+    if (use_sparse) {
+        {
+            std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
+            auto &pipelines = ctx->device->pipeline_fa_sparse_idx;
+            auto it = pipelines.find(Br);
+            if (it != pipelines.end()) {
+                pipeline_fa_sparse_idx = it->second;
+            } else {
+                pipelines[Br] = pipeline_fa_sparse_idx = std::make_shared<vk_pipeline_struct>();
+            }
+        }
+        assert(pipeline_fa_sparse_idx);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline_fa_sparse_idx, 1);
+
+        if (ctx->prealloc_size_y < sparse_size) {
+            ctx->prealloc_size_y = sparse_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_y_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+    }
+
     const uint32_t n_head_kv   = neq2;
     const uint32_t n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head_kv));
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
@@ -11539,6 +11636,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+    vk_subbuffer idx_buf = use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
 
     if (use_dequant_kv) {
         const uint64_t fp = sizeof(ggml_fp16_t);
@@ -11569,6 +11667,32 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
+
+    if (use_sparse) {
+        // a prefill has tiles enough to fill the GPU (one workgroup per tile, ascending list); a decode
+        // has one tile per token and splits the columns into chunks appended through an atomic. Measured
+        // on gfx1151: the chunks cost a prefill half of its gain at 32k, the single workgroup costs a
+        // decode 5 ms per token at 40k
+        const bool     chunked    = n_lists < 32;
+        const uint32_t chunk_cols = chunked ? FA_SPARSE_IDX_CHUNK : 0;
+        const vk_op_flash_attn_sparse_idx_push_constants idx_pc = {
+            nem0, nem1, nem2, nem3,
+            (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)),
+            (uint32_t)(mask->nb[2] / sizeof(ggml_fp16_t)),
+            (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)),
+            list_stride, list_tiles, chunk_cols,
+        };
+
+        if (chunked) {
+            // the chunks of a tile reserve their ranges with an atomic on the tile's count
+            ggml_vk_buffer_memset_async(subctx, ctx->prealloc_y, 0, 0, sizeof(uint32_t) * n_lists);
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_sparse_idx,
+                                  { mask_buf, idx_buf }, idx_pc,
+                                  { list_tiles, nem2 * nem3, chunked ? CEIL_DIV(nem0, chunk_cols) : 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
 
     if (use_mask_opt)
     {
@@ -11602,6 +11726,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                               scale, max_bias, logit_softcap,
                                               mask_n_head_log2, m0, m1,
                                               gqa_ratio, split_kv, split_k };
+    const vk_flash_attn_sparse_push_constants pc_sparse = { pc, list_stride, list_tiles };
 
     if (split_k > 1) {
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
@@ -11621,9 +11746,15 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         }
 
         vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf},
-                                    pc, { dispatch_x, workgroups_y, workgroups_z });
+        if (use_sparse) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, idx_buf},
+                                        pc_sparse, { dispatch_x, workgroups_y, workgroups_z });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf},
+                                        pc, { dispatch_x, workgroups_y, workgroups_z });
+        }
 
         ggml_vk_sync_buffers(ctx, subctx);
         const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr) };
@@ -11636,13 +11767,22 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
             // When using gqa, we want one actual workgroup per batch, so cancel out wg_denoms
             workgroups_x *= pipeline->wg_denoms[0];
         }
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
-                                    pc, { workgroups_x, workgroups_y, workgroups_z });
+        if (use_sparse) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, idx_buf},
+                                        pc_sparse, { workgroups_x, workgroups_y, workgroups_z });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
+                                        pc, { workgroups_x, workgroups_y, workgroups_z });
+        }
     }
 
     if (use_dequant_kv) {
         ctx->prealloc_x_need_sync = true;
+    }
+    if (use_sparse) {
+        ctx->prealloc_y_need_sync = true;
     }
 }
 

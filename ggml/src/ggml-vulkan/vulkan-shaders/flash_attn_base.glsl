@@ -70,6 +70,11 @@ layout (push_constant) uniform parameter {
     uint32_t gqa_ratio;
     uint32_t split_kv;
     uint32_t k_num;
+#ifdef FA_SPARSE
+    // sparse K/V: the per-tile cell lists written by flash_attn_sparse_idx.comp
+    uint32_t list_stride;
+    uint32_t list_tiles;
+#endif
 } p;
 
 #define SINK_ENABLE_BIT (1<<24)
@@ -81,6 +86,12 @@ layout (binding = 5) writeonly buffer O {D_TYPE data_o[];};
 layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
+
+#ifdef FA_SPARSE
+// counts[n_lists] then lists[n_lists][list_stride]: for every tile of Br mask rows, the cells
+// (ascending) whose mask entry is finite for at least one row of the tile
+layout (binding = 7) readonly buffer IDX {uint32_t data_idx[];};
+#endif
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2
@@ -209,6 +220,25 @@ void init_indices()
     // and breaking the alignment detection.
     m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
 }
+
+#ifdef FA_SPARSE
+uint32_t list_base;
+
+// Attend the query tile's cell list instead of the whole cache: KV becomes the list length and
+// the split_k range indexes the list. m_stride keeps the mask row stride set by init_indices.
+void init_sparse()
+{
+    const uint32_t row_tile = (p.gqa_ratio > 1) ? (gqa_iq1 / Br) : i;
+    const uint32_t li       = ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.list_tiles + row_tile;
+    const uint32_t n_lists  = p.list_tiles * p.nem2 * p.nem3;
+
+    KV        = min(data_idx[li], p.list_stride);
+    list_base = n_lists + li * p.list_stride;
+
+    start_j = split_k_index * p.split_kv / Bc;
+    end_j   = CEIL_DIV(min(KV, (split_k_index + 1) * p.split_kv), Bc);
+}
+#endif
 
 // Bias applied to softmax to stay in fp16 range.
 // Based on ggml-cuda issue https://github.com/ggml-org/llama.cpp/issues/18606

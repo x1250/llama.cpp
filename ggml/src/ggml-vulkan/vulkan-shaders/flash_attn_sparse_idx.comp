@@ -1,0 +1,127 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+
+// Sparse K/V lists for flash attention: the columns whose mask entry is finite for at least one row
+// of a tile of Br mask rows. Output: counts[n_lists] then lists[n_lists][list_stride], with
+// n_lists = list_tiles * nem2 * nem3. Two dispatch modes, chosen by the host:
+//   chunk_cols == 0: one workgroup per (tile, batch) walks the whole mask row range and writes the
+//     ascending list directly (prefill: the tiles alone fill the GPU).
+//   chunk_cols  > 0: one workgroup per (tile, batch, chunk of chunk_cols columns) compacts its chunk
+//     in shared memory and appends it through one atomic reservation on the count, which the host
+//     zeroes first (decode: one tile per token needs the chunks for parallelism). The cells are then
+//     grouped by chunk but not sorted, which attention does not need.
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 128;
+layout (constant_id = 1) const uint NUM_SUBGROUPS = 4;
+layout (constant_id = 2) const uint Br = 16;
+layout (constant_id = 3) const uint ITERS = 16;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer M {float16_t data_m[];};
+layout (binding = 1) buffer L {uint data_l[];};
+
+layout (push_constant) uniform parameter {
+    uint nem0;
+    uint nem1;
+    uint nem2;
+    uint nem3;
+    uint nbm1;
+    uint nbm2;
+    uint nbm3;
+    uint list_stride;
+    uint list_tiles;
+    uint chunk_cols;
+};
+
+shared uint sg_count[NUM_SUBGROUPS];
+shared uint sg_base[NUM_SUBGROUPS];
+shared uint chunk_total;
+shared uint staged[BLOCK_SIZE * ITERS];
+shared uint reserve_base;
+
+float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint i1  = gl_WorkGroupID.x;                   // tile of Br mask rows
+    const uint ib  = gl_WorkGroupID.y;                   // mask batch: i3 * nem2 + i2
+    const uint i2  = ib % nem2;
+    const uint i3  = ib / nem2;
+    const bool chunked = chunk_cols != 0;
+    const uint c_begin = chunked ? gl_WorkGroupID.z * chunk_cols : 0;
+    const uint c_end   = chunked ? min(c_begin + chunk_cols, nem0) : nem0;
+
+    const uint li        = ib * list_tiles + i1;
+    const uint n_lists   = list_tiles * nem2 * nem3;
+    const uint list_base = n_lists + li * list_stride;
+    const uint row0      = i1 * Br;
+    const uint row1      = min(row0 + Br, nem1);
+    const uint m_base    = i2 * nbm2 + i3 * nbm3;
+
+    uint count = 0;
+
+    for (uint c0 = c_begin; c0 < c_end; c0 += BLOCK_SIZE) {
+        const uint c = c0 + tid;
+
+        bool sel = false;
+        if (c < nem0) {
+            for (uint r = row0; r < row1; ++r) {
+                sel = sel || (float(data_m[m_base + r * nbm1 + c]) > NEG_FLT_MAX_OVER_2);
+            }
+        }
+
+        // compact the selected columns of this block, keeping their order
+        const uvec4 ballot = subgroupBallot(sel);
+        const uint  rank   = subgroupBallotExclusiveBitCount(ballot);
+
+        if (gl_SubgroupInvocationID == 0) {
+            sg_count[gl_SubgroupID] = subgroupBallotBitCount(ballot);
+        }
+        barrier();
+        if (tid == 0) {
+            uint acc = 0;
+            [[unroll]] for (uint s = 0; s < NUM_SUBGROUPS; ++s) {
+                sg_base[s] = acc;
+                acc += sg_count[s];
+            }
+            chunk_total = acc;
+        }
+        barrier();
+
+        if (sel) {
+            const uint dst = count + sg_base[gl_SubgroupID] + rank;
+            if (chunked) {
+                staged[dst] = c;
+            } else if (dst < list_stride) {
+                data_l[list_base + dst] = c;
+            }
+        }
+        count += chunk_total;
+        barrier();
+    }
+
+    if (!chunked) {
+        if (tid == 0) {
+            data_l[li] = min(count, list_stride);
+        }
+        return;
+    }
+
+    // one reservation per workgroup; the host zeroes the counts before the dispatch
+    if (tid == 0) {
+        reserve_base = (count > 0) ? atomicAdd(data_l[li], count) : 0u;
+    }
+    barrier();
+
+    for (uint k = tid; k < count; k += BLOCK_SIZE) {
+        const uint dst = reserve_base + k;
+        if (dst < list_stride) {
+            data_l[list_base + dst] = staged[k];
+        }
+    }
+}
