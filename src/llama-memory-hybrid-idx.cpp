@@ -53,6 +53,13 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
 
+        // the indexer has no value side: the graph only writes and reads this cache's K (cpy_k,
+        // get_k). llama_kv_cache allocates a V for every non-MLA cache, so give it one element
+        // instead of the model's n_embd_head_v per cell per layer. F32 because a quantized row
+        // must hold whole blocks, and one element of q8_0 does not.
+        hparams_idx.n_embd_head_v_full = 1;
+        hparams_idx.n_embd_head_v_swa  = 1;
+
         // the cached indexer keys are raw, rotation happens after pooling at read time, so a
         // K-shift must not rotate them while the stream copies in the same update still apply
         hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
@@ -60,7 +67,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, type_k, GGML_TYPE_F32, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
