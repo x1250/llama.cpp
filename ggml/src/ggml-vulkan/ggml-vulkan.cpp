@@ -11789,6 +11789,19 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     const bool use_sparse  = sparse_candidate  && tuning_params.path == FA_COOPMAT1;
     const bool use_compact = compact_candidate && use_sparse;
+
+    // GGML_VK_SPARSE_FA_LOG=1: the mode taken by every distinct node shape, once, to stderr
+    static const bool sparse_fa_log = getenv("GGML_VK_SPARSE_FA_LOG") != nullptr;
+    if (sparse_fa_log && n_kv_max > 0) {
+        static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>> seen;
+        if (seen.insert({ (uint32_t) neq1, (uint32_t) KV, (uint32_t) n_kv_max, (uint32_t) nem2 }).second) {
+            fprintf(stderr, "sparse fa: neq1=%u KV=%u n_kv_max=%d nem1=%u nem2=%u nem3=%u neq3=%u k=%s v=%s q_stride=%u path=%d "
+                            "sparse_candidate=%d compact_candidate=%d use_sparse=%d use_compact=%d\n",
+                    (uint32_t) neq1, (uint32_t) KV, n_kv_max, nem1, nem2, nem3, (uint32_t) neq3,
+                    ggml_type_name(k->type), ggml_type_name(v->type), (uint32_t) (nbq1 / ggml_type_size(q->type)), (int) tuning_params.path,
+                    sparse_candidate, compact_candidate, use_sparse, use_compact);
+        }
+    }
     if (compact_candidate && !use_compact) {
         // the coopmat1 path was not taken: attend the cache with its own types
         k_type_eff = k->type;
