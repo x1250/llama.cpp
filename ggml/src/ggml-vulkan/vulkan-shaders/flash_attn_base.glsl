@@ -260,7 +260,7 @@ void init_sparse()
 
         const uint32_t li = (iq3 % p.nem3) * p.list_tiles + compact_tile;
 
-        KV        = CEIL_DIV(min(data_idx[li], p.list_stride), Bc) * Bc;
+        KV        = CEIL_DIV(min(data_idx[li], p.compact_cap), Bc) * Bc;
         list_base = 0;
     } else {
         const uint32_t row_tile = (p.gqa_ratio > 1) ? (gqa_iq1 / Br) : i;

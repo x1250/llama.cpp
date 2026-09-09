@@ -1519,6 +1519,8 @@ struct vk_op_flash_attn_sparse_idx_push_constants {
 // flag bits of vk_fa_pipeline_state for the sparse K/V shader variant and its compact mode
 #define FA_PIPELINE_FLAG_SPARSE 16u
 #define FA_PIPELINE_FLAG_SPARSE_COMPACT 32u
+// compact mode only for small batches (query rows per node); a prefill keeps the index mode
+#define FA_SPARSE_COMPACT_MAX_ROWS 64u
 // compact scratch per FA node: the tiles of a dispatch fit their (K, V, mask) regions in this budget
 #define FA_SPARSE_COMPACT_BUDGET (1024ull * 1024 * 1024)
 // columns per fa_sparse_idx workgroup: 128 threads x FA_SPARSE_IDX_ITERS (must match the shader's staging size)
@@ -11745,12 +11747,16 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                   ctx->device->coopmat1_fa_support && ctx->device->subgroup_ballot &&
                                   ctx->device->properties.limits.maxPushConstantsSize >= sizeof(vk_flash_attn_sparse_push_constants);
 
-    // compact mode: the tiles (one mask slice per batch) gather the cells of their lists into f16 rows
-    // once and attend them with the aligned dense loop, a prefill's many tiles and a decode's few alike
+    // compact mode: a small batch's tiles (one mask slice per batch) gather the cells of their lists
+    // into f16 rows once and attend them with the aligned dense loop. Measured on gfx1151 at 40k
+    // (qwen4exp, q8_0 cache): the attention of a 3-token verification batch 6.4 -> 3.8 ms per step,
+    // while a prefill's tiles gained nothing over the index mode and would have held up to 1 GiB of
+    // scratch, so the prefill keeps the index mode
     static const bool disable_sparse_fa_compact = getenv("GGML_VK_DISABLE_SPARSE_FA_COMPACT") != nullptr;
     auto gather_type_ok = [](ggml_type t) { return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0; };
     // (the aligned attention variant needs 8-element strides: the compact rows are HSK/HSV wide)
-    const bool compact_candidate = !disable_sparse_fa_compact && sparse_candidate && nem2 == 1 && (HSK % 8) == 0 && (HSV % 8) == 0 &&
+    const bool compact_candidate = !disable_sparse_fa_compact && sparse_candidate && neq1 <= FA_SPARSE_COMPACT_MAX_ROWS &&
+                                   nem2 == 1 && (HSK % 8) == 0 && (HSV % 8) == 0 &&
                                    ((nbq1 / ggml_type_size(q->type)) % 8) == 0 &&
                                    gather_type_ok(k->type) && gather_type_ok(v->type);
 
@@ -12002,9 +12008,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     // compact mode: prealloc_x holds the (K, V, mask) regions of one group of tiles at a time,
-    // [tiles][nek2][C][HSK] f16, [tiles][nev2][C][HSV] f16, [tiles][Br][C] f16 with C = list_stride;
+    // [tiles][nek2][C][HSK] f16, [tiles][nev2][C][HSV] f16, [tiles][Br][C] f16 with C = compact_cap,
+    // the rows a tile can hold: its mask rows times the finite entries per row, at most the list;
     // the groups of one node are gathered and attended in turn
-    const uint32_t compact_cap     = use_compact ? list_stride : 0;
+    const uint32_t compact_cap     = use_compact ? ROUNDUP_POW2(std::min<uint32_t>(list_stride, std::min<uint32_t>(Br, (uint32_t) nem1) * (uint32_t) n_kv_max), Bc) : 0;
     const uint64_t compact_k_tile  = (uint64_t) nek2 * compact_cap * HSK * sizeof(ggml_fp16_t);
     const uint64_t compact_v_tile  = (uint64_t) nev2 * compact_cap * HSV * sizeof(ggml_fp16_t);
     const uint64_t compact_m_tile  = (uint64_t) Br * compact_cap * sizeof(ggml_fp16_t);

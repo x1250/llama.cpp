@@ -74,7 +74,7 @@ void main() {
     const uint i   = tile0 + g;                   // tile within the batch
 
     const uint li     = list_batch * list_tiles + i;
-    const uint count  = min(data_idx[li], list_stride);
+    const uint count  = min(data_idx[li], compact_cap);
     const uint n_rows = ((count + Bc - 1u) / Bc) * Bc;
 
     if (j0 >= n_rows) {
