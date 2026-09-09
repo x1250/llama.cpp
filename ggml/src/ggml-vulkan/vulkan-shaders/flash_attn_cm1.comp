@@ -449,8 +449,10 @@ void main() {
             }
         }
 
-        // a block whose mask was loaded may hold columns no valid row of the tile sees: their V rows are zeroed
-        const bool masked_block = MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO;
+        // a block whose mask was loaded may hold columns no valid row of the tile sees: their V rows are zeroed.
+        // Compact sparse rows are exempt: the gather writes every row the tile reads, a selected cell of the
+        // current context or a zero padding row, so nothing stale can reach the product and the direct loads stay
+        const bool masked_block = MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO && !FA_COMPACT_ROWS;
         if (SHMEM_STAGING != 0) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV_pad / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t d = (idx + tid) % (HSV_pad / 4);
