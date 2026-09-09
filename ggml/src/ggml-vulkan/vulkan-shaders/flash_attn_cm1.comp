@@ -170,11 +170,17 @@ void main() {
     uint32_t m_row0 = i * Br;
 #ifdef FA_SPARSE
     if (SPARSE_COMPACT) {
-        const uint32_t g = gl_WorkGroupID.x;
+        const uint32_t g = compact_tile - p.tile0;              // tile within the dispatch
         k_offset = (g * p.nek2 + ik2) * p.compact_cap * HSK;   // f16 rows, element units
         v_offset = (g * p.nev2 + iv2) * p.compact_cap * HSV;
-        m_offset = g * Br * p.compact_cap;
-        m_stride = p.compact_cap;
+        if (p.gqa_ratio > 1) {
+            // the rows are the heads of one token: they share the token's mask row of the tile
+            m_offset = (g * Br + gqa_iq1 % Br) * p.compact_cap;
+            m_stride = 0;
+        } else {
+            m_offset = g * Br * p.compact_cap;
+            m_stride = p.compact_cap;
+        }
         m_row0   = 0;
     }
 #endif

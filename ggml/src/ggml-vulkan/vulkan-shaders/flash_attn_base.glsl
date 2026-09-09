@@ -235,20 +235,30 @@ void init_indices()
 
 #ifdef FA_SPARSE
 uint32_t list_base;
+uint32_t compact_tile;   // compact mode: the tile whose region this workgroup reads
 
 // Attend the query tile's cell list instead of the whole cache: KV becomes the list length and
 // the split_k range indexes the list. m_stride keeps the mask row stride set by init_indices.
 void init_sparse()
 {
     if (SPARSE_COMPACT) {
-        // one dispatch per (batch, group of tiles): the workgroup's tile is tile0 + x and its compact
-        // rows, padded to Bc with zero K/V and -inf mask, sit at x * compact_cap
-        i   = p.tile0 + gl_WorkGroupID.x;
+        // one dispatch per (batch, group of tiles). Without grouped query attention the workgroup's
+        // tile is tile0 + x, its compact rows, padded to Bc with zero K/V and -inf mask, at x * compact_cap.
+        // With it (a small batch: the workgroup's rows are the gqa_ratio heads of one token) the
+        // workgroup's token is tile0 * Br + x and the tile is the token's
+        if (p.gqa_ratio > 1) {
+            gqa_iq1      = p.tile0 * Br + gl_WorkGroupID.x;
+            i            = 0;
+            compact_tile = gqa_iq1 / Br;
+        } else {
+            i            = p.tile0 + gl_WorkGroupID.x;
+            compact_tile = i;
+        }
         iq3 = p.batch0;
         ik3 = iq3 / rk3;
         iv3 = iq3 / rv3;
 
-        const uint32_t li = (iq3 % p.nem3) * p.list_tiles + i;
+        const uint32_t li = (iq3 % p.nem3) * p.list_tiles + compact_tile;
 
         KV        = CEIL_DIV(min(data_idx[li], p.list_stride), Bc) * Bc;
         list_base = 0;

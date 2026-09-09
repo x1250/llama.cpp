@@ -12180,9 +12180,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                 vk_flash_attn_sparse_push_constants pc_group = pc_sparse;
                 pc_group.tile0  = tile0;
                 pc_group.batch0 = b;
+                // one workgroup per tile; with grouped query attention one per token of the group's
+                // tiles (the workgroup's rows are the token's heads), never past the mask rows
+                const uint32_t attn_x = gqa_ratio > 1
+                    ? std::min<uint32_t>(n_g * Br, nem1 - tile0 * Br) * pipeline->wg_denoms[0]
+                    : n_g * Br;
                 ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                                           {q_buf, kc_buf, vc_buf, mc_buf, sinks_buf, dst_buf, mask_opt_buf, idx_buf},
-                                          pc_group, { n_g * Br, workgroups_y, 1 });
+                                          pc_group, { attn_x, workgroups_y, 1 });
                 // the next group overwrites the regions
                 ggml_vk_sync_buffers(ctx, subctx);
             }
