@@ -391,6 +391,9 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // the ubatch after the current one, or null when this is the last one of the batch
+    const llama_ubatch * get_next_ubatch() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 

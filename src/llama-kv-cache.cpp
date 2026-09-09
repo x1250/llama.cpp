@@ -2748,6 +2748,12 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     return ubatches[i_cur];
 }
 
+const llama_ubatch * llama_kv_cache_context::get_next_ubatch() const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+
+    return i_cur + 1 < ubatches.size() ? &ubatches[i_cur + 1] : nullptr;
+}
+
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
