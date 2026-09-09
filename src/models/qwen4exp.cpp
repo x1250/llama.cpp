@@ -887,17 +887,18 @@ llama_model_qwen4exp::graph::qsa_layer llama_model_qwen4exp::graph::build_qsa_ke
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
     // mean over the block members, then norm and rope: the summary key of a block. r is small, so
-    // summing slices beats a transpose plus sum_rows. n_pool blocks per stream, laid flat for the
-    // norm (rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536) and the rope
+    // summing slices beats a transpose plus sum_rows; the slices are strided views of members and
+    // ggml_add takes them as they are (the backends index through the strides), so nothing is
+    // copied. n_pool blocks per stream, laid flat for the norm (rms_norm launches gridDim.y = ne2,
+    // capped at 65535, and 262144/4 = 65536) and the rope
     auto summarize = [&](ggml_tensor * cells, ggml_tensor * pos, int64_t n_pool) {
         ggml_tensor * members = ggml_get_rows(ctx0, k_all, cells);
         members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_pool, n_stream);
 
         ggml_tensor * sum = nullptr;
         for (int64_t i = 0; i < r; ++i) {
-            ggml_tensor * slice = ggml_cont(ctx0,
-                    ggml_view_3d(ctx0, members, idx_dim, n_pool, n_stream,
-                            members->nb[2], members->nb[3], i*members->nb[1]));
+            ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_pool, n_stream,
+                    members->nb[2], members->nb[3], i*members->nb[1]);
             sum = sum ? ggml_add(ctx0, sum, slice) : slice;
         }
         sum = ggml_scale(ctx0, sum, 1.0f/(float) r);
