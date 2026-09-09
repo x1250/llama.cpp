@@ -6,14 +6,17 @@
 #extension GL_KHR_shader_subgroup_ballot : enable
 
 // Sparse K/V lists for flash attention: the columns whose mask entry is finite for at least one row
-// of a tile of Br mask rows. Output: counts[n_lists] then lists[n_lists][list_stride], with
-// n_lists = list_tiles * nem2 * nem3. Two dispatch modes, chosen by the host:
+// of a tile of Br mask rows, in ascending order. Output: counts[n_lists] then lists[n_lists][list_stride],
+// with n_lists = list_tiles * nem2 * nem3, and in chunked mode chunk_counts[n_lists][n_chunks] after
+// them. Two dispatch modes, chosen by the host:
 //   chunk_cols == 0: one workgroup per (tile, batch) walks the whole mask row range and writes the
 //     ascending list directly (prefill: the tiles alone fill the GPU).
-//   chunk_cols  > 0: one workgroup per (tile, batch, chunk of chunk_cols columns) compacts its chunk
-//     in shared memory and appends it through one atomic reservation on the count, which the host
-//     zeroes first (decode: one tile per token needs the chunks for parallelism). The cells are then
-//     grouped by chunk but not sorted, which attention does not need.
+//   chunk_cols  > 0: one workgroup per (tile, batch, chunk of chunk_cols columns), in two passes so
+//     the list does not depend on the order the chunks run in (decode: one tile per token needs the
+//     chunks for parallelism). chunk_pass 1 writes the chunk's count; chunk_pass 2 places the chunk's
+//     cells after those of the chunks before it, and chunk 0 writes the tile's count. Same ascending
+//     order as the single-workgroup mode, so attention accumulates the same cells in the same order
+//     no matter which mode built the list.
 
 layout (constant_id = 0) const uint BLOCK_SIZE = 128;
 layout (constant_id = 1) const uint NUM_SUBGROUPS = 4;
@@ -36,13 +39,14 @@ layout (push_constant) uniform parameter {
     uint list_stride;
     uint list_tiles;
     uint chunk_cols;
+    uint chunk_pass;
 };
 
 shared uint sg_count[NUM_SUBGROUPS];
 shared uint sg_base[NUM_SUBGROUPS];
 shared uint chunk_total;
 shared uint staged[BLOCK_SIZE * ITERS];
-shared uint reserve_base;
+shared uint place_base;
 
 float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
 
@@ -53,7 +57,8 @@ void main() {
     const uint i2  = ib % nem2;
     const uint i3  = ib / nem2;
     const bool chunked = chunk_cols != 0;
-    const uint c_begin = chunked ? gl_WorkGroupID.z * chunk_cols : 0;
+    const uint chunk   = gl_WorkGroupID.z;
+    const uint c_begin = chunked ? chunk * chunk_cols : 0;
     const uint c_end   = chunked ? min(c_begin + chunk_cols, nem0) : nem0;
 
     const uint li        = ib * list_tiles + i1;
@@ -62,6 +67,10 @@ void main() {
     const uint row0      = i1 * Br;
     const uint row1      = min(row0 + Br, nem1);
     const uint m_base    = i2 * nbm2 + i3 * nbm3;
+
+    // per-chunk counts of this list, after every list
+    const uint n_chunks    = chunked ? (nem0 + chunk_cols - 1) / chunk_cols : 0;
+    const uint counts_base = n_lists + n_lists * list_stride + li * n_chunks;
 
     uint count = 0;
 
@@ -96,7 +105,9 @@ void main() {
         if (sel) {
             const uint dst = count + sg_base[gl_SubgroupID] + rank;
             if (chunked) {
-                staged[dst] = c;
+                if (chunk_pass == 2) {
+                    staged[dst] = c;
+                }
             } else if (dst < list_stride) {
                 data_l[list_base + dst] = c;
             }
@@ -112,14 +123,31 @@ void main() {
         return;
     }
 
-    // one reservation per workgroup; the host zeroes the counts before the dispatch
+    if (chunk_pass == 1) {
+        if (tid == 0) {
+            data_l[counts_base + chunk] = count;
+        }
+        return;
+    }
+
+    // pass 2: this chunk's cells go after those of the chunks before it
     if (tid == 0) {
-        reserve_base = (count > 0) ? atomicAdd(data_l[li], count) : 0u;
+        uint base  = 0;
+        uint total = 0;
+        for (uint k = 0; k < n_chunks; ++k) {
+            const uint n = data_l[counts_base + k];
+            base  += (k < chunk) ? n : 0u;
+            total += n;
+        }
+        place_base = base;
+        if (chunk == 0) {
+            data_l[li] = min(total, list_stride);
+        }
     }
     barrier();
 
     for (uint k = tid; k < count; k += BLOCK_SIZE) {
-        const uint dst = reserve_base + k;
+        const uint dst = place_base + k;
         if (dst < list_stride) {
             data_l[list_base + dst] = staged[k];
         }

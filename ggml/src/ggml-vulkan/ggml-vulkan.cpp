@@ -1487,7 +1487,8 @@ struct vk_op_flash_attn_sparse_idx_push_constants {
     uint32_t nbm1, nbm2, nbm3;
     uint32_t list_stride;
     uint32_t list_tiles;
-    uint32_t chunk_cols;   // 0: one workgroup per tile; else columns per workgroup (atomic append)
+    uint32_t chunk_cols;   // 0: one workgroup per tile; else columns per workgroup
+    uint32_t chunk_pass;   // chunked: 1 = write the chunk counts, 2 = place the cells after the chunks before
 };
 
 // flag bit of vk_fa_pipeline_state for the sparse K/V shader variant
@@ -11834,7 +11835,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t list_tiles  = use_sparse ? CEIL_DIV(nem1, Br) : 0;
     const uint32_t list_stride = use_sparse ? ROUNDUP_POW2(std::min<uint32_t>(KV, (uint32_t) n_kv_max * Br), Bc) : 0;
     const uint32_t n_lists     = list_tiles * nem2 * nem3;
-    const uint64_t sparse_size = use_sparse ? sizeof(uint32_t) * ((uint64_t) n_lists + (uint64_t) n_lists * list_stride) : 0;
+    // a prefill has tiles enough to fill the GPU (one workgroup per tile); a decode has one tile per
+    // token and splits the columns into chunks, whose counts follow the lists in the scratch
+    const bool     chunked     = use_sparse && n_lists < 32;
+    const uint32_t n_chunks    = chunked ? CEIL_DIV(nem0, FA_SPARSE_IDX_CHUNK) : 0;
+    const uint64_t sparse_size = use_sparse ? sizeof(uint32_t) * ((uint64_t) n_lists + (uint64_t) n_lists * list_stride + (uint64_t) n_lists * n_chunks) : 0;
     const uint32_t KV_split    = use_sparse ? list_stride : KV;
     if (use_sparse) {
         split_kv = list_stride;
@@ -11910,7 +11915,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
             }
         }
         assert(pipeline_fa_sparse_idx);
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline_fa_sparse_idx, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline_fa_sparse_idx, chunked ? 2 : 1);
 
         if (ctx->prealloc_size_y < sparse_size) {
             ctx->prealloc_size_y = sparse_size;
@@ -11966,31 +11971,30 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
 
     if (use_sparse) {
-        // a prefill has tiles enough to fill the GPU (one workgroup per tile, ascending list); a decode
-        // has one tile per token and splits the columns into chunks appended through an atomic. Measured
+        // a prefill's tiles fill the GPU on their own: one workgroup per tile writes the ascending list.
+        // A decode has one tile per token and splits the columns into chunks; two passes place every
+        // chunk after the chunks before it, so the list is the same ascending list whichever order the
+        // chunks ran in (an atomic reservation made the order, and the attention's rounding with it,
+        // depend on the scheduling: identical requests at depth returned different logits). Measured
         // on gfx1151: the chunks cost a prefill half of its gain at 32k, the single workgroup costs a
         // decode 5 ms per token at 40k
-        const bool     chunked    = n_lists < 32;
         const uint32_t chunk_cols = chunked ? FA_SPARSE_IDX_CHUNK : 0;
-        const vk_op_flash_attn_sparse_idx_push_constants idx_pc = {
+        vk_op_flash_attn_sparse_idx_push_constants idx_pc = {
             nem0, nem1, nem2, nem3,
             (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)),
             (uint32_t)(mask->nb[2] / sizeof(ggml_fp16_t)),
             (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)),
-            list_stride, list_tiles, chunk_cols,
+            list_stride, list_tiles, chunk_cols, 0,
         };
+        const std::array<uint32_t, 3> idx_wg = { list_tiles, nem2 * nem3, chunked ? n_chunks : 1 };
 
         if (chunked) {
-            // the chunks of a tile reserve their ranges with an atomic on the tile's count, so the
-            // counts are zeroed in queue order right before the prepass. ggml_vk_buffer_memset_async
-            // would not do: on a UMA device it defers a host memset to the submission, ahead of every
-            // node of the command buffer, and the counts of the nodes already recorded would accumulate
-            subctx->s->buffer->buf.fillBuffer(ctx->prealloc_y->buffer, 0, sizeof(uint32_t) * n_lists, 0);
+            idx_pc.chunk_pass = 1;
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_sparse_idx, { mask_buf, idx_buf }, idx_pc, idx_wg);
             ggml_vk_sync_buffers(ctx, subctx);
+            idx_pc.chunk_pass = 2;
         }
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_sparse_idx,
-                                  { mask_buf, idx_buf }, idx_pc,
-                                  { list_tiles, nem2 * nem3, chunked ? CEIL_DIV(nem0, chunk_cols) : 1 });
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_sparse_idx, { mask_buf, idx_buf }, idx_pc, idx_wg);
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
