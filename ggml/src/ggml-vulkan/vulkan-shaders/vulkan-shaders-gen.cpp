@@ -679,6 +679,7 @@ void process_shaders() {
             fa_base_dict["DATA_A_IQ4_NL"] = "1";
             if (fp16 && f16acc) {
                 fa_base_dict["ACC_TYPE_MAX"] = "float16_t(65504.0)";
+                fa_base_dict["FA_F16ACC"] = "1";
             }
 
             if (fp16) {

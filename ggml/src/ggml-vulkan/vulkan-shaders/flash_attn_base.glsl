@@ -101,12 +101,18 @@ layout (binding = 7) readonly buffer IDX {uint32_t data_idx[];};
 
 #include "fa_types.glsl"
 
-#if defined(BFLOAT16)
+// the output accumulates in f32 unless f16 accumulation was requested: with F32 precision asked for,
+// the f16 output accumulator of the coopmat1 path rounded every row and amplified sub-ulp effects
+// of the product (see col_seen in flash_attn_cm1.comp)
+#if defined(BFLOAT16) || !defined(FA_F16ACC)
 #define O_TYPE float
 #define O_TYPEV4 vec4
 #else
 #define O_TYPE FLOAT_TYPE
 #define O_TYPEV4 FLOAT_TYPEV4
+#if defined(FLOAT_TYPE_MAX)
+#define O_TYPE_MAX FLOAT_TYPE_MAX
+#endif
 #endif
 
 // These can't be `const` globals because GLSL forbids function calls in global

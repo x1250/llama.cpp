@@ -70,6 +70,13 @@ shared O_TYPEV4 pvsh[MatBc * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
+// per column of the current block, one flag per row group of 4: some valid row of the tile sees the
+// cell. A column no valid row sees is masked out of the product by zeroing its V row when V is staged:
+// the coopmat product lets the sign of V under a zero weight move the result by an ulp, and the cells
+// past the end of a sequence hold whatever a previous request left there
+shared uint col_seen[Bc * (Br / 4)];
+shared uint col_any[Bc];
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
@@ -198,34 +205,37 @@ void main() {
                     if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
                         if ((!KV_bounds_check || j * Bc + c < KV)) {
                             f16vec4 m;
+                            float max_valid = NEG_FLT_MAX_OVER_2;
                             if (!nem1_bounds_check || i * Br + r * 4 + 3 < p.nem1) {
                                 m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + KV_ROW(c)],
                                             data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + KV_ROW(c)],
                                             data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + KV_ROW(c)],
                                             data_m[m_offset + (i * Br + r * 4 + 3) * m_stride + KV_ROW(c)]);
-                                max_mask = max(max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2])), float(m[3]));
+                                max_valid = max(max(max(float(m[0]), float(m[1])), float(m[2])), float(m[3]));
                             } else if (i * Br + r * 4 + 2 < p.nem1) {
                                 m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + KV_ROW(c)],
                                             data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + KV_ROW(c)],
                                             data_m[m_offset + (i * Br + r * 4 + 2) * m_stride + KV_ROW(c)],
                                             0.0);
-                                max_mask = max(max(max(max_mask, float(m[0])), float(m[1])), float(m[2]));
+                                max_valid = max(max(float(m[0]), float(m[1])), float(m[2]));
                             } else if (i * Br + r * 4 + 1 < p.nem1) {
                                 m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + KV_ROW(c)],
                                             data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + KV_ROW(c)],
                                             0.0,
                                             0.0);
-                                max_mask = max(max(max_mask, float(m[0])), float(m[1]));
+                                max_valid = max(float(m[0]), float(m[1]));
                             } else if (i * Br + r * 4 < p.nem1) {
                                 m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + KV_ROW(c)],
                                             0.0,
                                             0.0,
                                             0.0);
-                                max_mask = max(max_mask, float(m[0]));
+                                max_valid = float(m[0]);
                             } else {
                                 m = f16vec4(0.0);
                             }
+                            max_mask = max(max_mask, max_valid);
                             mask_cache[idx / WorkGroupSize] = m;
+                            col_seen[c * (Br / 4) + r] = (max_valid > NEG_FLT_MAX_OVER_2) ? 1u : 0u;
                         }
                     }
                 }
@@ -234,6 +244,13 @@ void main() {
                 barrier();
                 if (gl_SubgroupInvocationID == 0) {
                     tmpsh[gl_SubgroupID] = all_less ? NEG_FLT_MAX_OVER_2 : 0.0f;
+                }
+                if (tid < Bc) {
+                    uint seen = 0;
+                    [[unroll]] for (uint32_t rg = 0; rg < Br / 4; ++rg) {
+                        seen |= col_seen[tid * (Br / 4) + rg];
+                    }
+                    col_any[tid] = seen;
                 }
                 barrier();
                 [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
@@ -415,13 +432,16 @@ void main() {
             }
         }
 
+        // a block whose mask was loaded may hold columns no valid row of the tile sees: their V rows are zeroed
+        const bool masked_block = MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO;
         if (SHMEM_STAGING != 0) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV_pad / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t d = (idx + tid) % (HSV_pad / 4);
                 uint32_t c = (idx + tid) / (HSV_pad / 4);
                 if (idx + gl_WorkGroupSize.x <= Bc * HSV_pad / 4 || c < Bc) {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
-                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
+                    const bool seen = !masked_block || col_any[c] != 0u;
+                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4) && seen) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             uint coord = KV_ROW(c) * v_stride * BLOCK_SIZE_V + 4 * d;
@@ -444,15 +464,20 @@ void main() {
         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
 
         // Each subgroup handles HSV/4 columns
+        // the rows a thread stages do not depend on the head tile: resolve their visibility once per block
+        const uint v_loads_per_thread = (Bc * v_cols) / gl_WorkGroupSize.x;
+        bool row_seen[v_loads_per_thread];
+        [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
+            const uint row = (i * gl_WorkGroupSize.x + tid) / v_cols;
+            row_seen[i] = !masked_block || col_any[row] != 0u;
+        }
+
         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
             const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * 16;
 
             coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> PVMat = coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
 
             // Preload V tiles for [Bc, 16 * num subgroups]
-            const uint v_rows = Bc;
-            const uint v_total = v_rows * v_cols;
-            const uint v_loads_per_thread = v_total / gl_WorkGroupSize.x;
 
             // If SHMEM_STAGING is set, a Bc * HSV_pad size tile of V is loaded to shmem.
             // If not, V is loaded directly from global memory if aligned, otherwise
@@ -461,7 +486,7 @@ void main() {
             if (SHMEM_STAGING == 0) {
             // For quants we always preload via kvsh. For f16/bf16 we only preload when
             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
-            const bool stage_v = USE_DECODE_V || KV_bounds_check;
+            const bool stage_v = USE_DECODE_V || KV_bounds_check || masked_block;
             if (stage_v) {
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                     const uint idx = i * gl_WorkGroupSize.x + tid;
@@ -476,7 +501,7 @@ void main() {
                     const uint ib = coord / BLOCK_SIZE_V;
                     const uint iqs = coord % BLOCK_SIZE_V;
 
-                    if (!KV_bounds_check || (v_pos < KV && v_col < HSV)) {
+                    if ((!KV_bounds_check || (v_pos < KV && v_col < HSV)) && row_seen[i]) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
@@ -500,7 +525,7 @@ void main() {
                     coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
 
                     if (SHMEM_STAGING == 0) {
-                    if (!USE_DECODE_V && !KV_bounds_check) {
+                    if (!(USE_DECODE_V || KV_bounds_check || masked_block)) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
@@ -634,8 +659,8 @@ void main() {
         const uint d_local = d0 / threads_per_rowgroup;
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             Of[r][d_local] *= O_TYPE(Lfrcp[r]);
-#if defined(FLOAT_TYPE_MAX)
-            Of[r][d_local] = clamp(Of[r][d_local], -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
+#if defined(O_TYPE_MAX)
+            Of[r][d_local] = clamp(Of[r][d_local], -O_TYPE_MAX, O_TYPE_MAX);
 #endif
         }
     }
