@@ -11745,13 +11745,12 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                   ctx->device->coopmat1_fa_support && ctx->device->subgroup_ballot &&
                                   ctx->device->properties.limits.maxPushConstantsSize >= sizeof(vk_flash_attn_sparse_push_constants);
 
-    // compact mode: a prefill's tiles (many query rows, one mask slice per batch) gather the cells of
-    // their lists into f16 rows once and attend them with the aligned dense loop; a decode's tiles keep
-    // the index mode (one gather of the whole row set would cost more than the attention itself)
+    // compact mode: the tiles (one mask slice per batch) gather the cells of their lists into f16 rows
+    // once and attend them with the aligned dense loop, a prefill's many tiles and a decode's few alike
     static const bool disable_sparse_fa_compact = getenv("GGML_VK_DISABLE_SPARSE_FA_COMPACT") != nullptr;
     auto gather_type_ok = [](ggml_type t) { return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0; };
     // (the aligned attention variant needs 8-element strides: the compact rows are HSK/HSV wide)
-    const bool compact_candidate = !disable_sparse_fa_compact && sparse_candidate && neq1 >= 64 && nem2 == 1 && (HSK % 8) == 0 && (HSV % 8) == 0 &&
+    const bool compact_candidate = !disable_sparse_fa_compact && sparse_candidate && nem2 == 1 && (HSK % 8) == 0 && (HSV % 8) == 0 &&
                                    ((nbq1 / ggml_type_size(q->type)) % 8) == 0 &&
                                    gather_type_ok(k->type) && gather_type_ok(v->type);
 
