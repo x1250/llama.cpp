@@ -164,3 +164,44 @@ Reglas de toda ventana de medición: producción descargada, gate de 40 GiB (37 
 de profundidad), baseline repetido en la misma cadena, MTP encendido, y las comprobaciones de
 determinismo (`repeat_probe.py`, `graph_diff4`, `depth_repeat.py`) tras cualquier cambio de
 backend.
+
+## 5. Medición del solape de expertos (decode, punto 1)
+
+Herramienta: `LLAMA_MOE_IDS_LOG=<archivo>` (common/common.cpp), volcado de los expertos que
+elige cada capa por ubatch; estadísticas con `~/dbg/merge/moe_ids_stats.py`. Corrida: rig de
+profundidad a 40k con MTP n-max 2 (`~/dbg/depth/moe-ids-40k.txt`, 45305 líneas, 2026-09-09).
+El callback parte el grafo en cada nodo observado, así que los tiempos de esa corrida no son
+comparables (prefill 273 t/s, decode 26-32 t/s); las selecciones sí.
+
+Verify (troncal, 48 capas):
+
+| Tokens del verify | Grafos-capa | Expertos únicos / pares (token, slot) | Bytes de expertos ahorrados con dedup |
+|---|---|---|---|
+| 2 | 238 | 0.791 | 21 % |
+| 3 | 40608 | 0.730 | 27 % |
+| 4 | 432 | 0.533 | 47 % |
+
+Por capa a n = 3: entre 18.0 y 27.4 expertos únicos de 30; las capas altas (39-47) solapan más.
+El bloque MTP (capa 48) a n = 3: 0.846 (15 %).
+
+Proyección: los expertos del verify cuestan 18.2 ms por paso leyendo 3.98 GB a 219 GB/s (cada
+token relee sus expertos); con una lectura por experto único quedan ~2.9 GB → −4.9 ms por paso
+de 66 (−7.4 %, +8 % de decode). Además la fusión `MUL_MAT_ID + MUL` hoy exige un solo token
+(ggml-vulkan.cpp, `mmid_mul_ok`: `scale->ne[2] == 1`), así que a n = 3 la ponderación es un
+MUL aparte (48 dispatches por paso) que la variante agrupada puede absorber.
+
+Prefill (ubatch de 2048, troncal): tokens consecutivos comparten el 36.6 % de sus expertos
+(t, t+1) y el 28.3 % (t, t+2); expertos activos por capa 398 de 512; filas por experto activo
+media 52, p50 18-21, p90 103-116, máximo ~1960 (un experto casi universal por capa). Con el tile
+BN = 128 del MUL_MAT_ID (sección 3, prefill punto 2) la mediana de 21 filas ocupa el 16 % del
+tile: confirma el diagnóstico de utilización.
+
+Diseño propuesto (backend Vulkan, `ggml_vk_mul_mat_vec_id_q_f16` y `mul_mat_vec_base.glsl`):
+un solo dispatch por nodo con eje y = pares (token, slot) en vez de un dispatch por token; el
+workgroup del par p toma su experto e, sale si un par anterior ya lo tiene, y si no calcula las
+columnas de todos los tokens que eligieron e (≤ n_tokens ≤ 8, NUM_COLS especializado por
+n_tokens) con offsets de B y D por columna y el índice de escala `t·n_used + s`. La aritmética
+por columna es la misma secuencia que hoy, así que los logits no cambian bit a bit: `graph_diff4`
+contra la build actual debe dar 0 nodos distintos. Cobertura: los casos MUL_MAT_ID de
+test-backend-ops con n ≤ 8 tokens ya producen ids repetidos entre tokens (n_mats 16, n_used 16);
+faltan los de forma real (512 expertos, 10 usados, 640/2560, n = 2..4).
