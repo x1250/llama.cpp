@@ -2,6 +2,8 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 #include "types.glsl"
 
@@ -31,7 +33,27 @@ layout (push_constant) uniform parameter {
 shared uint histo[RADIX_SIZE];
 shared uint sh_bucket;
 shared uint sh_above;
-shared uint out_count;
+// per-subgroup totals of the compaction scan
+shared uint sh_scan[BLOCK_SIZE / 32];
+
+// exclusive prefix of v over the workgroup in invocation order, and the total
+uint scan_exclusive(const uint v, out uint total) {
+    const uint sg_prefix = subgroupExclusiveAdd(v);
+    const uint sg_sum    = subgroupAdd(v);
+    if (subgroupElect()) {
+        sh_scan[gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+    uint base = 0;
+    total = 0;
+    for (uint s = 0; s < gl_NumSubgroups; ++s) {
+        const uint t = sh_scan[s];
+        base  += (s < gl_SubgroupID) ? t : 0u;
+        total += t;
+    }
+    barrier();
+    return base + sg_prefix;
+}
 
 // order-preserving float -> uint mapping
 uint f2ui(float x) {
@@ -114,25 +136,36 @@ void topk(const uint row) {
         barrier();
     }
 
-    if (tid == 0) {
-        out_count = 0;
-    }
-    barrier();
-
-    // emit everything above the threshold, then fill the rest from ties
+    // emit everything above the threshold, then fill the rest from the ties, each invocation its own
+    // strided elements, placed after a scan of the counts: an atomic append would make the emission
+    // order, and which ties are taken, depend on the scheduling of the invocations (QSA scores tie
+    // across every cell of a block, so the tied set at the threshold is not empty and the selected
+    // cells varied between identical evaluations)
     const uint threshold = prefix;
+
+    uint n_above = 0;
+    uint n_tie   = 0;
     for (uint i = tid; i < ncols; i += BLOCK_SIZE) {
-        if (f2ui(load(row, i, false)) > threshold) {
-            data_d[row_out + atomicAdd(out_count, 1u)] = int(i);
-        }
+        const uint key = f2ui(load(row, i, false));
+        n_above += key > threshold ? 1u : 0u;
+        n_tie   += key == threshold ? 1u : 0u;
     }
-    barrier();
+    uint total_above;
+    uint total_tie;
+    const uint above_base = scan_exclusive(n_above, total_above);
+    const uint tie_base   = total_above + scan_exclusive(n_tie, total_tie);
+
+    uint pos_above = above_base;
+    uint pos_tie   = tie_base;
     for (uint i = tid; i < ncols; i += BLOCK_SIZE) {
-        if (f2ui(load(row, i, false)) == threshold) {
-            const uint pos = atomicAdd(out_count, 1u);
-            if (pos < p.k) {
-                data_d[row_out + pos] = int(i);
+        const uint key = f2ui(load(row, i, false));
+        if (key > threshold) {
+            data_d[row_out + pos_above++] = int(i);
+        } else if (key == threshold) {
+            if (pos_tie < p.k) {
+                data_d[row_out + pos_tie] = int(i);
             }
+            pos_tie++;
         }
     }
 }
