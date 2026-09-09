@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -1716,6 +1717,64 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+// LLAMA_MOE_IDS_LOG=<file>: append the experts every MoE layer selects, one line per ubatch and
+// layer ("il n_used n_tokens id..."), read back through the scheduler's eval callback once the
+// top-k node has run. Measures the expert overlap between the tokens of a batch (the MoE mat-vec
+// reads an expert once per token that selects it) and the rows per expert of a prefill ubatch.
+// Observing a node splits the graph there, so the run is slower: a diagnostic, never production.
+static bool common_moe_ids_log_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    static const char prefix[] = "ffn_moe_topk-";
+
+    const char * name = ggml_get_name(t);
+    const bool match = strncmp(name, prefix, sizeof(prefix) - 1) == 0;
+
+    if (ask) {
+        return match;
+    }
+    if (!match) {
+        return true;
+    }
+
+    GGML_ASSERT(t->type == GGML_TYPE_I32 && t->nb[0] == sizeof(int32_t));
+
+    // the top-k ids are a view of the first n_used columns of the argsort output: read row by row
+    const int64_t n_used   = t->ne[0];
+    const int64_t n_tokens = t->ne[1];
+
+    std::vector<int32_t> ids(n_used*n_tokens);
+    for (int64_t r = 0; r < n_tokens; ++r) {
+        ggml_backend_tensor_get(t, ids.data() + r*n_used, r*t->nb[1], n_used*sizeof(int32_t));
+    }
+
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    FILE * f = (FILE *) user_data;
+    fprintf(f, "%s %" PRId64 " %" PRId64, name + sizeof(prefix) - 1, n_used, n_tokens);
+    for (const int32_t id : ids) {
+        fprintf(f, " %d", id);
+    }
+    fputc('\n', f);
+    fflush(f);
+
+    return true;
+}
+
+static FILE * common_moe_ids_log_file() {
+    static FILE * f = [] {
+        const char * path = getenv("LLAMA_MOE_IDS_LOG");
+        if (path == nullptr) {
+            return (FILE *) nullptr;
+        }
+        FILE * res = fopen(path, "a");
+        if (res == nullptr) {
+            LOG_WRN("%s: cannot open LLAMA_MOE_IDS_LOG file '%s'\n", __func__, path);
+        }
+        return res;
+    }();
+    return f;
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
@@ -1743,6 +1802,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    if (cparams.cb_eval == nullptr && common_moe_ids_log_file() != nullptr) {
+        cparams.cb_eval           = common_moe_ids_log_cb;
+        cparams.cb_eval_user_data = common_moe_ids_log_file();
+    }
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
