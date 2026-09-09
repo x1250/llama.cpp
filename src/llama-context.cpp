@@ -1399,12 +1399,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
+        // LLAMA_INPUT_TIMING=1: host time of the input fill per ubatch (masks, cache maps, gathers). The
+        // device is idle while it runs, so it adds directly to the step at depth. Written to stderr like
+        // the backend perf loggers: the library's INFO lines need -lv 4, which the server does not run with.
+        static const bool input_timing = getenv("LLAMA_INPUT_TIMING") != nullptr;
+        const int64_t t_start_us = input_timing ? ggml_time_us() : 0;
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        if (input_timing) {
+            fprintf(stderr, "input timing: n_tokens = %u, set_inputs = %.3f ms\n", ubatch.n_tokens, (ggml_time_us() - t_start_us)/1000.0);
+        }
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
