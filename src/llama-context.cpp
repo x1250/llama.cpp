@@ -1361,6 +1361,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    // LLAMA_INPUT_TIMING=1: host timeline of every ubatch, one stderr line per ubatch: graph build and
+    // allocation (zero when the graph is reused), the input fill, the compute call (command recording
+    // and submission), and the wait for the device, which the timing forces right after the submission
+    // so that the stages add up to the ubatch and no wait hides in the next ubatch's input fill. The
+    // forced wait removes the overlap between the device and the next ubatch's host work, so the run is
+    // a diagnostic, never production. Written to stderr like the backend perf loggers: the library's INFO
+    // lines need -lv 4, which the server does not run with.
+    static const bool ubatch_timing = getenv("LLAMA_INPUT_TIMING") != nullptr;
+    const int64_t t_ubatch_us = ubatch_timing ? ggml_time_us() : 0;
+    int64_t t_build_us = 0;
+    int64_t t_alloc_us = 0;
+    bool    reused     = false;
+
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1372,17 +1385,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        reused = true;
     } else {
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+        const int64_t t_build_start_us = ubatch_timing ? ggml_time_us() : 0;
 
         gf = model.build_graph(gparams);
 
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        if (ubatch_timing) {
+            t_build_us = ggml_time_us() - t_build_start_us;
+        }
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1390,34 +1406,47 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const int64_t t_alloc_start_us = ubatch_timing ? ggml_time_us() : 0;
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        if (ubatch_timing) {
+            t_alloc_us = ggml_time_us() - t_alloc_start_us;
+        }
     }
 
     // set the input data for the input tensors
-    {
-        // LLAMA_INPUT_TIMING=1: host time of the input fill per ubatch (masks, cache maps, gathers). The
-        // device is idle while it runs, so it adds directly to the step at depth. Written to stderr like
-        // the backend perf loggers: the library's INFO lines need -lv 4, which the server does not run with.
-        static const bool input_timing = getenv("LLAMA_INPUT_TIMING") != nullptr;
-        const int64_t t_start_us = input_timing ? ggml_time_us() : 0;
+    const int64_t t_inputs_start_us = ubatch_timing ? ggml_time_us() : 0;
 
-        // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
+    // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+    res->set_inputs(&ubatch);
 
-        if (input_timing) {
-            fprintf(stderr, "input timing: n_tokens = %u, set_inputs = %.3f ms\n", ubatch.n_tokens, (ggml_time_us() - t_start_us)/1000.0);
-        }
-    }
+    const int64_t t_inputs_us = ubatch_timing ? ggml_time_us() - t_inputs_start_us : 0;
+
+    const int64_t t_compute_start_us = ubatch_timing ? ggml_time_us() : 0;
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (ubatch_timing) {
+        const int64_t t_compute_us = ggml_time_us() - t_compute_start_us;
+
+        const int64_t t_wait_start_us = ggml_time_us();
+        ggml_backend_sched_synchronize(sched.get());
+        const int64_t t_wait_us = ggml_time_us() - t_wait_start_us;
+
+        fprintf(stderr, "input timing: ctx = %p, t = %" PRId64 ", n_tokens = %u, reused = %d, build = %.3f, alloc = %.3f, set_inputs = %.3f, compute = %.3f, gpu_wait = %.3f, total = %.3f ms\n",
+                (void *) this, t_ubatch_us, ubatch.n_tokens, reused ? 1 : 0,
+                t_build_us/1000.0, t_alloc_us/1000.0, t_inputs_us/1000.0, t_compute_us/1000.0, t_wait_us/1000.0,
+                (ggml_time_us() - t_ubatch_us)/1000.0);
     }
 
     ret = GGML_STATUS_SUCCESS;
