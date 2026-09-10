@@ -9838,6 +9838,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false,  640, 2048, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, 2048,  640));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K,   GGML_TYPE_F32, 256,  8, false, 2048, 2048,  512));
+    // the speculative verify batches of the same MoE: the mat-vec path, several tokens sharing experts
+    for (int n : {2, 3, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n, 640, 1, true));
+    }
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
@@ -10086,6 +10092,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
+        // mat-vec path with tokens sharing experts (4 experts, 2 used, 5 tokens)
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64,  5, 3*ggml_blck_size(type_a)));
     }
 
     // Test IQP panel path for all grid IQ types
