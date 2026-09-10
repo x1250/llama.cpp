@@ -9838,6 +9838,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false,  640, 2048, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, 2048,  640));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K,   GGML_TYPE_F32, 256,  8, false, 2048, 2048,  512));
+    // the same expert shapes with 64 experts: 320 rows per expert on average instead of 40, so the tiles of
+    // the mul_mat_id path fill; the perf mode compares the two against the tile-utilization hypothesis
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32,  64, 10, false,  640, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32,  64, 10, false, 2560, 2048,  640));
     // the speculative verify batches of the same MoE: the mat-vec path, several tokens sharing experts
     for (int n : {2, 3, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
