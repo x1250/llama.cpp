@@ -196,12 +196,33 @@ media 52, p50 18-21, p90 103-116, máximo ~1960 (un experto casi universal por c
 BN = 128 del MUL_MAT_ID (sección 3, prefill punto 2) la mediana de 21 filas ocupa el 16 % del
 tile: confirma el diagnóstico de utilización.
 
-Diseño propuesto (backend Vulkan, `ggml_vk_mul_mat_vec_id_q_f16` y `mul_mat_vec_base.glsl`):
-un solo dispatch por nodo con eje y = pares (token, slot) en vez de un dispatch por token; el
-workgroup del par p toma su experto e, sale si un par anterior ya lo tiene, y si no calcula las
-columnas de todos los tokens que eligieron e (≤ n_tokens ≤ 8, NUM_COLS especializado por
-n_tokens) con offsets de B y D por columna y el índice de escala `t·n_used + s`. La aritmética
-por columna es la misma secuencia que hoy, así que los logits no cambian bit a bit: `graph_diff4`
-contra la build actual debe dar 0 nodos distintos. Cobertura: los casos MUL_MAT_ID de
-test-backend-ops con n ≤ 8 tokens ya producen ids repetidos entre tokens (n_mats 16, n_used 16);
-faltan los de forma real (512 expertos, 10 usados, 640/2560, n = 2..4).
+Diseño implementado y medido (2026-09-10, retirado): un solo dispatch por nodo con eje y =
+pares (token, slot) en vez de un dispatch por token; el workgroup del par p toma su experto e,
+sale si un par anterior ya lo tiene, y si no calcula las columnas de todos los tokens que
+eligieron e (NUM_COLS especializado por n_tokens) con offsets de B y D por columna y el índice
+de escala `t·n_used + s`, lo que extiende la fusión `MUL_MAT_ID + MUL` a varios tokens.
+
+Resultado: correcto y determinista, pero más lento. test-backend-ops MUL_MAT_ID 927/927,
+MUL_MAT_ID_FUSION 17/17, MUL_MAT 1176/1176; graph_diff4 seq_rm 2048,631 sobre MUL_MAT_ID: 0 de
+432 nodos difieren; logits a 40k bit a bit idénticos a la build anterior (q1: El −0.3867,
+We −1.286, The −3.2772, Okay −6.0566 en ambas; sonda de producción idéntica). A/B en el rig de
+40k con MTP, mismas condiciones, una carga tras otra:
+
+| Build | Turnos 2-5, decode t/s | Turno 1 | Runs del repeat (small batch) |
+|---|---|---|---|
+| Anterior (dispatch por token) | 38.50, 36.69, 36.56, 36.00 | 33.34 | 34.9-35.4 |
+| Agrupada, corrida 1 | 36.93, 35.25, 34.71, 34.21 | 31.61 | 33.7-34.2 |
+| Agrupada, corrida 2 | 36.04, 35.06, 33.96, 33.71 | 31.26 | 33.2-33.7 |
+
+Lectura: −5 % de decode. Las relecturas del 27 % ya las servía la Infinity Cache de 32 MB (los
+tres dispatches de un nodo leen los mismos expertos con microsegundos de diferencia), así que la
+agrupación no quitó tráfico de DRAM, y añadió a cada workgroup el barrido de los ids y hasta
+n_tokens columnas de B y de FMAs aunque su experto lo use un solo token. La ineficiencia real del
+mat-vec de expertos (160 GB/s frente a 210-227 de los densos grandes) está en la forma del
+workgroup, no en los bytes: `down` tiene k = 640 (una iteración y media por hilo, 640
+workgroups por par que pagan la reducción entera) y `gate`/`up` m = 640 (160 workgroups por
+par); son dos nodos separados por capa (gate y up no se fusionan al cargar). Próxima vía para
+este bloque: NUM_ROWS mayor o reparto de k para `down`, y gate+up en un tensor fusionado
+(m = 1280, la mitad de dispatches); ambas requieren medición propia. El commit del kernel
+agrupado se retiró; quedan los tests de forma real a 2-8 tokens con expertos compartidos
+(`tests: MUL_MAT_ID mat-vec cases with tokens sharing experts`).
