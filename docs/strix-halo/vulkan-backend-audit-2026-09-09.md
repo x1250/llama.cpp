@@ -503,3 +503,36 @@ sin paralelismo temporal en prefill (no se aplica la formulación por bloques); 
 `16·H` waves; un wave por workgroup; dos reducciones de subgrupo por token en la ruta crítica
 (`:158`, `:170`) más `exp()` por elemento con `KDA == 1` (`:145-151`); escritura del estado
 por token cuando `K > 1` (`:175-182`) en lugar de una sola al final (`:186-190`).
+
+## 10. Compuertas de halo-box/strix-llama.cpp en el fork (2026-09-15)
+
+El fork comunitario halo-box/strix-llama.cpp (Vulkan, gfx1151, RADV) publica sus kernels con la
+medición en el mensaje de cada commit. Estado en nuestro `master` (los `getenv` de
+`ggml-vulkan.cpp`), lo que midió halo-box y si aplica a qwen4exp. Las vías citadas son las de
+`qwen4exp-cost-breakdown-2026-09-09.md`, sección 3.
+
+| Compuerta (halo-box) | En el fork | Default aquí | Medición de halo-box (gfx1151) | Aplicación a qwen4exp |
+|---|---|---|---|---|
+| `GGML_VK_DENSE_F16B` (B en f16 para MUL_MAT cuantizado coopmat1; `auto` = solo ne10 == 5120) | sí, 8dc44961d (2026-08-25) | on (=1); `auto` nunca dispararía aquí (n_embd 2560) | +5..+7 % pp2048 en densos de 5120 (q6_K, q8_0), −1.2 % en un 7B, −0.5 % en un MoE; fork: +4.5 % denso, +4.7 % MoE | Lista sin IQ4_NL (Q2_K..Q8_0): actúa en wqkv q5_K, o_proj q8_0 y LM head q6_K, no en los densos IQ4_NL (vía 11) |
+| `GGML_VK_MMID_F16B` (lo mismo para MUL_MAT_ID) | sí | on | fork: +6.9 % pp2048 en un MoE | Lista sin IQ4_NL: sin efecto en nuestros expertos (vía 11) |
+| `GGML_VK_DENSE_WAVE32` (retile a wave32 de los coopmat cuantizados densos; `=2` también f16) | sí, con el shadow de los tiles mmid de 3865cc79a | off ("hasta medirla aquí") | GEMM densa q6_K +5.2..+10.8 %, q8_0 +5.4..+8.4 %, q4_K +0.7..+9.1 %, q4_0 −1.5..+1.8 %, f16 −6.7..+6.4 %; Qwen3-32B Q6_K pp2048 +7.2 % (ub256) / +3.9 % (ub2048), Qwen3.8-27B +5.3 / +4.8 %; PPL idéntica | Vía 6 (pre-check por variable) |
+| `GGML_VK_MMID_WAVE32`, `GGML_VK_MMID_WG256` | sí | off | on por defecto allí desde 2026-08-30 (6192a050d); WG256 forma parte de 1223 → 1733 t/s pp2048 en Qwen3.6-35B (cuatro compuertas juntas) | Vía 6 |
+| `GGML_VK_CONCAT_TRANSPOSE` (concat traspuesta por tiles 32×32 del estado conv de delta-net) | sí, 7f2d40ef5 (2026-08-24) | on | CONCAT 11877 → 957 µs/op (stride de 40960 B: un solo canal de memoria, 13.7 GB/s); Qwen3.8-27B pp2048 +7.2 % (ub2048); fork: +45 % pp2048 en un MoE delta-net | Activa; CONCAT 1.1 s en 34677 dispatches por corrida de 40k (32 µs) |
+| `GGML_VK_FUSE_UNARY_MUL` | equivalente upstream #27220 (936849ba9) | on | 750 → 443 µs/op | Activa |
+| `GGML_VK_MMID_SMALLN`, `M128`, `BM64` (tile por filas esperadas por experto sobre un prepass de listas de filas), `TILE16` | no | — | SMALLN + listas: pp512 914.7 → 1063.6 t/s (+16.3 %) en Qwen3.6-35B-A3B; MUL_MAT_ID q5_K 2.33 → 4.43 TFLOPS, q6_K 1.99 → 3.57; TILE16 negativo en gfx1151 | Vía 1: implementación de referencia; mismo diagnóstico que 8.A |
+| `GGML_VK_MMID_SCALE_EPILOGUE` (escala por (experto, token) al escribir el MUL_MAT_ID de prefill; no coopmat2) | no | — | evita 134 MB de escritura y relectura por capa en Qwen3.6-35B | Vía 8 |
+| Troceado por columnas del mat-vec por lotes (`GGML_VK_MMV_NO_SPLIT=1` lo desactiva; d22fa655a lo limita a q8_0 y q6_K) | no | — | Qwen3.8-Flash-Next en Vulkan, MTP n-max 4: decode 9.6 → 14.8-15.2 t/s; Qwen3.8-27B q4_K con `-b 8`: 28.8 troceado frente a 47.4 sin trocear (pierde en q4_K) | Vía 3: dato de forma; nuestro mat-vec-id ya despacha por token y los densos grandes van a 190-227 GB/s |
+| `GGML_VK_FA_WAVE32` (pin a subgrupo 32 de la FA coopmat1 cuando hsv ≤ 128; solo n_rows ≥ 32) | no | — | pp2048 Qwen3-Coder-30B: +2.5 % d0, +11.3 % d32768; hsv 256 declinado (6-18 % más lento) | No aplica: HSK = HSV = 256 |
+| `GGML_VK_FA_KV_CONTIG`, `GGML_VK_FA_DEQUANT` (K/V f16 con stride contiguizados; dequant una vez) | no | — | pp2048 a d8192 846.6 frente a 847.9 t/s (neutro en su modelo) | No aplica: KV q8_0 y FA sparse propia (5.4) |
+| `GGML_VK_FA_TOPK_GATHER`, `GGML_VK_FA_TOPK_UNION` (gather a KV compacto para el decode sparse de DeepSeek V4; unión deduplicada para lotes 2-8) | no | — | gather: kv 32768 986 → 56 µs (17.6×), plano con el contexto; unión: 1.06-1.46× a lote 2-8 con solape del 60 % | Equivalente propio: modo compacto (filas compactas, c0e776ec4) y solape medido del 27 % a n = 3 (desglose, sección 5) |
+| `GGML_VK_MAX_MB_PER_SUBMIT` (cota de bytes por submisión, 8 GiB) | no | — | evita el reset del anillo (timeout de 10 s en su kernel) con nodos sin estimación de flops | Robustez (desglose, sección 4); aquí `GGML_VK_MAX_NODES_PER_SUBMIT` cuenta nodos y `qsa_query_block` acota solo la FA |
+| Kernels del indexador y de la FA sparse de DeepSeek V4 (prefill y decode) | no | — | serie de agosto (e72ffec16 … 78e31af07) | Equivalente propio (5.4); no comparados |
+| ROCmFPx (tipos FPx nativos de AMD, CPU + Vulkan) | no (677ad73a8 retiró las referencias) | — | — | Tipos nuevos, fuera de alcance |
+
+Upstream Vulkan posterior a nuestra base `6d9c82ea2` (2026-09-09) y ausente aquí: `50182a53f`
+topk_moe fusionado en prefill (#28422), `6788edb4f` matrices M pequeñas para qwen (#28457),
+`28ff09582` escrituras CPU en `ggml_backend_vk_cpy_tensor_async` con el contexto inactivo
+(#28618), `481c65f09` carrera y OOB en argsort grande (#28705), `91f6a6cf3` constante de
+especialización para el tipo A (#25773), `72797e891` etiquetas de depuración (#28101). La rama
+HIP de pwilkin (kernels ggml-cuda y cambios de modelo, 2026-09-12..14) no aporta código Vulkan;
+su análisis está en el desglose, sección 6.

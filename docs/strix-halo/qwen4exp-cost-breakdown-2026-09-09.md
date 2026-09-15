@@ -96,54 +96,79 @@ exista aunque el cambio sea correcto.
 
 | # | Vía | Fase | Ganancia estimada | Evidencia | Riesgo | Comprobación previa |
 |---|---|---|---|---|---|---|
-| 1 | MUL_MAT_ID del prefill: tile por filas por experto (mediana 21, BN=128), hoisting de ids para 512 expertos, cargas de B fuera de `_ne1`, BK_STEP=1 | prefill | −8 a −10 % (20 s → 9-11 s) | Medida directa: 4.6 y 10 TFLOPS frente a 22 en los densos; causas leídas en `mul_mmq.comp` | Medio: otro límite (L2, ocupación) puede aparecer al llenar los tiles | test-backend-ops perf con 64 expertos (320 filas por experto): si alcanza 15-20 TFLOPS, el tile es la causa |
+| 1 | MUL_MAT_ID del prefill: tile por filas por experto (mediana 21, BN=128), hoisting de ids para 512 expertos, cargas de B fuera de `_ne1`, BK_STEP=1 | prefill | −8 a −10 % (20 s → 9-11 s) | Medida directa: 4.6 y 10 TFLOPS frente a 22 en los densos; causas leídas en `mul_mmq.comp`; externa, misma GPU: halo-box selecciona el tile por filas esperadas por experto (`GGML_VK_MMID_SMALLN` con `M128` y `BM64`, sobre un prepass de listas de filas) y midió +16.3 % pp512 en Qwen3.6-35B-A3B (~32 filas por experto), MUL_MAT_ID q5_K de 2.33 a 4.43 TFLOPS; es la implementación de referencia (auditoría, sección 10) | Medio: otro límite (L2, ocupación) puede aparecer al llenar los tiles | test-backend-ops perf con 64 expertos (320 filas por experto): si alcanza 15-20 TFLOPS, el tile es la causa; ubatch 4096 en el rig con MTP (80 filas por experto; compute buffer 4.3 GiB a 2048, verificar el tamaño con `-lv 4` antes de cargar) |
 | 2 | FA sparse token-major en prefill: tiles de 12 cabezas × 1 token (la ruta GQA del decode) en vez de 16 tokens × 1 cabeza, unión 6.3× la lista | prefill | −7.5 % a 40k (−8 s), más a mayor profundidad | Medida directa: 67.5 ms sparse vs 229 densa por nodo; uniones del 33 % medidas por el backend a 16k | Medio: asume FA limitada por cómputo; el gather compacto no ganó, lo que apunta a cómputo pero no lo prueba | `LLAMA_QSA_QUERY_BLOCK=8` fuerza bloques de 8 tokens por la ruta GQA existente; el perf logger da el coste de la FA por token sin escribir shader |
-| 3 | Forma del workgroup del mat-vec de expertos en decode: NUM_ROWS mayor o reparto de k en `down` (k=640, una iteración y media por hilo), gate+up como tensor fusionado (m=1280) | decode | hasta −6.5 % (18.2 → ~14 ms) | Tasas medidas: 160 GB/s en expertos frente a 210-227 en densos grandes de la misma GPU | Medio-alto: estimación por tasa, del mismo tipo que la vía retirada | test-backend-ops perf con las formas reales (640×2560, 2560×640, 10 de 512, n=3) y variantes de NUM_ROWS antes de tocar el grafo |
+| 3 | Forma del workgroup del mat-vec de expertos en decode: NUM_ROWS mayor o reparto de k en `down` (k=640, una iteración y media por hilo), gate+up como tensor fusionado (m=1280) | decode | hasta −6.5 % (18.2 → ~14 ms) | Tasas medidas: 160 GB/s en expertos frente a 210-227 en densos grandes de la misma GPU; halo-box midió sobre este modelo en Vulkan el troceado por columnas del mat-vec por lotes: gana en q8_0 y q6_K (MTP n-max 4: 9.6 → 15 t/s) y pierde en q4_K por releer los pesos por trozo; nuestro mat-vec-id ya despacha por token | Medio-alto: estimación por tasa, del mismo tipo que la vía retirada | test-backend-ops perf con las formas reales (640×2560, 2560×640, 10 de 512, n=3) y variantes de NUM_ROWS antes de tocar el grafo |
 | 4 | Mezcladores hyper-connection en prefill: tiles para m=320 y k=320 (48 workgroups, B en f32), formulación transpuesta o fusión del inject m=4 | prefill | −5.5 % (−6 s) | Medida directa: 7.5 TFLOPS y 0.1 TFLOPS en formas concretas | Bajo-medio | test-backend-ops perf en esas tres formas con la heurística de split_k relajada (una línea) |
-| 5 | split_k en el modo compacto de la FA sparse de decode (hoy 6 workgroups por capa, 350 µs) | decode | hasta −4.5 % (−3 ms), no probado | Inferencia: 6 workgroups en 40 CUs | Alto: el modo índice con split_k=13 fue más lento que el compacto sin split_k | test-backend-ops perf con la FA sparse de 3 tokens y split_k forzado |
-| 6 | Ponderación y suma de expertos en el epílogo del MUL_MAT_ID de prefill (MUL 3.0 s, MULTI_ADD 1.65 s) | prefill | −4.3 % (el MUL solo, −2.8 %) | Pasos de memoria medidos, 1 ms por tensor de 84-210 MB | Bajo para el MUL, medio para la suma | Ninguna para el MUL; la suma requiere diseño (orden de acumulación) |
-| 7 | Cabeza del draft MTP recortada a un subconjunto de vocabulario (248k → ~47k filas, tabla índice → token, muestreo del draft sobre K logits; converter + `common/speculative.cpp`). Aplazada por decisión del Director (2026-09-10) | decode | +4 % (la cabeza del draft mide 1.62 ms por token, 3.24 ms por paso; con 47k filas ~0.6 ms) | Medida directa del mat-vec de la cabeza (221 GB/s) | Medio: la aceptación cae con los tokens fuera del subconjunto; el subconjunto debe salir de nuestro tráfico (español), no de uno de código | Contar en las respuestas de los rigs qué fracción de tokens cae en los 47k más frecuentes de nuestro tráfico |
-| 8 | Mezclador hyper-connection en decode: reparto de k del mat-vec m=4 (14 µs en un solo workgroup), scale plegado, silu y gate fusionados | decode | hasta −3.8 % (−2.5 ms), rebajado desde −4.4 | Cadena medida: 61 µs por mezclador × 96; suelo por dispatch 2.5 µs | Alto si se fusiona todo en un kernel serial por token; medio como reparto de k | test-backend-ops perf del mat-vec m=4, k=10240 con reparto de k |
-| 9 | IQ4_NL en las listas f16-B del backend (B viaja en f32; `matmul_iq4_nl_f16` ya se genera) | prefill | −1 a −3 % | Medición del fork en otros tipos (+4.5 %) | Medio: los densos grandes van a cómputo, no a bytes de B | Dos líneas; se mide directamente |
-| 10 | Input fill del prefill: `prefetch_ple_rows` emite 2 × 10240 `posix_madvise` síncronos por ubatch (150-250 ms medidos); el resto del 25 % no GPU sin atribuir | prefill | −2.8 % seguro; hasta −20 % si el resto es host | Medido con `LLAMA_INPUT_TIMING`; el resto es una resta pared − GPU | Bajo para la parte medida; el resto no está cuantificado | Línea de tiempo por ubatch (set_inputs, build/alloc, compute host, D2H, catch-up del draft) |
-| 11 | Router f32: mat-vec con NUM_ROWS=1, 96 GB/s frente a 165 del bf16 de igual forma | decode | −2.7 % (−1.8 ms); −3.5 % con router q8_0 en el GGUF, con PPL/KLD | Medida directa | Bajo | Constante de especialización; se mide |
-| 12 | Estado GDN in place: 36 CPY de snapshots y 36 gathers por paso | decode | −2.3 % (−1.5 ms) | Familias CPY y GET_ROWS medidas; la porción GDN es estimada | Medio | Contar en el perfil los dispatches de estado por capa |
-| 13 | `eh_proj` del draft como una sola matmul (`ggml_reshape_2d` a [5120, 4·T]) en vez de mat-vec por lote de 2048 (130 ms por ubatch) | prefill | −2.2 % (−2.4 s) | Medida directa; vecinos de igual forma a 18-23 TFLOPS | Bajo | Ninguna; se implementa y mide en la misma ventana |
-| 14 | QSA en el bloque del draft reutilizando la selección de bloques del target (IndexShare, como SGLang en su soporte de día 0: el draft no ejecuta el indexador; toma la lista de la última fila aceptada más N+1 columnas para las posiciones drafteadas). La FA densa del draft cuesta 229 ms por ubatch a 37k, lineal con la profundidad, y en decode 0.5 → 3.3 ms por paso de 40k a 262k | prefill y decode | −2.2 % a 40k, crece con la profundidad; decode −6 ms por paso a 262k | Medida directa del coste; diseño de referencia publicado (SGLang) | Medio: la aceptación del draft con una selección prestada se mide al implementar; el target no cambia | Ninguna barata: la ganancia es el coste medido de la FA densa; la aceptación se comprueba en el rig (draft acc) |
-| 15 | Menos dispatches en decode: cont+cpy de los slots de rollback (108), scale plegado en `hc_down` (96), sigmoid×mul de la norma GDN, máscara fill/set_rows/add si la FA consume la lista | decode | −1 a −3 % | Suelo por dispatch medido (2.4-2.6 µs) | Bajo | Aritmética directa |
-| 16 | gate y up de los expertos en un solo tensor `ffn_gate_up_exps` (el loader ya lo soporta y el converter tiene `--fuse-gate-up-exps`; nuestro GGUF los trae separados). Transformación exacta del archivo: un MUL_MAT_ID por capa en vez de dos, un prólogo de ids menos por capa en prefill, −49 dispatches por paso en decode | prefill y decode | −1 a −2 % en prefill (estimado), −0.3 % en decode | Bit-idéntico según oMLX (`qwen35_moe_gate_up.py`); dispatches medidos | Bajo | Construir el GGUF fusionado con gguf-py (concatenar filas por experto, sin recuantizar) y medir en una ventana; cambio de archivo, decisión del Director |
-| 17 | Selección QSA a granularidad de bloque y FA que consuma la lista top-k sin construir la máscara | prefill y decode | −1.4 % a 40k, lineal con n_kv | Pasos de memoria medidos | Medio | Diseño; cuantificar a 128k con el perfil |
-| 18 | concat + transpose del `ssm_conv` | prefill | −0.8 % | Medida directa | Bajo | Ninguna |
-| 19 | Mat-muls diminutos en prefill (m=48, m=1 f32, router f32) | prefill | −0.6 % | Medida directa | Bajo | Ninguna |
-| 20 | MMVQ IQ4_NL fuera del allowlist del mat-vec | decode | < 1 % | El commit b9c196c1c midió tg64 sin cambio | Alto | test-backend-ops perf |
-| 21 | GDN chunked en prefill (hoy kernel secuencial, 2.1 ms por nodo de 2048 tokens = 1.03 µs por token y capa) | prefill | ≤ −1.4 %, probablemente nula | oMLX: su kernel secuencial optimizado rinde 0.93 µs por token y capa a 16k (paridad con el nuestro) y su variante chunked resultó más lenta de extremo a extremo | Alto | Ninguna barata; queda al final por la evidencia de oMLX |
+| 5 | GEMM densa con sombra f16 por nodo en prefill: desempaquetar el peso cuantizado a f16 una vez por nodo y ubatch (scratch transitorio) y correr el pipeline coopmat f16, en vez de dequantizar cada tile de A en cada workgroup que lo usa (16 veces por ubatch de 2048 con BN=128) | prefill | central −3 %, hasta −5.5 % (los densos grandes: 11.4 s a 18-23 TFLOPS; la sombra cuesta leer el quant y escribir f16 una vez por nodo) | Externa: la ablación de pwilkin en HIP vale 1.42× para "bf16 WMMA dequant GEMM" con ubatch 24576 (sección 6); halo-box atribuye la ganancia de wave32 al conteo de instrucciones de dequant inline (q6_K 3907 → 3433) | Medio-alto: otro backend y otro ubatch; en Vulkan la ruta coopmat f16 debe rendir ~2× la cuantizada para que la sombra se pague | test-backend-ops perf MUL_MAT f16×f32 frente a q5_K, q8_0 e iq4_nl×f32 en las formas densas de la sección 2 (wqkv, ssm_out, z, wq, wo, shexp); si f16 no dobla la tasa, la vía no existe |
+| 6 | Compuertas ya compiladas y apagadas del backend: `GGML_VK_DENSE_WAVE32=1` (retile a wave32 de los pipelines coopmat cuantizados densos; `=2` también los f16), `GGML_VK_MMID_WAVE32=1` y `GGML_VK_MMID_WG256=1` (mismo retile y workgroup de 256 hilos para MUL_MAT_ID) | prefill | 0 a −5 % | Externa, misma GPU (halo-box, RADV gfx1151): GEMM densa q6_K +5.2..+10.8 %, q8_0 +5.4..+8.4 %, q4_K +0.7..+9.1 %, q4_0 −1.5..+1.8 %; a nivel de modelo pp2048 +3.9..+7.2 %; activadas allí por defecto desde 2026-08-30. IQ4_NL sin medir en ningún sitio | Medio: el grueso de nuestros pesos es IQ4_NL, del que no hay dato; q5_K y q8_0 (wqkv, o_proj) sí lo tienen | Tres variables de entorno, sin código: test-backend-ops perf en las formas densas y de expertos, luego el rig de 40k con la combinación que gane (auditoría, sección 10) |
+| 7 | split_k en el modo compacto de la FA sparse de decode (hoy 6 workgroups por capa, 350 µs) | decode | hasta −4.5 % (−3 ms), no probado | Inferencia: 6 workgroups en 40 CUs | Alto: el modo índice con split_k=13 fue más lento que el compacto sin split_k | test-backend-ops perf con la FA sparse de 3 tokens y split_k forzado |
+| 8 | Ponderación y suma de expertos en el epílogo del MUL_MAT_ID de prefill (MUL 3.0 s, MULTI_ADD 1.65 s) | prefill | −4.3 % (el MUL solo, −2.8 %) | Pasos de memoria medidos, 1 ms por tensor de 84-210 MB; implementación de referencia en halo-box: `GGML_VK_MMID_SCALE_EPILOGUE` aplica la escala por (experto, token) al escribir el MUL_MAT_ID de prefill (no en coopmat2) | Bajo para el MUL, medio para la suma | Ninguna para el MUL; la suma requiere diseño (orden de acumulación) |
+| 9 | Cabeza del draft MTP recortada a un subconjunto de vocabulario (248k → ~47k filas, tabla índice → token, muestreo del draft sobre K logits; converter + `common/speculative.cpp`). Aplazada por decisión del Director (2026-09-10) | decode | +4 % (la cabeza del draft mide 1.62 ms por token, 3.24 ms por paso; con 47k filas ~0.6 ms) | Medida directa del mat-vec de la cabeza (221 GB/s) | Medio: la aceptación cae con los tokens fuera del subconjunto; el subconjunto debe salir de nuestro tráfico (español), no de uno de código | Contar en las respuestas de los rigs qué fracción de tokens cae en los 47k más frecuentes de nuestro tráfico |
+| 10 | Mezclador hyper-connection en decode: reparto de k del mat-vec m=4 (14 µs en un solo workgroup), scale plegado, silu y gate fusionados | decode | hasta −3.8 % (−2.5 ms), rebajado desde −4.4 | Cadena medida: 61 µs por mezclador × 96; suelo por dispatch 2.5 µs | Alto si se fusiona todo en un kernel serial por token; medio como reparto de k | test-backend-ops perf del mat-vec m=4, k=10240 con reparto de k |
+| 11 | IQ4_NL en las listas f16-B del backend (B viaja en f32; `matmul_iq4_nl_f16` ya se genera) | prefill | −1 a −3 % | Medición del fork en otros tipos (+4.5 %) | Medio: los densos grandes van a cómputo, no a bytes de B | Dos líneas; se mide directamente |
+| 12 | Input fill del prefill: `prefetch_ple_rows` emite 2 × 10240 `posix_madvise` síncronos por ubatch (150-250 ms medidos); el resto del 25 % no GPU sin atribuir. Hipótesis añadida el 2026-09-15: la máscara KQ densa. La CPU la rellena celda a celda en un solo hilo (`set_input_kq_mask_impl`, `src/llama-kv-cache.cpp`): 2048 × n_kv por ubatch, 84M celdas a 40k y 260M a 126k, creciente con la profundidad; y cada capa QSA hace fill, set_rows y add sobre n_kv × 2048 (`build_attn_qsa`), unos 5 × n_kv × 2 B por token y capa: ~1 s por prefill de 40k, ~10 s a 126k (pwilkin: "guard KQ mask write" +2 % y "maskless KQ" 1.48× en HIP con ubatch 24576) | prefill | −2.8 % seguro; hasta −20 % si el resto es host | Medido con `LLAMA_INPUT_TIMING`; el resto es una resta pared − GPU | Bajo para la parte medida; el resto no está cuantificado | Línea de tiempo por ubatch (set_inputs, build/alloc, compute host, D2H, catch-up del draft); set_inputs separa máscara y filas PLE, y el perf logger da FILL/SET_ROWS/ADD de la máscara por capa |
+| 13 | Router f32: mat-vec con NUM_ROWS=1, 96 GB/s frente a 165 del bf16 de igual forma | decode | −2.7 % (−1.8 ms); −3.5 % con router q8_0 en el GGUF, con PPL/KLD | Medida directa | Bajo | Constante de especialización; se mide |
+| 14 | Estado GDN in place: 36 CPY de snapshots y 36 gathers por paso | decode | −2.3 % (−1.5 ms) | Familias CPY y GET_ROWS medidas; la porción GDN es estimada | Medio | Contar en el perfil los dispatches de estado por capa |
+| 15 | `eh_proj` del draft como una sola matmul (`ggml_reshape_2d` a [5120, 4·T]) en vez de mat-vec por lote de 2048 (130 ms por ubatch) | prefill | −2.2 % (−2.4 s) | Medida directa; vecinos de igual forma a 18-23 TFLOPS | Bajo | Ninguna; se implementa y mide en la misma ventana |
+| 16 | QSA en el bloque del draft reutilizando la selección de bloques del target (IndexShare, como SGLang en su soporte de día 0: el draft no ejecuta el indexador; toma la lista de la última fila aceptada más N+1 columnas para las posiciones drafteadas). La FA densa del draft cuesta 229 ms por ubatch a 37k, lineal con la profundidad, y en decode 0.5 → 3.3 ms por paso de 40k a 262k | prefill y decode | −2.2 % a 40k, crece con la profundidad; decode −6 ms por paso a 262k | Medida directa del coste; diseño de referencia publicado (SGLang) | Medio: la aceptación del draft con una selección prestada se mide al implementar; el target no cambia | Ninguna barata: la ganancia es el coste medido de la FA densa; la aceptación se comprueba en el rig (draft acc) |
+| 17 | Menos dispatches en decode: cont+cpy de los slots de rollback (108), scale plegado en `hc_down` (96), sigmoid×mul de la norma GDN, máscara fill/set_rows/add si la FA consume la lista | decode | −1 a −3 % | Suelo por dispatch medido (2.4-2.6 µs) | Bajo | Aritmética directa |
+| 18 | gate y up de los expertos en un solo tensor `ffn_gate_up_exps` (el loader ya lo soporta y el converter tiene `--fuse-gate-up-exps`; nuestro GGUF los trae separados). Transformación exacta del archivo: un MUL_MAT_ID por capa en vez de dos, un prólogo de ids menos por capa en prefill, −49 dispatches por paso en decode | prefill y decode | −1 a −2 % en prefill (estimado), −0.3 % en decode | Bit-idéntico según oMLX (`qwen35_moe_gate_up.py`); dispatches medidos | Bajo | Construir el GGUF fusionado con gguf-py (concatenar filas por experto, sin recuantizar) y medir en una ventana; cambio de archivo, decisión del Director |
+| 19 | Selección QSA a granularidad de bloque y FA que consuma la lista top-k sin construir la máscara | prefill y decode | −1.4 % a 40k, lineal con n_kv | Pasos de memoria medidos | Medio | Diseño; cuantificar a 128k con el perfil |
+| 20 | concat + transpose del `ssm_conv` | prefill | −0.8 % | Medida directa | Bajo | Ninguna |
+| 21 | Mat-muls diminutos en prefill (m=48, m=1 f32, router f32) | prefill | −0.6 % | Medida directa | Bajo | Ninguna |
+| 22 | MMVQ IQ4_NL fuera del allowlist del mat-vec | decode | < 1 % | El commit b9c196c1c midió tg64 sin cambio | Alto | test-backend-ops perf |
+| 23 | GDN chunked en prefill (hoy kernel secuencial, 2.1 ms por nodo de 2048 tokens = 1.03 µs por token y capa) | prefill | ≤ −1.4 %, probablemente nula | oMLX: su kernel secuencial optimizado rinde 0.93 µs por token y capa a 16k (paridad con el nuestro) y su variante chunked resultó más lenta de extremo a extremo | Alto | Ninguna barata; queda al final por la evidencia de oMLX |
 | M | Caché del indexador como una clave agrupada por bloque de 4 celdas más un anillo de 4 slots con las claves crudas del bloque incompleto (SGLang, oMLX): hoy guardamos la clave cruda de cada celda, 12 × n_ctx × 128 × 2 B = 1.6 GB a 524k | memoria | −1.2 GB del sobre de producción; rendimiento neutro | Diseño de referencia publicado | Medio: toca `llama-memory-hybrid-idx` y el camino de recomputación del prefill | Ninguna; es memoria, se mide al cargar |
 | — | Mat-vec-id agrupado por experto (retirado, sección 5) | decode | medido: −5 % de decode, más lento | Inferencia de bytes sin prueba de cuello de botella | Fallido | — |
 
-Suma de las vías 1, 2, 4, 6, 9, 10 (parte medida) y 13 en prefill: −30 a −35 s de 108 con
-confianza media; la parte no atribuida del host es adicional y desconocida. En decode, las vías
-3, 8, 11, 12 y 15 suman −9 a −13 ms de 66 con confianza media-baja: cada una exige su
-comprobación previa.
+Suma de las vías 1, 2, 4, 8, 11, 12 (parte medida) y 15 en prefill: −30 a −35 s de 108 con
+confianza media; la parte no atribuida del host es adicional y desconocida. Las vías 5 y 6
+(2026-09-15) añadirían entre 0 y −9 s con evidencia externa: no entran en la suma hasta su
+comprobación. En decode, las vías 3, 10, 13, 14 y 17 suman −9 a −13 ms de 66 con confianza
+media-baja: cada una exige su comprobación previa.
 
 Referencias externas revisadas el 2026-09-11: oMLX (jundot/omlx, Apple Silicon/MLX) y el blog de SGLang del
-soporte de día 0 de Qwen3.8-Flash-Next. Coinciden con las vías 2 y 17 (atención sparse GQA de índice
-directo, sin máscara, por token) y con nuestro modo compacto de decode; aportan IndexShare (vía 14), el
-anillo del caché del indexador (fila M) y gate+up fusionado (vía 16), y sitúan el GDN chunked al final.
+soporte de día 0 de Qwen3.8-Flash-Next. Coinciden con las vías 2 y 19 (atención sparse GQA de índice
+directo, sin máscara, por token) y con nuestro modo compacto de decode; aportan IndexShare (vía 16), el
+anillo del caché del indexador (fila M) y gate+up fusionado (vía 18), y sitúan el GDN chunked al final.
 El mecanismo Causal Encoder-Decoder de DeepSeek-V4.1-Flash (KV de las capas altas proyectado desde el
 encoder) es una aproximación entrenada, con pérdida por diseño y sin lugar para el estado recurrente de las
-capas GDN: fuera de esta lista.
+capas GDN: fuera de esta lista. Revisión del 2026-09-15 (pwilkin Strix Halo Lab y
+halo-box/strix-llama.cpp): sección 6.
 
 ## 4. Mediciones previas pendientes
 
 - Línea de tiempo host por ubatch de prefill, producción descargada: set_inputs, build/alloc,
-  compute host, copias D2H, catch-up del draft. Decide cuánto vale la vía 10 y si existe una
+  compute host, copias D2H, catch-up del draft. Decide cuánto vale la vía 12 y si existe una
   vía mayor.
 - Coste de la FA sparse por token en prefill con `LLAMA_QSA_QUERY_BLOCK=8` y el perf logger.
   Confirma o descarta la vía 2 antes de escribir el shader.
 - test-backend-ops perf de las formas reales de expertos (vías 1 y 3) y de los mezcladores
-  (vías 4 y 8).
+  (vías 4 y 10).
 - El solape de expertos entre los tokens del verify ya está medido (sección 5): 27 % a n=3, y
   no es una vía.
+- Compuertas compiladas (vía 6): test-backend-ops perf con `GGML_VK_DENSE_WAVE32=1`,
+  `GGML_VK_MMID_WAVE32=1` y `GGML_VK_MMID_WG256=1`, por separado, en las formas densas y de
+  expertos; después el rig de 40k con la combinación que gane.
+- Sombra f16 de los densos (vía 5): perf de MUL_MAT f16×f32 frente a q5_K, q8_0 e iq4_nl en las
+  formas densas.
+- Ubatch 4096 en el rig con MTP (vía 1): tamaño del compute buffer con `-lv 4` y prefill a 40k;
+  hoy solo hay medición a 4.7k (ub2048 425 t/s, ub8192 348).
+- Robustez, sin rendimiento: acotar cada submisión por bytes movidos (halo-box
+  `GGML_VK_MAX_MB_PER_SUBMIT`, 8 GiB por defecto) como guarda genérica del timeout de 2 s del
+  kernel 7.0. Hoy solo la FA está acotada (`qsa_query_block`); los nodos sin estimación de flops
+  (copias, set_rows, fill de máscaras) crecen con el contexto y `GGML_VK_MAX_NODES_PER_SUBMIT`
+  cuenta nodos, no bytes.
+- Merge de upstream: tras nuestra base `6d9c82ea2` hay cuatro commits Vulkan relevantes:
+  `50182a53f` fusión topk_moe en prefill (#28422), `6788edb4f` matrices M pequeñas para qwen
+  (#28457), `28ff09582` escrituras CPU en `cpy_tensor_async` con el contexto inactivo (#28618) y
+  `481c65f09` carrera y OOB en argsort grande (#28705, corrección). Entran con el próximo merge y
+  sus comprobaciones (lazy mode, split-on-inputs, sonda a n_ctx 135168).
+- Memoria: draft MTP con `token_embd` y `output` compartidos con el target (pwilkin
+  `--mtp-shared-embd`, draft Q8_0 de 2.8 GB sin ambos). Nuestro
+  `Qwen3.8-Flash-Next-MTP-IQ4_NL.gguf` lleva los dos (2 × 636 M elementos IQ4_NL, ~0.7 GB):
+  ahorro del mismo orden en el sobre; requiere cargador y archivo.
 
 Reglas de toda ventana de medición: producción descargada, gate de 40 GiB (37 para los rigs
 de profundidad), baseline repetido en la misma cadena, MTP encendido, y las comprobaciones de
@@ -178,7 +203,7 @@ MUL aparte (48 dispatches por paso) que la variante agrupada puede absorber.
 Prefill (ubatch de 2048, troncal): tokens consecutivos comparten el 36.6 % de sus expertos
 (t, t+1) y el 28.3 % (t, t+2); expertos activos por capa 398 de 512; filas por experto activo
 media 52, p50 18-21, p90 103-116, máximo ~1960 (un experto casi universal por capa). Con el tile
-BN = 128 del MUL_MAT_ID (sección 3, prefill punto 2) la mediana de 21 filas ocupa el 16 % del
+BN = 128 del MUL_MAT_ID (sección 3, vía 1) la mediana de 21 filas ocupa el 16 % del
 tile: confirma el diagnóstico de utilización.
 
 Diseño implementado y medido (2026-09-10, retirado): un solo dispatch por nodo con eje y =
@@ -211,3 +236,81 @@ este bloque: NUM_ROWS mayor o reparto de k para `down`, y gate+up en un tensor f
 (m = 1280, la mitad de dispatches); ambas requieren medición propia. El commit del kernel
 agrupado se retiró; quedan los tests de forma real a 2-8 tokens con expertos compartidos
 (`tests: MUL_MAT_ID mat-vec cases with tokens sharing experts`).
+
+## 6. Referencias externas (2026-09-15): pwilkin Strix Halo Lab y halo-box/strix-llama.cpp
+
+Fuentes: https://pwilkin.github.io/strix-halo/ (y su `journey.html`), el instalador `install.sh`
+del repo pwilkin/strix-halo (rama `strix-halo` de pwilkin/llama.cpp, commit `d67d58836`, ROCm
+10.0, `-DGGML_HIP=ON -DGPU_TARGETS=gfx1151`) y https://github.com/halo-box/strix-llama.cpp
+(Vulkan, misma GPU). Los commits del fork comunitario que ya están en el nuestro y los que
+faltan están tabulados en `vulkan-backend-audit-2026-09-09.md`, sección 10.
+
+Sus números son llama-bench en HIP (`-b 24576 -ub 24576 -p 16384 -n 128 -d 0,40000 -r 3`, y
+16384 en el instalador, que mide igual: 1204.31 ± 2.31 frente a 1199.63 ± 7.12), sin draft, un
+slot, ctx 65536, sin mmproj, pesos en memoria anónima (`--load-mode none`) y PLE servida por
+`pread` desde un pool de hilos (`--lazy-mode on-direct`). Su lanzador de producción añade MTP
+n-max 3 con un draft Q8_0 de 2.8 GB que comparte `token_embd` y `output` con el target. Los
+nuestros son el server con el feature set de producción (Vulkan, ubatch 2048, KV q8_0, MTP
+n-max 2, mmproj, checkpoints): rigs `~/dbg/depth/depth-p40-{mtp,nomtp}.log`,
+`depth-merge-rev-125k.log` y `depth-chunk125.log`.
+
+| Medida | pwilkin, HIP, ubatch 16384 | Nuestro, Vulkan, ubatch 2048 |
+|---|---|---|
+| Prefill, profundidad 0 | 1204 ± 2 t/s | ~425 t/s (prompts de 4.7k, MTP cargado) |
+| Prefill, 40k | 1086 ± 1 t/s | 368 con MTP, 401 sin MTP |
+| Prefill, contexto largo | 947 t/s (150k) | 299 con MTP (126.5k) |
+| Decode, 40k | 16.6 ± 0.1 t/s | 25.9 sin MTP, 36.0 con MTP |
+| Decode, contexto largo | 6.9 t/s (150k) | 21.8 sin MTP (build anterior), 31.4 con MTP (126.5k) |
+
+Prefill: 2.7 a 3.2× a favor de HIP. Decode: 1.5 a 3× a favor nuestro sin draft, hasta 4.5× con
+MTP. Su punto de partida con HIP upstream fue 191 t/s con ubatch 24576, la mitad de nuestro
+Vulkan: el salto (6.07×) es su rama. Sobre upstream lleva 26 commits del 12 al 14 de septiembre
+(15 de kernels CUDA/HIP, 5 de modelo y grafo sobre `qwen4exp.cpp` y `llama-graph`, el resto
+pruebas, defaults y guardas), más el anillo de entradas del scheduler de agosto y los TOP_K
+wave32 de ROCm. Su trabajo de decode empezó el 13 de septiembre (`hip: enable sparse QSA decode
+and incremental indexer state`). Su capa de runtime (listas PM4 retenidas para HIP graphs) no
+interviene: por su propia nota los HIP graphs nunca se activan en el prefill de este modelo, y
+Vulkan no tiene esa re-codificación.
+
+Ablación de pwilkin (desactivando cada pieza en su binario final) mapeada a nuestro desglose de
+108 s:
+
+- GDN por tiles, 2.37× en su serie: no aplica. Nuestro GDN cuesta 1.43 s (1.3 %), ~1.03 µs por
+  token y capa; su baseline era el kernel genérico de HIP.
+- GEMM densa bf16 WMMA con dequant una vez por grafo, 1.42×: vía 5.
+- Kernel de atención sparse, 1.71×, y "sparse apagada del todo" 0.98-1.01×: su FA densa es tan
+  rápida que el indexador (12 capas × 80 franjas por prefill) anula lo que ahorra la sparsity con
+  ubatch 16384. Confirma la vía 2: la palanca es el kernel, no la sparsity; una FA densa rápida
+  de head 256 serviría también a la atención densa del draft (229 ms por nodo a 37k).
+- Camino sin máscara KQ, 1.48× con ubatch 24576 (máscara de 24576 × n_kv escrita por el host en
+  memoria managed): en nuestro grafo la máscara densa existe y es la hipótesis añadida a la vía 12.
+- HC gate GEMM + mezcla fusionados, 1.19×; streams HC en bf16, 1.08×: vías 4 y 10. Los streams
+  en bf16 cambian la numérica y exigirían una compuerta de calidad (PPL).
+- Lector PLE directo, 2.75× (233 → 396 t/s aislado): patología de la memoria managed de HIP,
+  que hacía fault por página dentro del driver. Nosotros leemos filas de la page cache con
+  `posix_madvise` (vía 12); solo el diseño (pool de hilos con `pread`) es candidato si la línea
+  de tiempo confirma el input fill.
+- Indexador WMMA, compactación MMQ, tuning de FA hd256 y concat traspuesta: neutros en su serie.
+  Nuestra concat ya es la traspuesta por tiles (1.1 s por corrida de 40k, 32 µs por dispatch).
+- Empates en TOP_K (−1.9 %, corrección): la misma clase de defecto que corregimos en el radix
+  top-k el 2026-09-09.
+
+Veredicto (2026-09-15): el 3× requiere ubatch 16384 (8× menos lanzamientos de grafo, costes
+fijos por ubatch amortizados 8×, 320 filas por experto en vez de 40) y kernels a eficiencia
+WMMA nativa (FA densa hd256, GEMM densas, indexador). Ubatch 16384 está fuera del sobre de
+memoria de producción (compute buffer 4.3 GiB a 2048, margen ~22 GiB con producción cargada);
+ubatch 4096 es el máximo razonable de probar. En Vulkan la ruta hardware es la misma (coopmat es
+WMMA en RDNA3.5), pero alcanzarla es reescribir kernels, no ajustar los que hay, y nadie ha
+publicado ese resultado en Vulkan con este modelo: halo-box lo corre en Vulkan sin publicar
+prefill y con decode MTP de 15 t/s a profundidad no indicada. El techo de nuestra tabla queda en
+~2×: hoy 108 s; central 67 s (~590 t/s) con la tabla anterior y ~64 s (~620 t/s) con la vía 5;
+optimista 55-58 s (~700 t/s); frente a 1086.
+
+Migración a HIP: esta máquina no tiene ROCm (sin `/opt/rocm` ni paquetes; build solo Vulkan).
+ROCm 10.0 es un cambio de sistema que decide el Director. La pila de producción es Vulkan de
+punta a punta: las tres correcciones de determinismo viven en shaders Vulkan, y los caminos QSA,
+checkpoints, visión y el presupuesto del timeout de 2 s se revalidarían completos sobre kernels
+HIP; sus commits de modelo tocan `qwen4exp.cpp` y chocan con nuestro trabajo de QSA y PLE.
+Semanas, con decode hoy 1.5× peor que el nuestro. Decisión (2026-09-15): no se abre. Si se
+abriera, el primer paso sería instalar ROCm y una ventana de medición con sus argumentos
+exactos, producción descargada.
