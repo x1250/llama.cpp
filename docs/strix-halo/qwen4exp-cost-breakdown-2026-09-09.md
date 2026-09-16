@@ -97,7 +97,7 @@ exista aunque el cambio sea correcto.
 | # | Vía | Fase | Ganancia estimada | Evidencia | Riesgo | Comprobación previa |
 |---|---|---|---|---|---|---|
 | 1 | MUL_MAT_ID del prefill: tile por filas por experto (mediana 21, BN=128), hoisting de ids para 512 expertos, cargas de B fuera de `_ne1`, BK_STEP=1. **Hoisting hecho y medido (7fc9ae43d, 2026-09-16): prefill 109.6 → 94.7 s (−13.5 %), re-prefill 6.05 → 5.30 s, decode igual.** El tile por filas por experto (`GGML_VK_MMID_SMALLN=1`) resultó neutro (94.4 s) y queda como sonda apagada; ubatch 4096 pierde un 9 % y deja los checkpoints a 4096. Pendientes: cargas de B fuera de `_ne1`, BK_STEP | prefill | −13.5 % medido (hoisting); resto sin estimar | Medida directa: 4.6 y 10 TFLOPS frente a 22 en los densos; causas leídas en `mul_mmq.comp`; externa, misma GPU: halo-box selecciona el tile por filas esperadas por experto (`GGML_VK_MMID_SMALLN` con `M128` y `BM64`, sobre un prepass de listas de filas) y midió +16.3 % pp512 en Qwen3.6-35B-A3B (~32 filas por experto), MUL_MAT_ID q5_K de 2.33 a 4.43 TFLOPS; es la implementación de referencia (auditoría, sección 10). Ruta entera (MMQ q8_1) frente a coopmat, medido a nivel de modelo el 2026-09-16 con `GGML_VK_DISABLE_COOPMAT_MMQ=1`: para IQ4_NL la entera gana 2.4 % de prefill (104.0 frente a 106.5 s); para IQ3_S la coopmat gana 2.1 % (109.7 frente a 112.0 s), y en el microbench aislado la coopmat gana en ambos tipos: el +3.7 % de b9c196c1c se sostiene solo en el grafo real | Medio: otro límite (L2, ocupación) puede aparecer al llenar los tiles | test-backend-ops perf con 64 expertos (320 filas por experto): si alcanza 15-20 TFLOPS, el tile es la causa; ubatch 4096 en el rig con MTP (80 filas por experto; compute buffer 4.3 GiB a 2048, verificar el tamaño con `-lv 4` antes de cargar) |
-| 2 | FA sparse token-major en prefill: tiles de 12 cabezas × 1 token (la ruta GQA del decode) en vez de 16 tokens × 1 cabeza, unión 6.3× la lista | prefill | −7.5 % a 40k (−8 s), más a mayor profundidad | Medida directa: 67.5 ms sparse vs 229 densa por nodo; uniones del 33 % medidas por el backend a 16k | Medio: asume FA limitada por cómputo; el gather compacto no ganó, lo que apunta a cómputo pero no lo prueba | `LLAMA_QSA_QUERY_BLOCK=8` fuerza bloques de 8 tokens por la ruta GQA existente; el perf logger da el coste de la FA por token sin escribir shader |
+| 2 | FA sparse token-major en prefill: tiles de 12 cabezas × 1 token (la ruta GQA del decode) en vez de 16 tokens × 1 cabeza, unión 6.3× la lista. **Hecha y medida (2026-09-16, sección 9): prefill 94.7 → 88.8 s (−6.3 %), re-prefill de 2k 5.3 → 4.75 s (−10 %), decode igual, determinismo verificado.** | prefill | −7.5 % a 40k (−8 s), más a mayor profundidad | Medida directa: 67.5 ms sparse vs 229 densa por nodo; uniones del 33 % medidas por el backend a 16k | Medio: asume FA limitada por cómputo; el gather compacto no ganó, lo que apunta a cómputo pero no lo prueba | `LLAMA_QSA_QUERY_BLOCK=8` fuerza bloques de 8 tokens por la ruta GQA existente; el perf logger da el coste de la FA por token sin escribir shader |
 | 3 | Forma del workgroup del mat-vec de expertos en decode: NUM_ROWS mayor o reparto de k en `down` (k=640, una iteración y media por hilo), gate+up como tensor fusionado (m=1280) | decode | hasta −6.5 % (18.2 → ~14 ms) | Tasas medidas: 160 GB/s en expertos frente a 210-227 en densos grandes de la misma GPU; halo-box midió sobre este modelo en Vulkan el troceado por columnas del mat-vec por lotes: gana en q8_0 y q6_K (MTP n-max 4: 9.6 → 15 t/s) y pierde en q4_K por releer los pesos por trozo; nuestro mat-vec-id ya despacha por token | Medio-alto: estimación por tasa, del mismo tipo que la vía retirada | test-backend-ops perf con las formas reales (640×2560, 2560×640, 10 de 512, n=3) y variantes de NUM_ROWS antes de tocar el grafo |
 | 4 | Mezcladores hyper-connection en prefill: tiles para m=320 y k=320 (48 workgroups, B en f32), formulación transpuesta o fusión del inject m=4 | prefill | −5.5 % (−6 s) | Medida directa: 7.5 TFLOPS y 0.1 TFLOPS en formas concretas | Bajo-medio | test-backend-ops perf en esas tres formas con la heurística de split_k relajada (una línea) |
 | 5 | GEMM densa con sombra f16 por nodo en prefill: desempaquetar el peso cuantizado a f16 una vez por nodo y ubatch (scratch transitorio) y correr el pipeline coopmat f16, en vez de dequantizar cada tile de A en cada workgroup que lo usa (16 veces por ubatch de 2048 con BN=128) | prefill | central −3 %, hasta −5.5 % (los densos grandes: 11.4 s a 18-23 TFLOPS; la sombra cuesta leer el quant y escribir f16 una vez por nodo) | Externa: la ablación de pwilkin en HIP vale 1.42× para "bf16 WMMA dequant GEMM" con ubatch 24576 (sección 6); halo-box atribuye la ganancia de wave32 al conteo de instrucciones de dequant inline (q6_K 3907 → 3433) | Medio-alto: otro backend y otro ubatch; en Vulkan la ruta coopmat f16 debe rendir ~2× la cuantizada para que la sombra se pague | test-backend-ops perf MUL_MAT f16×f32 frente a q5_K, q8_0 e iq4_nl×f32 en las formas densas de la sección 2 (wqkv, ssm_out, z, wq, wo, shexp); si f16 no dobla la tasa, la vía no existe |
@@ -143,7 +143,10 @@ halo-box/strix-llama.cpp): sección 6.
   compute host, copias D2H, catch-up del draft. Decide cuánto vale la vía 12 y si existe una
   vía mayor.
 - Coste de la FA sparse por token en prefill con `LLAMA_QSA_QUERY_BLOCK=8` y el perf logger.
-  Confirma o descarta la vía 2 antes de escribir el shader.
+  Confirma o descarta la vía 2 antes de escribir el shader. **Hecha (sección 9): el brazo de
+  bloques de 8 no mide la geometría sino la ocupación (16 workgroups por dispatch, 3× más lento);
+  el brazo base fijó la FA sparse en 0.77-0.98 s por 2048 consultas (12 capas) entre 16k y 37k,
+  y la vía se midió directamente con el kernel.**
 - test-backend-ops perf de las formas reales de expertos (vías 1 y 3) y de los mezcladores
   (vías 4 y 10).
 - El solape de expertos entre los tokens del verify ya está medido (sección 5): 27 % a n=3, y
@@ -371,3 +374,44 @@ Microbench del nodo gate/up (640×2560, 512 de 10, n=2048): iq4_nl 10.2-11.4 →
 9.4 ms con el hoisting; los casos de 64 expertos (ya hoisteados) no se mueven. Estado de producción al
 cierre: quant nl3s-oproj8, build 376 (7fc9ae43d), prefill 94.7 s a 40k (417 t/s), decode 36-38 t/s,
 MemAvailable 36-38 GiB con producción cargada.
+
+## 9. Vía 2 medida: FA sparse token-major en el prefill (2026-09-16, build 378)
+
+Cambio (backend Vulkan, `ggml_vk_flash_attn`, `flash_attn_base.glsl`, `flash_attn_sparse_idx.comp`):
+en el modo índice de la FA sparse, un workgroup del prefill toma las 12 cabezas de un token (la
+disposición GQA que ya usaba el decode con N ≤ 8) y atiende la lista del propio token, en vez de
+un tile de 16 tokens de una cabeza con la unión de sus listas. Las listas pasan a ser por fila de
+máscara (`list_rows` = 1; el prepass es el mismo shader con Br = 1) y el shader recibe la altura
+de la lista como push constant en lugar de asumir Br. El modo compacto (decode, lotes ≤ 64
+filas) no cambia. Compuerta de apagado: `GGML_VK_DISABLE_SPARSE_FA_TOKEN_MAJOR=1`.
+
+Geometría a 40k por capa QSA y ubatch de 2048: antes 24 cabezas × 128 tiles × ~13k celdas
+(624k pasos de tile de 64 celdas); ahora 2 cabezas KV × 2048 tokens × 2051 celdas (135k pasos,
+4.6× menos) con 12 de las 16 filas coopmat en uso.
+
+Pre-check (perf logger, ubatch 512, modo compacto apagado, sección 4): la FA sparse costaba
+0.77-0.98 s por 2048 consultas y 12 capas entre 16k y 37k de profundidad (creciente con la
+unión). El brazo `LLAMA_QSA_QUERY_BLOCK=8` dio 2.3-3.6 s: no mide la geometría sino la
+ocupación (cada nodo de 8 tokens despacha 16 workgroups con split_k 5 y un prepass por trozos
+de dos pasadas), así que no sirve como proxy y la vía se midió con el kernel.
+
+Rigs de 40k con MTP (`mtp_depth.sh`, base con la compuerta de apagado, primero y último):
+
+| Config | Prefill 39.5k | Re-prefill 2k | Decode | Determinismo |
+|---|---|---|---|---|
+| Base (token-major apagado) | 94.7 / 94.7 s (417 t/s) | 5.31 / 5.32 s | 33-38 t/s | — |
+| Token-major | **88.8 s (445 t/s, −6.3 %)** | **4.75 s (−10 %)** | 32-39 t/s (igual) | depth_repeat: runs 2 = 3 y 1 = 5 idénticos en tokens y logprobs |
+
+Correctness: test-backend-ops FLASH_ATTN_EXT 5197/5197 en tres pases (por defecto, modo
+compacto apagado y token-major apagado); los casos sparse con GQA 12 y lotes de 128-512 filas a
+32k y 131k toman la ruta nueva. Gate (`chain_via2.sh`): graph_diff4 seq_rm 2048,631 con los
+mismos 72 nodos SET_ROWS de vistas de caché sobre 12300 que la referencia del 2026-09-09 (benignos)
+y repeat_probe sobre producción con una sola distribución en 5 prefills. Estado de producción al
+cierre: quant nl3s-oproj8, build 378, prefill 88.8 s a 40k (445 t/s), decode 32-39 t/s,
+MemAvailable 36-37 GiB con producción cargada.
+
+La ganancia (5.9 s sobre 12 ubatches en régimen sparse, ~0.5 s por ubatch) es el 60 % de la FA
+sparse medida en el pre-check: el resto es el prepass por token (2048 workgroups que recorren la
+fila de máscara completa, con una barrera por bloque de 128 columnas, 16× más iteraciones de
+barrera que el prepass por tile) y las 4 filas coopmat vacías. Siguiente palanca en esta vía:
+construir la lista por token desde los índices del selector QSA en vez de barrer la máscara.

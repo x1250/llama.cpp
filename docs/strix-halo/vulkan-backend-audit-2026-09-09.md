@@ -350,8 +350,9 @@ mask[i,t,s]` (`S/topk_radix_select.comp:69-76`), materializado una vez en scratc
 9. Palancas de entorno existentes: `GGML_VK_DENSE_F16B` (`V:4354`), `GGML_VK_MMID_F16B`
    (`V:4369`), `GGML_VK_DENSE_WAVE32` (`V:5281`), `GGML_VK_MMID_WG256` / `GGML_VK_MMID_WAVE32`
    (`V:5432`, `V:5441`, solo tiles coopmat de `mul_mat_id`), `GGML_VK_DISABLE_COOPMAT_MMQ` /
-   `GGML_VK_FORCE_COOPMAT_MMQ` (`V:7199-7200`), `GGML_VK_DISABLE_SPARSE_FA` / `_COMPACT`
-   (`V:11740`, `V:11755`), `GGML_VK_SPARSE_FA_LOG` (`V:11803`), `GGML_VK_MAX_NODES_PER_SUBMIT`
+   `GGML_VK_FORCE_COOPMAT_MMQ` (`V:7199-7200`), `GGML_VK_DISABLE_SPARSE_FA` / `_COMPACT` /
+   `_TOKEN_MAJOR` (`V:11740`, `V:11755`, `V:11796`; el tercero apaga las listas por token del
+   prefill, 2026-09-16), `GGML_VK_SPARSE_FA_LOG` (`V:11803`), `GGML_VK_MAX_NODES_PER_SUBMIT`
    (`V:7179`), `GGML_VK_SYNC_LOGGER`, `GGML_VK_PERF_LOGGER[_CONCURRENT|_FREQUENCY]`
    (`V:8169-8181`).
 
