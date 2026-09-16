@@ -73,10 +73,12 @@ layout (push_constant) uniform parameter {
     uint32_t split_kv;
     uint32_t k_num;
 #ifdef FA_SPARSE
-    // sparse K/V: the per-tile cell lists written by flash_attn_sparse_idx.comp, and in compact mode
-    // the rows per (tile, head) of the compact regions and the dispatch's first tile and batch
+    // sparse K/V: the cell lists written by flash_attn_sparse_idx.comp, one per list_rows mask rows,
+    // and in compact mode the rows per (tile, head) of the compact regions and the dispatch's first
+    // tile and batch
     uint32_t list_stride;
     uint32_t list_tiles;
+    uint32_t list_rows;
     uint32_t compact_cap;
     uint32_t tile0;
     uint32_t batch0;
@@ -94,7 +96,7 @@ layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 #ifdef FA_SPARSE
-// counts[n_lists] then lists[n_lists][list_stride]: for every tile of Br mask rows, the cells
+// counts[n_lists] then lists[n_lists][list_stride]: for every tile of list_rows mask rows, the cells
 // (ascending) whose mask entry is finite for at least one row of the tile
 layout (binding = 7) readonly buffer IDX {uint32_t data_idx[];};
 #endif
@@ -263,7 +265,9 @@ void init_sparse()
         KV        = CEIL_DIV(min(data_idx[li], p.compact_cap), Bc) * Bc;
         list_base = 0;
     } else {
-        const uint32_t row_tile = (p.gqa_ratio > 1) ? (gqa_iq1 / Br) : i;
+        // the workgroup's list: its tile's, or with grouped query attention the one holding its
+        // token's row (list_rows = 1: the token's own cells)
+        const uint32_t row_tile = (p.gqa_ratio > 1) ? (gqa_iq1 / p.list_rows) : i;
         const uint32_t li       = ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.list_tiles + row_tile;
         const uint32_t n_lists  = p.list_tiles * p.nem2 * p.nem3;
 

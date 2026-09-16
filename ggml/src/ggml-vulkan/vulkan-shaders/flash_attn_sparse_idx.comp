@@ -6,7 +6,7 @@
 #extension GL_KHR_shader_subgroup_ballot : enable
 
 // Sparse K/V lists for flash attention: the columns whose mask entry is finite for at least one row
-// of a tile of Br mask rows, in ascending order. Output: counts[n_lists] then lists[n_lists][list_stride],
+// of a tile of Br mask rows (Br = 1: one list per row), in ascending order. Output: counts[n_lists] then lists[n_lists][list_stride],
 // with n_lists = list_tiles * nem2 * nem3, and in chunked mode chunk_counts[n_lists][n_chunks] after
 // them. Two dispatch modes, chosen by the host:
 //   chunk_cols == 0: one workgroup per (tile, batch) walks the whole mask row range and writes the

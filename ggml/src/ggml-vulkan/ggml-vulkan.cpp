@@ -1171,7 +1171,7 @@ struct vk_device_struct {
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
-    std::map<uint32_t, vk_pipeline> pipeline_fa_sparse_idx;   // keyed by Br
+    std::map<uint32_t, vk_pipeline> pipeline_fa_sparse_idx;   // keyed by the mask rows per list
     std::map<std::pair<ggml_type, ggml_type>, vk_pipeline> pipeline_fa_sparse_gather;   // keyed by (K type, V type)
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
@@ -1481,6 +1481,7 @@ struct vk_flash_attn_sparse_push_constants {
     vk_flash_attn_push_constants base;
     uint32_t list_stride;
     uint32_t list_tiles;
+    uint32_t list_rows;   // mask rows per list: Br, or 1 when the workgroup's rows are one token's heads
     // compact mode: rows per (tile, head) of the compact regions and the dispatch's first tile and batch
     uint32_t compact_cap;
     uint32_t tile0;
@@ -11788,7 +11789,15 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    // token-major sparse index mode: a prefill's workgroup takes the heads of one token (the grouped
+    // query attention layout) and attends the token's own list instead of a tile of Br tokens' union.
+    // The QSA selection of qwen4exp is 2051 cells per token and the union of 16 tokens ~13k: the
+    // workgroup streams 6x fewer K/V rows for 12 of 16 coopmat rows in use
+    static const bool disable_sparse_fa_token_major = getenv("GGML_VK_DISABLE_SPARSE_FA_TOKEN_MAJOR") != nullptr;
+    const bool sparse_token_major = !disable_sparse_fa_token_major && sparse_candidate && !compact_candidate &&
+                                    tuning_params.path == FA_COOPMAT1;
+
+    if ((N <= 8 || sparse_token_major) && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
@@ -11809,10 +11818,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>> seen;
         if (seen.insert({ (uint32_t) neq1, (uint32_t) KV, (uint32_t) n_kv_max, (uint32_t) nem2 }).second) {
             fprintf(stderr, "sparse fa: neq1=%u KV=%u n_kv_max=%d nem1=%u nem2=%u nem3=%u neq3=%u k=%s v=%s q_stride=%u path=%d "
-                            "sparse_candidate=%d compact_candidate=%d use_sparse=%d use_compact=%d\n",
+                            "sparse_candidate=%d compact_candidate=%d use_sparse=%d use_compact=%d gqa_ratio=%u\n",
                     (uint32_t) neq1, (uint32_t) KV, n_kv_max, nem1, nem2, nem3, (uint32_t) neq3,
                     ggml_type_name(k->type), ggml_type_name(v->type), (uint32_t) (nbq1 / ggml_type_size(q->type)), (int) tuning_params.path,
-                    sparse_candidate, compact_candidate, use_sparse, use_compact);
+                    sparse_candidate, compact_candidate, use_sparse, use_compact, gqa_ratio);
         }
     }
     if (compact_candidate && !use_compact) {
@@ -11917,10 +11926,13 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     GGML_ASSERT(Br == pipeline->wg_denoms[0]);
     const uint32_t Tr = CEIL_DIV(N, Br);
 
-    // sparse lists in prealloc_y: counts[n_lists] then lists[n_lists][list_stride]. A tile of Br
-    // mask rows holds at most Br * n_kv_max cells; split_k splits the list, not the cache
-    const uint32_t list_tiles  = use_sparse ? CEIL_DIV(nem1, Br) : 0;
-    const uint32_t list_stride = use_sparse ? ROUNDUP_POW2(std::min<uint32_t>(KV, (uint32_t) n_kv_max * Br), Bc) : 0;
+    // sparse lists in prealloc_y: counts[n_lists] then lists[n_lists][list_stride], one list per
+    // tile of list_rows mask rows: the Br rows of a workgroup's tile, or the one row of the token whose
+    // heads the workgroup takes (index mode with grouped query attention; the compact regions are per
+    // tile). A list holds at most list_rows * n_kv_max cells; split_k splits the list, not the cache
+    const uint32_t list_rows   = (use_sparse && !use_compact && gqa_ratio > 1) ? 1 : Br;
+    const uint32_t list_tiles  = use_sparse ? CEIL_DIV(nem1, list_rows) : 0;
+    const uint32_t list_stride = use_sparse ? ROUNDUP_POW2(std::min<uint32_t>(KV, (uint32_t) n_kv_max * list_rows), Bc) : 0;
     const uint32_t n_lists     = list_tiles * nem2 * nem3;
     // a prefill has tiles enough to fill the GPU (one workgroup per tile); a decode has one tile per
     // token and splits the columns into chunks, whose counts follow the lists in the scratch
@@ -11996,11 +12008,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         {
             std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
             auto &pipelines = ctx->device->pipeline_fa_sparse_idx;
-            auto it = pipelines.find(Br);
+            auto it = pipelines.find(list_rows);
             if (it != pipelines.end()) {
                 pipeline_fa_sparse_idx = it->second;
             } else {
-                pipelines[Br] = pipeline_fa_sparse_idx = std::make_shared<vk_pipeline_struct>();
+                pipelines[list_rows] = pipeline_fa_sparse_idx = std::make_shared<vk_pipeline_struct>();
             }
         }
         assert(pipeline_fa_sparse_idx);
@@ -12160,7 +12172,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                               scale, max_bias, logit_softcap,
                                               mask_n_head_log2, m0, m1,
                                               gqa_ratio, split_kv, split_k };
-    const vk_flash_attn_sparse_push_constants pc_sparse = { pc, list_stride, list_tiles, compact_cap, 0, 0 };
+    const vk_flash_attn_sparse_push_constants pc_sparse = { pc, list_stride, list_tiles, list_rows, compact_cap, 0, 0 };
 
     if (use_compact) {
         GGML_ASSERT(split_k == 1);
