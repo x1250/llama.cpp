@@ -9838,13 +9838,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false,  640, 2048, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, 2048,  640));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K,   GGML_TYPE_F32, 256,  8, false, 2048, 2048,  512));
+    // iq3_s gate/up experts of the same MoE (k = 2560; the down shape's k = 640 is not a multiple of its 256 block)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false,  640, 2048, 2560));
     // the same expert shapes with 64 experts: 320 rows per expert on average instead of 40, so the tiles of
     // the mul_mat_id path fill; the perf mode compares the two against the tile-utilization hypothesis
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32,  64, 10, false,  640, 2048, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32,  64, 10, false, 2560, 2048,  640));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32,  64, 10, false,  640, 2048, 2560));
     // the speculative verify batches of the same MoE: the mat-vec path, several tokens sharing experts
     for (int n : {2, 3, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
         test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n, 640, 1, true));
     }
@@ -10973,6 +10977,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // qwen4exp gate/up experts (512 of which 10, m=640 k=2560) as iq3_s and iq4_nl: the integer-dot path at the
+    // prefill and verify batch sizes, and the 64-expert variant with 320 rows per expert
+    for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}) {
+        for (int n : {3, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, n, 2560));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 10, false, 640, 2048, 2560));
+    }
 
     // decode mat-vec with a few columns (MTP verification batches): the qwen4exp f32 router [2560 x 512]
     // and the same shape in f16 / q8_0, 1 to 4 columns
