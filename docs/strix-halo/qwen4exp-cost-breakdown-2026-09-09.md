@@ -96,7 +96,7 @@ exista aunque el cambio sea correcto.
 
 | # | Vía | Fase | Ganancia estimada | Evidencia | Riesgo | Comprobación previa |
 |---|---|---|---|---|---|---|
-| 1 | MUL_MAT_ID del prefill: tile por filas por experto (mediana 21, BN=128), hoisting de ids para 512 expertos, cargas de B fuera de `_ne1`, BK_STEP=1 | prefill | −8 a −10 % (20 s → 9-11 s) | Medida directa: 4.6 y 10 TFLOPS frente a 22 en los densos; causas leídas en `mul_mmq.comp`; externa, misma GPU: halo-box selecciona el tile por filas esperadas por experto (`GGML_VK_MMID_SMALLN` con `M128` y `BM64`, sobre un prepass de listas de filas) y midió +16.3 % pp512 en Qwen3.6-35B-A3B (~32 filas por experto), MUL_MAT_ID q5_K de 2.33 a 4.43 TFLOPS; es la implementación de referencia (auditoría, sección 10) | Medio: otro límite (L2, ocupación) puede aparecer al llenar los tiles | test-backend-ops perf con 64 expertos (320 filas por experto): si alcanza 15-20 TFLOPS, el tile es la causa; ubatch 4096 en el rig con MTP (80 filas por experto; compute buffer 4.3 GiB a 2048, verificar el tamaño con `-lv 4` antes de cargar) |
+| 1 | MUL_MAT_ID del prefill: tile por filas por experto (mediana 21, BN=128), hoisting de ids para 512 expertos, cargas de B fuera de `_ne1`, BK_STEP=1 | prefill | −8 a −10 % (20 s → 9-11 s) | Medida directa: 4.6 y 10 TFLOPS frente a 22 en los densos; causas leídas en `mul_mmq.comp`; externa, misma GPU: halo-box selecciona el tile por filas esperadas por experto (`GGML_VK_MMID_SMALLN` con `M128` y `BM64`, sobre un prepass de listas de filas) y midió +16.3 % pp512 en Qwen3.6-35B-A3B (~32 filas por experto), MUL_MAT_ID q5_K de 2.33 a 4.43 TFLOPS; es la implementación de referencia (auditoría, sección 10). Ruta entera (MMQ q8_1) frente a coopmat, medido a nivel de modelo el 2026-09-16 con `GGML_VK_DISABLE_COOPMAT_MMQ=1`: para IQ4_NL la entera gana 2.4 % de prefill (104.0 frente a 106.5 s); para IQ3_S la coopmat gana 2.1 % (109.7 frente a 112.0 s), y en el microbench aislado la coopmat gana en ambos tipos: el +3.7 % de b9c196c1c se sostiene solo en el grafo real | Medio: otro límite (L2, ocupación) puede aparecer al llenar los tiles | test-backend-ops perf con 64 expertos (320 filas por experto): si alcanza 15-20 TFLOPS, el tile es la causa; ubatch 4096 en el rig con MTP (80 filas por experto; compute buffer 4.3 GiB a 2048, verificar el tamaño con `-lv 4` antes de cargar) |
 | 2 | FA sparse token-major en prefill: tiles de 12 cabezas × 1 token (la ruta GQA del decode) en vez de 16 tokens × 1 cabeza, unión 6.3× la lista | prefill | −7.5 % a 40k (−8 s), más a mayor profundidad | Medida directa: 67.5 ms sparse vs 229 densa por nodo; uniones del 33 % medidas por el backend a 16k | Medio: asume FA limitada por cómputo; el gather compacto no ganó, lo que apunta a cómputo pero no lo prueba | `LLAMA_QSA_QUERY_BLOCK=8` fuerza bloques de 8 tokens por la ruta GQA existente; el perf logger da el coste de la FA por token sin escribir shader |
 | 3 | Forma del workgroup del mat-vec de expertos en decode: NUM_ROWS mayor o reparto de k en `down` (k=640, una iteración y media por hilo), gate+up como tensor fusionado (m=1280) | decode | hasta −6.5 % (18.2 → ~14 ms) | Tasas medidas: 160 GB/s en expertos frente a 210-227 en densos grandes de la misma GPU; halo-box midió sobre este modelo en Vulkan el troceado por columnas del mat-vec por lotes: gana en q8_0 y q6_K (MTP n-max 4: 9.6 → 15 t/s) y pierde en q4_K por releer los pesos por trozo; nuestro mat-vec-id ya despacha por token | Medio-alto: estimación por tasa, del mismo tipo que la vía retirada | test-backend-ops perf con las formas reales (640×2560, 2560×640, 10 de 512, n=3) y variantes de NUM_ROWS antes de tocar el grafo |
 | 4 | Mezcladores hyper-connection en prefill: tiles para m=320 y k=320 (48 workgroups, B en f32), formulación transpuesta o fusión del inject m=4 | prefill | −5.5 % (−6 s) | Medida directa: 7.5 TFLOPS y 0.1 TFLOPS en formas concretas | Bajo-medio | test-backend-ops perf en esas tres formas con la heurística de split_k relajada (una línea) |
@@ -110,7 +110,7 @@ exista aunque el cambio sea correcto.
 | 12 | Input fill del prefill: `prefetch_ple_rows` emite 2 × 10240 `posix_madvise` síncronos por ubatch (150-250 ms medidos); el resto del 25 % no GPU sin atribuir. Hipótesis añadida el 2026-09-15: la máscara KQ densa. La CPU la rellena celda a celda en un solo hilo (`set_input_kq_mask_impl`, `src/llama-kv-cache.cpp`): 2048 × n_kv por ubatch, 84M celdas a 40k y 260M a 126k, creciente con la profundidad; y cada capa QSA hace fill, set_rows y add sobre n_kv × 2048 (`build_attn_qsa`), unos 5 × n_kv × 2 B por token y capa: ~1 s por prefill de 40k, ~10 s a 126k (pwilkin: "guard KQ mask write" +2 % y "maskless KQ" 1.48× en HIP con ubatch 24576) | prefill | −2.8 % seguro; hasta −20 % si el resto es host | Medido con `LLAMA_INPUT_TIMING`; el resto es una resta pared − GPU | Bajo para la parte medida; el resto no está cuantificado | Línea de tiempo por ubatch (set_inputs, build/alloc, compute host, D2H, catch-up del draft); set_inputs separa máscara y filas PLE, y el perf logger da FILL/SET_ROWS/ADD de la máscara por capa |
 | 13 | Router f32: mat-vec con NUM_ROWS=1, 96 GB/s frente a 165 del bf16 de igual forma | decode | −2.7 % (−1.8 ms); −3.5 % con router q8_0 en el GGUF, con PPL/KLD | Medida directa | Bajo | Constante de especialización; se mide |
 | 14 | Estado GDN in place: 36 CPY de snapshots y 36 gathers por paso | decode | −2.3 % (−1.5 ms) | Familias CPY y GET_ROWS medidas; la porción GDN es estimada | Medio | Contar en el perfil los dispatches de estado por capa |
-| 15 | `eh_proj` del draft como una sola matmul (`ggml_reshape_2d` a [5120, 4·T]) en vez de mat-vec por lote de 2048 (130 ms por ubatch) | prefill | −2.2 % (−2.4 s) | Medida directa; vecinos de igual forma a 18-23 TFLOPS | Bajo | Ninguna; se implementa y mide en la misma ventana |
+| 15 | `eh_proj` del draft como una sola matmul (`ggml_reshape_2d` a [5120, 4·T]) en vez de mat-vec por lote de 2048 (130 ms por ubatch). Implementada (bbded2ebe) y medida el 2026-09-16: prefill de 39.5k 104.0 s frente a 107.4 s de la referencia anterior (−3.2 %), decode igual, repeat idéntico | prefill | −3.2 % medido | Medida en el rig | Cerrada | — |
 | 16 | QSA en el bloque del draft reutilizando la selección de bloques del target (IndexShare, como SGLang en su soporte de día 0: el draft no ejecuta el indexador; toma la lista de la última fila aceptada más N+1 columnas para las posiciones drafteadas). La FA densa del draft cuesta 229 ms por ubatch a 37k, lineal con la profundidad, y en decode 0.5 → 3.3 ms por paso de 40k a 262k | prefill y decode | −2.2 % a 40k, crece con la profundidad; decode −6 ms por paso a 262k | Medida directa del coste; diseño de referencia publicado (SGLang) | Medio: la aceptación del draft con una selección prestada se mide al implementar; el target no cambia | Ninguna barata: la ganancia es el coste medido de la FA densa; la aceptación se comprueba en el rig (draft acc) |
 | 17 | Menos dispatches en decode: cont+cpy de los slots de rollback (108), scale plegado en `hc_down` (96), sigmoid×mul de la norma GDN, máscara fill/set_rows/add si la FA consume la lista | decode | −1 a −3 % | Suelo por dispatch medido (2.4-2.6 µs) | Bajo | Aritmética directa |
 | 18 | gate y up de los expertos en un solo tensor `ffn_gate_up_exps` (el loader ya lo soporta y el converter tiene `--fuse-gate-up-exps`; nuestro GGUF los trae separados). Transformación exacta del archivo: un MUL_MAT_ID por capa en vez de dos, un prólogo de ids menos por capa en prefill, −49 dispatches por paso en decode | prefill y decode | −1 a −2 % en prefill (estimado), −0.3 % en decode | Bit-idéntico según oMLX (`qwen35_moe_gate_up.py`); dispatches medidos | Bajo | Construir el GGUF fusionado con gguf-py (concatenar filas por experto, sin recuantizar) y medir en una ventana; cambio de archivo, decisión del Director |
@@ -314,3 +314,42 @@ HIP; sus commits de modelo tocan `qwen4exp.cpp` y chocan con nuestro trabajo de 
 Semanas, con decode hoy 1.5× peor que el nuestro. Decisión (2026-09-15): no se abre. Si se
 abriera, el primer paso sería instalar ROCm y una ventana de medición con sus argumentos
 exactos, producción descargada.
+
+## 7. Quant nl3s-oproj8: gate y up de expertos en IQ3_S sin recuantizar (2026-09-16)
+
+Origen: el registro del requant de producción (`~/dbg/imatrix/requant.log`, 2026-09-01) muestra que
+nl-oproj8 se construyó desde unsloth UD-IQ4_XS, donde gate y up de los expertos vienen en IQ3_S (47
+capas) e IQ4_XS (blk.2), y los infló a IQ4_NL con `--allow-requantize`: 42.2 GiB para guardar 32.4 GiB
+de información, más un paso de cuantización. La receta nueva (`~/dbg/imatrix/pipeline-nl3s.sh`) es la
+misma con `--tensor-type 'blk\.([013-9]|[1-4][0-9])\.ffn_(gate|up)_exps\.=iq3_s'`: llama-quantize copia
+sin tocar los tensores que ya tienen el tipo destino, blk.2 sigue a IQ4_NL, el resto es idéntico.
+Archivo `NL3S/qwen4exp-nl3s-oproj8.gguf`, 83.5 GiB (93.3 antes); residente con lazy 56.5 GiB (66.5).
+
+Medido en la misma cadena, mismo binario, producción descargada:
+
+| | nl-oproj8 (actual) | nl3s-oproj8 (nuevo) |
+|---|---|---|
+| PPL holdout, 12 chunks c=4096 | 1.5939 ± 0.0158 | 1.5941 ± 0.0159 |
+| MemAvailable / MemFree con carga de producción (NP=2, 262144, MTP, mmproj) | ~24 / ~1 GiB | 38 / 28 GiB |
+| Prefill 39.5k con MTP | 104.0 s (380 t/s) | 109.2 s (362 t/s), −4.9 % |
+| Re-prefill de 2k a 40k | 5.95 s | 6.05 s |
+| Decode turnos 2 / 5 | 38.6 / 36.0 t/s | 38.9 / 33.8 t/s (corridas previas 37.1 / 35.8 y 36.8 / 35.7) |
+| Determinismo | — | repeat idéntico a 40k (small batch y re-prefill por lotes), sonda ×5 idéntica |
+
+Coste de IQ3_S por nodo, aislado (test-backend-ops perf, gate/up 640×2560, 512 de 10 expertos):
+20 a 30 % más que IQ4_NL a n = 2048 y a n = 3, por cualquier ruta; es la búsqueda en la rejilla de
+512 entradas y los signos, no la ruta. Un cargador MMQ de enteros para IQ3_S (78dce736c, retirado,
+tests conservados en 00b7dec7d) resultó correcto pero 2.1 % más lento que la ruta coopmat a nivel de
+modelo (112.0 frente a 109.7 s); la configuración final es la de antes de ese commit: ruta entera
+para los down (IQ4_NL) y coopmat para gate y up (IQ3_S). El coste de prefill se recupera con la vía 1,
+que reduce el peso del cargador para cualquier formato.
+
+La medición costó dos incidentes: el freeze #10 (load de la GPU sobre el archivo recién escrito, con
+sus páginas sucias sin volcar; reglas en CLAUDE.md) y tres timeouts del anillo de la GPU a las 13:16,
+13:19 y 13:21 que coincidieron, con 4 a 9 s de diferencia, con aperturas del dispositivo por otro
+proceso del Director (ComfyUI en la misma GPU): los rigs bajo contención se descartaron y el vigilante
+de MemFree descargó el rig a 2 GiB libres. Toda medición exige la GPU sola.
+
+Adopción en producción: `quant = nl3s-oproj8` en `strix-halo/config.ini` (decisión del Director), y la
+compuerta final con producción cargada: `repeat_probe.py <tag> 5 0 0` y `graph_diff4` con
+`GD_MODES=seq_rm GD_SPLIT=2048,631`.
