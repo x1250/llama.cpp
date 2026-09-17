@@ -9852,6 +9852,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
         test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n, 640, 1, true));
     }
+    // the prefill's MUL by the routing weights fused into the tile kernels: the integer-dot (iq4_nl), the coopmat
+    // dequant (iq3_s) and the f16 kernels, aligned and unaligned batches
+    for (int n : {2048, 100}) {
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n,  640, 1, true));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false,  640, n, 2560, 1, true));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16,    GGML_TYPE_F32,  64, 10, false,  640, n, 2560, 1, true));
+    }
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {

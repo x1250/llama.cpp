@@ -1,3 +1,6 @@
+// fused MUL by a per-(expert slot, token) scale applied at the store (p.fusion_flags)
+#define MAT_MAT_ID_FUSION_FLAGS_SCALE 0x1
+
 #ifdef MUL_MAT_ID
 shared u16vec2 row_ids[BN];
 uint _ne1;
