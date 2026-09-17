@@ -51,11 +51,17 @@ IQ4_NL a n = 2048: coopmat f16acc con B en f32. Cadena: `quantize_y = true` (`V:
 sin coopmat, `V:5609`) → `nullptr` → repliegue a `(IQ4_NL, F32)` con `quantize_y = false`
 (`V:9999-10003`). `dense_f16b` (`V:9979-9984`) es false porque IQ4_NL no está instanciado en
 `pipeline_dequant_mul_mat_mat_f16` (`V:5395-5406`), aunque el generador produce
-`matmul_<tipo>_f16` para todos los tipos (`S/vulkan-shaders-gen.cpp:585-613`). Tile:
+`matmul_<tipo>_f16` para todos los tipos (`S/vulkan-shaders-gen.cpp:585-613`). **2026-09-16:
+instanciarlo se midió neutro a nivel de modelo (86.7 frente a 86.7-87.1 s a 40k; los mezcladores
+ganan 6-10 % en microbench y los nodos grandes pierden 2-3 %); no se adopta (desglose, sección 11).**
+Tile:
 `ggml_vk_guess_matmul_pipeline` (`V:9566-9572`) → L si `m, n > 64`,
 `l_mmq_wg_denoms = {128,128,1}` (`V:4759`), warptile AMD+RADV `{256,128,128,32,...}`
 (`V:4748`). `split_k` por `ggml_vk_guess_split_k` (`V:9488-9528`): solo si `k >= 2048` y
-`m_tiles*n_tiles <= 20` o `<= 26` (con `shader_core_count = 40`).
+`m_tiles*n_tiles <= 20` o `<= 26` (con `shader_core_count = 40`). **2026-09-16: relajar el umbral
+(split_k 2 o 3 con menos de 80 tiles) se midió negativo (+4.5 % y +2 % de prefill); y desde
+6459c5bb9 un k múltiplo de 64 pero no de 128 toma el kernel medio alineado en vez del grande con
+bounds checks (−1.3 %, misma salida).**
 
 Router F32: a n = 3 es mat-vec `mul_mat_vec_f32_f32_f32` NUM_ROWS=1/NUM_COLS=3 sin
 conversión; a n = 2048 es `pipeline_matmul_f32`. A n = 3 lee los pesos una sola vez: la carga
@@ -129,7 +135,7 @@ Patrones reconocidos, en el orden de evaluación de `ggml_backend_vk_graph_compu
 |---|---|---|
 | `ADD × N` | `V:19042` | `ggml_vk_fuse_multi_add` (`V:18803-18845`): `device->multi_add`, todo F32, mismas shapes, alineado |
 | `MUL_MAT, ADD, ADD` / `MUL_MAT, ADD` | `V:19047` / `V:19053` | `mm_add_ok` (`V:18239-18260`): `ggml_nrows(mul) == 1` (solo n = 1), misma shape/stride que el bias |
-| `MUL_MAT_ID, ADD_ID, MUL` / `..., ADD_ID` / `..., MUL` | `V:19058` / `V:19061` / `V:19066` | `V:18305-18348`: `ggml_vk_use_mul_mat_vec_id` (≤ 8 tokens), ids compartidos, escala `[1, n_expert_used, 1, 1]` |
+| `MUL_MAT_ID, ADD_ID, MUL` / `..., ADD_ID` / `..., MUL` | `V:19058` / `V:19061` / `V:19066` | `V:18305-18348`: `ggml_vk_use_mul_mat_vec_id` (≤ 8 tokens), ids compartidos, escala `[1, n_expert_used, 1, 1]`. **2026-09-16 (cad680f62): `MUL_MAT_ID, MUL` también en los kernels de tiles (`mul_mm.comp`, `mul_mmq.comp`; no coopmat2) con escala `[1, n_used, n_tokens]`, y el mat-vec indexa la escala por token: el prefill y el lote de verificación fusionan; `..., ADD_ID` sigue solo mat-vec** |
 | `RMS_NORM, MUL, ROPE, VIEW, SET_ROWS` | `V:19071` | `can_fuse_rms_norm_mul_rope` (`V:18770`) + `can_fuse_rope_set_rows` (`V:18619`) |
 | `RMS_NORM, MUL, ROPE` | `V:19084` | contiguo, modo NEOX/NORMAL, `mul->ne[0] <= 1024` (shmem) |
 | `RMS_NORM, MUL, ADD, MUL` / `RMS_NORM, MUL, ADD` | `V:19092` / `V:19097` | `V:18216-18236`: residual F32 contiguo; escala final escalar |
@@ -260,7 +266,12 @@ medición: por debajo de 8 × n_kv_max la unión de celdas de los tiles cubre ca
 Estructuras en `prealloc_y` (`V:11913-11921`): `counts[n_lists]`, luego
 `lists[n_lists][list_stride]`, y en modo troceado `chunk_counts[n_lists][n_chunks]`.
 `list_tiles = ceil(nem1/Br)`, `list_stride = ROUNDUP_POW2(min(KV, n_kv_max*Br), Bc)`
-(a 40k con Br = 16 es la caché entera), `chunked = (n_lists < 32)`.
+(a 40k con Br = 16 es la caché entera), `chunked = (n_lists < 32)`. **2026-09-16 (4ac37b4a4):
+en el modo índice con GQA las listas son por fila de máscara (`list_rows = 1`, push constant;
+`list_tiles = nem1`, `list_stride = ROUNDUP_POW2(min(KV, n_kv_max), Bc)`) y el prefill toma la
+disposición GQA (workgroup = las 12 cabezas de un token, 2 × N workgroups): 4.6× menos pasos de
+tile, −6.3 % de prefill a 40k; `GGML_VK_DISABLE_SPARSE_FA_TOKEN_MAJOR=1` restaura los tiles de
+16 tokens. El modo compacto no cambia.**
 
 Dispatches por nodo FA:
 
@@ -318,12 +329,12 @@ mask[i,t,s]` (`S/topk_radix_select.comp:69-76`), materializado una vez en scratc
 
 ## 7. Hallazgos ordenados por ganancia esperada
 
-1. [prefill, muy alta] `hoist_row_ids` desactivado con 512 expertos (`V:10969-10972`):
+1. **[hecho 2026-09-16, 7fc9ae43d: límite a 1024 expertos, prefill −13.5 %]** [prefill, muy alta] `hoist_row_ids` desactivado con 512 expertos (`V:10969-10972`):
    `count_experts` con 512 workgroups reescaneando los `nei0*nei1` ids (`V:11223`,
    `S/count_experts.comp:113-134`) y cada workgroup vivo del matmul ejecutando `load_row_ids`
    con 2 `barrier()` cada 128 entradas antes de calcular. El límite de 256 viene de los arrays
    compartidos de `count_experts.comp`, no es intrínseco.
-2. [prefill y decode, alta] IQ4_NL fuera de las listas f16-B (`V:5395-5406`, `V:5517-5530`):
+2. **[medido 2026-09-16: f16-B para IQ4_NL neutro a nivel de modelo, no adoptado; el allowlist de MMVQ sigue abierto]** [prefill y decode, alta] IQ4_NL fuera de las listas f16-B (`V:5395-5406`, `V:5517-5530`):
    `dense_f16b` es false para IQ4_NL y la B viaja en f32 (el fork mide +4.5 % denso / +4.7 %
    MoE con f16-B en otros tipos, `V:4356-4362`). Y MMVQ IQ4_NL compilado pero inalcanzable:
    el commit `b9c196c1c` creó `pipeline_dequant_mul_mat_vec_q8_1_f32[w][IQ4_NL][i]` (`V:5963`)
@@ -335,9 +346,9 @@ mask[i,t,s]` (`S/topk_radix_select.comp:69-76`), materializado una vez en scratc
    en esta ruta.
 4. [decode, media-alta] El mat-vec F32 usa `NUM_ROWS = 1` (`V:5898`), único tipo con `{1,1,1}`.
    El router (F32, 5.24 MB por capa) lo paga 48 veces por paso.
-5. [decode, media] Los proyectores de la hyper-connection son mat-vecs degenerados: con
+5. **[resuelto en parte 2026-09-16, c12f6777c: el proyector `m = 4` desaparece al fusionar `hc_*_inject` en `hc_*_down` en el archivo; decode +15 %]** [decode, media] Los proyectores de la hyper-connection son mat-vecs degenerados: con
    `NUM_ROWS = 4` para IQ4_NL el de `m = 4` lanza un solo workgroup (`V:11485`, `V:10472`).
-6. [prefill, media] Elección del tile de `mul_mat_id` por tokens totales (`V:11071`) y no por
+6. **[medido 2026-09-16: `GGML_VK_MMID_SMALLN=1` neutro, sonda apagada]** [prefill, media] Elección del tile de `mul_mat_id` por tokens totales (`V:11071`) y no por
    filas por experto (`nei0*nei1/n_as`).
 7. [prefill, media] `count_experts` repetido y serializado por nodo (`V:11206-11223`,
    `V:11275`) aunque gate_up y down compartan `ids`.
@@ -395,6 +406,12 @@ vivos; con k = 640 el prólogo y las barreras se amortizan sobre 20 pasos de k.
 Contraste denso: `MUL_MAT iq4_nl m=12288 n=2048 k=2560` va por coopmat `matmul_iq4_nl_f32`,
 tile `{128,128}` ocupado, B contigua, sin prólogo de ids → 22 TFLOPS.
 
+Resultado (2026-09-16): con el hoisting a 1024 expertos (7fc9ae43d) el nodo gate/up baja a
+8.6-9.4 ms (iq4_nl / iq3_s) en microbench y el prefill de 40k −13.5 %; el epílogo de escala
+(cad680f62) elimina el MUL de 420 MB por capa que seguía a `down` (−2.4 %). En el quant actual
+gate/up son IQ3_S (ruta coopmat, 9.0-9.2 ms) y down IQ4_NL (integer-dot, ~9 ms por dispatch):
+sigue siendo el bloque más caro del prefill (28 s de 80).
+
 ### 8.B Densos de dimensión pequeña (mezclador hyper-connection, `M/qwen4exp.cpp:356-397`)
 
 B1 `m=320 n=2048 k=10240`, 1.75-1.8 ms (7.5 TFLOPS), `build_lora_mm(w_down, xn)`:
@@ -417,6 +434,11 @@ B3 `m=4 n=2048 k=10240`, 1.5 ms (0.1 TFLOPS), `build_lora_mm(w_inject, xn)` con 
 nula y 28 de 32 filas del tile de A son relleno. Los kernels transpuestos
 `mul_mat_vec_p021_f16_f32` (`V:10906-10918`) y `mul_mat_vec_nc_f16_f32` (`V:10919-10926`)
 exigen `src0->type == F16` y `dst->ne[1] == 1`; no hay ruta que intercambie A y B.
+
+Resultado (2026-09-16, desglose sección 11): B1 sin cambio (split_k negativo); B2 corre el kernel
+medio alineado (6459c5bb9, −1.3 % de prefill); B3 desaparece con `hc_*_down_inject` (c12f6777c,
+−5.2 % de prefill y +15 % de decode). Transponer B3 por la ruta mat-vec habría exigido el inject
+en f32 y un segundo barrido de `xn`; descartado.
 
 ### 8.C `MUL_MAT_VEC iq4_nl m=2560 n=4 k=5120 batch=2048`: 130 ms
 
@@ -521,7 +543,7 @@ medición en el mensaje de cada commit. Estado en nuestro `master` (los `getenv`
 | `GGML_VK_CONCAT_TRANSPOSE` (concat traspuesta por tiles 32×32 del estado conv de delta-net) | sí, 7f2d40ef5 (2026-08-24) | on | CONCAT 11877 → 957 µs/op (stride de 40960 B: un solo canal de memoria, 13.7 GB/s); Qwen3.8-27B pp2048 +7.2 % (ub2048); fork: +45 % pp2048 en un MoE delta-net | Activa; CONCAT 1.1 s en 34677 dispatches por corrida de 40k (32 µs) |
 | `GGML_VK_FUSE_UNARY_MUL` | equivalente upstream #27220 (936849ba9) | on | 750 → 443 µs/op | Activa |
 | `GGML_VK_MMID_SMALLN`, `M128`, `BM64` (tile por filas esperadas por experto sobre un prepass de listas de filas), `TILE16` | no | — | SMALLN + listas: pp512 914.7 → 1063.6 t/s (+16.3 %) en Qwen3.6-35B-A3B; MUL_MAT_ID q5_K 2.33 → 4.43 TFLOPS, q6_K 1.99 → 3.57; TILE16 negativo en gfx1151 | Vía 1: implementación de referencia; mismo diagnóstico que 8.A |
-| `GGML_VK_MMID_SCALE_EPILOGUE` (escala por (experto, token) al escribir el MUL_MAT_ID de prefill; no coopmat2) | no | — | evita 134 MB de escritura y relectura por capa en Qwen3.6-35B | Vía 8 |
+| `GGML_VK_MMID_SCALE_EPILOGUE` (escala por (experto, token) al escribir el MUL_MAT_ID de prefill; no coopmat2) | **sí, cad680f62 (2026-09-16), on; `GGML_VK_DISABLE_MMID_SCALE_EPILOGUE=1` la apaga** | on | evita 134 MB de escritura y relectura por capa en Qwen3.6-35B | Vía 8 |
 | Troceado por columnas del mat-vec por lotes (`GGML_VK_MMV_NO_SPLIT=1` lo desactiva; d22fa655a lo limita a q8_0 y q6_K) | no | — | Qwen3.8-Flash-Next en Vulkan, MTP n-max 4: decode 9.6 → 14.8-15.2 t/s; Qwen3.8-27B q4_K con `-b 8`: 28.8 troceado frente a 47.4 sin trocear (pierde en q4_K) | Vía 3: dato de forma; nuestro mat-vec-id ya despacha por token y los densos grandes van a 190-227 GB/s |
 | `GGML_VK_FA_WAVE32` (pin a subgrupo 32 de la FA coopmat1 cuando hsv ≤ 128; solo n_rows ≥ 32) | no | — | pp2048 Qwen3-Coder-30B: +2.5 % d0, +11.3 % d32768; hsv 256 declinado (6-18 % más lento) | No aplica: HSK = HSV = 256 |
 | `GGML_VK_FA_KV_CONTIG`, `GGML_VK_FA_DEQUANT` (K/V f16 con stride contiguizados; dequant una vez) | no | — | pp2048 a d8192 846.6 frente a 847.9 t/s (neutro en su modelo) | No aplica: KV q8_0 y FA sparse propia (5.4) |
@@ -537,3 +559,25 @@ topk_moe fusionado en prefill (#28422), `6788edb4f` matrices M pequeñas para qw
 especialización para el tipo A (#25773), `72797e891` etiquetas de depuración (#28101). La rama
 HIP de pwilkin (kernels ggml-cuda y cambios de modelo, 2026-09-12..14) no aporta código Vulkan;
 su análisis está en el desglose, sección 6.
+
+## 11. Cambios del fork posteriores a la auditoría (2026-09-16)
+
+Commits en `master` desde la base auditada, con lo medido en el rig de 40k con MTP (desglose,
+secciones 8-12):
+
+| Commit | Cambio | Efecto medido |
+|---|---|---|
+| 16f6ae0d9 | `LLAMA_INPUT_TIMING=1`: línea de tiempo del host por ubatch | el prefill es GPU: host 4-7 % |
+| bbded2ebe | `eh_proj` del draft como una matmul [5120, 4·T] | prefill −3.2 % |
+| 7fc9ae43d | `hoist_row_ids` hasta 1024 expertos; `GGML_VK_MMID_SMALLN` (sonda, neutra) | prefill −13.5 % |
+| 4ac37b4a4 | FA sparse token-major en el modo índice (listas por token, `list_rows`) | prefill −6.3 %, re-prefill −10 % |
+| cad680f62 | MUL por los pesos del router como epílogo de los kernels de tiles del MUL_MAT_ID | prefill −2.4 %, salida bit-idéntica |
+| 6459c5bb9 | kernel medio alineado cuando k es múltiplo de 64 y no de 128 | prefill −1.3 % |
+| c12f6777c | `hc_*_down_inject` (archivo, loader y grafo) + `scripts/qwen4exp-merge-hc-inject.py` | prefill −5.2 %, decode +15 % |
+
+Medidas y descartadas el mismo día (no hay código en `master`): sombra f16 por nodo de los densos
+cuantizados (+4 a +7 %), split_k con menos de 80 tiles (+2 a +4.5 %), IQ4_NL en la lista f16-B
+(neutro), loader integer-dot para IQ3_S (correcto, −2.1 %), gate/up en Q3_K (17 % más lento que
+IQ3_S en microbench), ubatch 4096 (−9 %), las compuertas `DENSE_WAVE32` / `MMID_WAVE32` /
+`MMID_WG256` (neutras). Las referencias `V:línea` de las secciones anteriores son las de la base
+auditada (`6d9c82ea2`); los nombres de función siguen valiendo.

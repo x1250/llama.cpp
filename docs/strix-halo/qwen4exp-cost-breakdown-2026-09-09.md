@@ -1,11 +1,34 @@
-# qwen4exp en Strix Halo: dónde va el tiempo y vías de optimización (2026-09-09)
+# qwen4exp en Strix Halo: dónde va el tiempo y vías de optimización (2026-09-09, actualizado 2026-09-16)
 
-Estado del árbol: master `c0e776ec4` (filas compactas de la FA sparse para lotes pequeños,
-prepass determinista, V del indexador estrechado, hoist de P en la FA coopmat1).
-Producción: `strix load qwen38flash` (NP=2, `-c 524288`, ubatch 2048, KV q8_0, lazy mode auto,
-draft MTP IQ4_NL n-max 2, mmproj, `--ctx-checkpoints 8`).
+## Estado actual (2026-09-16, noche)
 
-Fuentes de datos:
+- Árbol: master `5f6128357` (build 382+). Producción: `strix load qwen38flash` (NP=2, `-c 524288`
+  = 262144 × 2 slots, ubatch 2048, KV q8_0, lazy mode auto, draft MTP IQ4_NL n-max 2, mmproj,
+  `--ctx-checkpoints 8`), archivo `NL3S/qwen4exp-nl3s-hcdi-oproj8.gguf` (`quant = nl3s-hcdi-oproj8`).
+- Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **80.8 s (489 t/s)**,
+  re-prefill de 2k 4.68 s, decode 38-41 t/s. Residentes 56.5 GiB; MemAvailable 36 GiB con producción
+  cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
+- Lista de trabajo vigente: sección 13. Desglose por nodo vigente: sección 2. Las secciones 5-12 son el
+  registro de cada ventana de medición, en orden cronológico.
+
+Cronología del prefill de 39.5k a 40k (misma máquina, mismo rig):
+
+| Paso | Prefill | t/s | Cambio |
+|---|---|---|---|
+| 2026-09-09 | 108 s | 366 | base de este documento |
+| 2026-09-16 mañana | 109.6 s | 361 | build 375 (referencia de la ventana de palancas) |
+| eh_proj como matmul (bbded2ebe) | 104.0 s | 380 | −3.2 % |
+| quant nl3s-oproj8 (gate/up IQ3_S, −10 GiB) | 109.2 s | 362 | −4.9 % de prefill a cambio de la memoria |
+| hoisting a 1024 expertos (7fc9ae43d) | 94.7 s | 417 | −13.5 % |
+| FA sparse token-major (4ac37b4a4) | 88.8 s | 445 | −6.3 % |
+| epílogo de escala del MUL_MAT_ID (cad680f62) | 86.8 s | 455 | −2.4 % |
+| tile medio alineado (6459c5bb9) | 85.8 s | 461 | −1.3 % |
+| hc inject fusionado en down (c12f6777c, archivo hcdi) | **80.8 s** | **489** | −5.8 %, decode +15 % |
+
+Lo que sigue es el documento original del 2026-09-09 con sus secciones anotadas; el desglose de
+la sección 2 está reemplazado por el perfil del build actual.
+
+Fuentes de datos (2026-09-09):
 
 - Perfiles del Vulkan perf logger a 40k: `~/dbg/depth/strix-decode-prof-cd-vk.log` (prefill de
   39.5k + decode) y `strix-decode-prof-cdec-vk.log` (decode con filas compactas). El logger
@@ -24,70 +47,66 @@ Dimensiones del modelo que fijan los bytes: n_embd 2560, hc 4 (residual ancho 10
 LM head Q6_K, wqkv de GDN Q5_K, router `ffn_gate_inp` F32, indexador BF16, resto IQ4_NL,
 o_proj Q8_0. Pesos por token: densos ~3.1 GB, expertos 1.33 GB.
 
-## 1. Decode a 40k con MTP: paso de 66 ms = 2.42 tokens (36 t/s)
+## 1. Decode a 40k con MTP (perfil del 2026-09-16 noche, build 382+, archivo hcdi)
 
-| Bloque | ms/paso | Observación |
+Perf logger a 40k (`~/dbg/depth/strix-decode-prof-prof383.log`, `GGML_VK_PERF_LOGGER_FREQUENCY=1`,
+que serializa cada nodo: sus sumas son cotas superiores). Un paso = un grafo de verificación del
+target (3 tokens) más los grafos del draft (2 tokens): 39.3 ms de GPU por paso, ~1.5 tokens
+aceptados por paso → 38-41 t/s medidos en producción.
+
+| Bloque (grafo de verificación, 3 tokens) | ms/paso | Observación |
 |---|---|---|
-| Expertos del verify (3 tokens) | 18.2 | `ggml_vk_mul_mat_vec_id_q_f16` despacha un dispatch por token (ggml-vulkan.cpp:11517); los expertos compartidos (27 % de los pares) los relee la Infinity Cache, no la DRAM (sección 5): ~2.9 GB únicos a ~160 GB/s, frente a 210-227 de los densos grandes |
-| LM head (target q6_K 2.3 + 2 del draft iq4_nl 1.6) | 5.6 | 227 GB/s, en el límite del bus |
-| Densos grandes (wqkv q5_K 3.0, z 1.7, ssm_out 1.8, wq 1.1, wo 1.0, shexp 1.2) | ~11 | 190-215 GB/s |
-| Router f32 (`m=512 n=3`, 49 dispatches de 54.8 µs) | 2.7 | 96 GB/s: único mat-vec con NUM_ROWS=1 (ggml-vulkan.cpp:5898) |
-| Hyper-connection: 3 mat-vecs (`m=320` 1.72, `m=10240 k=320` 1.58, `m=4` 1.40) + norm, scale, silu, gated_mean, inject | 6.7 | 3.7 MB de pesos por paso, suelo 1.5 ms. `m=4` corre en un solo workgroup |
-| FA sparse (12 capas × 0.35 ms) + FA densa del draft (2 × 0.5) + prepass | 5.7 | Modo compacto sin split_k: 6 workgroups en 40 CUs para 2051 celdas |
-| Estado GDN: gather (36 get_rows) + 3 snapshots copiados (36 CPY) + kernel 0.8 | 3.1 | ~450 MB movidos por paso por el rollback de MTP (n_rs_seq = 2) |
-| TOPK_QSA (12 × 85 µs) | 1.05 | Lineal con n_kv: ~6 ms a 262k |
-| ~2500 dispatches pequeños (norms 285, sigmoid 139, glu 105, cont 176, cpy 156, set_rows 65, scale 199, add 153) | ~6 | 3600 dispatches por paso; barrera global entre nodos dependientes |
-| Host: sampling 1.2, huecos ~3 | ~4 | |
+| Mat-vecs densos | 9.6 | wqkv q5_K 1.52, router f32 1.32 (NUM_ROWS=1, 96 GB/s), LM head q6_K 1.16, ssm_out 0.88, hc down+inject 0.86, z 0.83, hc up 0.77, wq 0.56, wo 0.49 |
+| Expertos gate/up IQ3_S (`batch=3`) | 5.4 | 48 dispatches; el nodo más caro también en decode |
+| Expertos down IQ4_NL con la escala fusionada | 2.8 | epílogo de escala activo en el lote de verificación |
+| FA sparse (12 capas, modo compacto) | 2.3 | 0.5-0.56 ms por capa a 40k |
+| GET_ROWS + CPY (estado GDN, rollback MTP) | 1.2 | |
+| TOPK_QSA | 0.5 | lineal con n_kv |
+| RMS_NORM_MUL, GDN, CONT, SCALE, ADD, SIGMOID, HC_INJECT, ARGSORT | ~2.0 | ~2500 dispatches pequeños |
+| **Total verificación** | **25.7** | |
+| Grafos del draft (2 tokens) | 13.6 | expertos 4.8 (mat-vec-id), densos 4.4, FA densa 1.65 (crece con n_kv), resto 2.7 |
+| **Total GPU por paso** | **39.3** | |
 
-Suelo de ancho de banda: ~7.8 GB de pesos por paso (densos 3.1 + expertos 3.2 con dedup +
-draft 1.5) = 32 ms a 240 GB/s, el 49 % del paso. El resto es latencia de kernels pequeños,
-kernels mal dimensionados y ocupación baja. La afirmación anterior de que "el 70 % del paso
-son los pesos" era incorrecta.
+Cambios respecto del 2026-09-09 (66 ms por paso, 36 t/s): el mat-vec `m=4` del inject desapareció
+(archivo hcdi), el MUL de la ponderación se fusionó y el quant nl3s bajó los bytes de expertos.
+Observación nueva: los grafos del draft cuestan 13.6 ms por paso, el 35 % del total; su expertos
+(4.8 ms para un bloque) y su FA densa a 40k son las palancas de decode que quedan sin explorar
+(vía 16 y la cabeza recortada, vía 9).
 
-Datos de apoyo:
+## 2. Prefill de 39.5k tokens: 80.8 s de pared, 20 ubatches de 2048 (perfil del 2026-09-16 noche)
 
-- Draft (2 tokens): 8 ms por paso = LM head 1.6 + expertos ~1.2 + FA densa 0.5 (crece con
-  n_kv) + eh_proj 0.1 + resto 0.6, por token.
-- Aceptación 1.42 tokens por paso a temp 0 (0.71 por token del draft). n-max 3 midió peor.
-- Graph reuse activo en decode (`graphs reused` en print_timing).
+Mismo perfil. GPU 3.63 s por ubatch = 72.6 s por prefill; los ~8 s restantes (10 %) son host y
+huecos entre submisiones (línea de tiempo de la sección 8: set_inputs 177 ms, alloc 40, fuera de
+`llama_decode` 204 ms por ciclo). Por familia y por nodo, en segundos por prefill de 39.5k:
 
-## 2. Prefill de 39.5k tokens: 108 s de pared, 20 ubatches de 2048
-
-| Bloque | s | % |
+| Bloque | s | % de la GPU |
 |---|---|---|
-| GPU total (suma del perf logger) | 80.7 | 75 |
-| · Densos MUL_MAT | 22.5 | 21 |
-| · · hyper-connection: `m=320 n=2048 k=10240` 3.0 (7.5 TFLOPS), `m=10240 k=320` 2.78 (7 TFLOPS), `m=4 k=10240` 2.65 (0.1 TFLOPS) | 8.4 | 7.8 |
-| · · wqkv q5_K 3.09 (22 TFLOPS), ssm_out 2.36 (18), z 1.86 (22), wq 1.32 (23), shexp 1.15, wo q8_0 0.70, router f32 0.37 (12.7), `m=48` 0.27, `m=1` f32 0.25 | 11.4 | 10.5 |
-| · Expertos MUL_MAT_ID (down `m=2560 k=640` 14.5 ms/dispatch a 4.6 TFLOPS; gate_up `m=640 k=2560` 13.3 ms a 10 TFLOPS) | 20.0 | 18.5 |
-| · Flash attention (sparse del target ~12 s, densa del draft ~3 s) | 15.8 | 14.6 |
-| · Elementwise sobre el residual ancho de 84 MB: MUL 3.0, RMS_NORM(+MUL) 2.95, HC_GATED_MEAN 1.9, MULTI_ADD 1.65, HC_INJECT 1.6, CONCAT 0.94, CONT 0.92, ADD 0.87, GLU 0.67, SSM_CONV 0.65 | ~13 | 12 |
-| · `eh_proj` del draft como mat-vec por lote (`m=2560 n=4 k=5120 batch=2048`, 130 ms por ubatch) | 2.5 | 2.3 |
-| · Selección QSA (TOPK_QSA 1.1, RELU 0.37, TOP_K 0.22, FILL/SET_ROWS 0.17) | ~2 | 1.9 |
-| · GDN (36 × 2.1 ms por ubatch, kernel secuencial en tokens) | 1.43 | 1.3 |
-| No GPU | 27 | 25 |
+| Expertos gate/up IQ3_S (`MUL_MAT_ID`, 94 dispatches por ubatch, 9.5 ms cada uno, 6.4 TFLOPS) | 17.8 | 24.5 |
+| Expertos down IQ4_NL con la escala fusionada (`MUL_MAT_ID_MUL`, 47 × 9.1 ms, 7.3 TFLOPS) | 8.5 | 11.7 |
+| Densos `MUL_MAT` | 18.3 | 25.2 |
+| · wqkv q5_K `m=10240 k=2560` 3.31 (23 TFLOPS), hc down+inject `m=324 k=10240` 3.16 (8 TFLOPS), ssm_out `m=2560 k=6144` 2.58 (18), z `m=6144` 2.01 (23), hc up `m=10240 k=320` 1.53 (tile medio alineado), wq `m=12288` 1.43, shexp 0.84, wo q8_0 0.75, router f32 0.4 | | |
+| Flash attention (sparse del target ~7, densa del draft ~2.7) | 9.8 | 13.4 |
+| Elementwise sobre el residual ancho: RMS_NORM_MUL 2.52, HC_GATED_MEAN 1.88, HC_INJECT 1.61, MULTI_ADD 1.44, MUL 0.96, CONCAT 0.93, CONT 0.85, ADD 0.79, GLU 0.66, SSM_CONV 0.64 | ~12.3 | 17 |
+| GDN (36 × 2 ms) | 1.45 | 2.0 |
+| Selección QSA (TOPK_QSA 1.32 + RELU, TOP_K, FILL) | ~1.7 | 2.3 |
+| eh_proj del draft (matmul `m=2560 n=8192 k=5120`) y resto del draft | ~1.5 | 2 |
+| **GPU** | **72.6** | 100 |
+| Host y huecos | ~8 | |
 
-FA sparse por nodo de 2048 consultas según n_kv (perf logger, 12 nodos por ubatch):
-2.3k 6.8 ms, 4.4k 19.6, 6.4k 32.5, 8.4k 43.7, 10.5k 53.9, 12.5k 64.3, 14.6k 71.6
-(régimen denso con máscara), 18.7k ~83, de 20k a 40k satura en 67-80 ms. La FA densa del
-draft a 37k cuesta 229 ms por nodo (7.2 TFLOPS). La sparse a 40k equivale a atender ~13k
-celdas por tile de 16 consultas: 6.3× las 2051 seleccionadas por token.
+Lectura: los expertos son el 37 % de la GPU y gate/up en IQ3_S el nodo más caro (sección 12: en
+IQ4_NL sería un 12 % más rápido, descartado por memoria; Q3_K un 17 % más lento). Los densos van
+a 18-23 TFLOPS salvo el mezclador `m=324` (8 TFLOPS, 48 workgroups, sin split_k rentable). La FA
+sparse ya corre token-major; su prepass barre la máscara entera por token (vía 2 bis). El
+elementwise sobre el residual de 84 MB suma 12 s: fusiones pendientes (fila 6 de la sección 13).
 
-Input fill medido con `LLAMA_INPUT_TIMING`: 140-250 ms por ubatch de 2048, plano con la
-profundidad (~0.1 ms por token); 39 ms para 512 tokens; 0.3 ms para 2 tokens a 40k. El
-componente plano con la profundidad apunta a `prefetch_ple_rows` (`src/models/qwen4exp.cpp`):
-hasta 2 × 10240 llamadas síncronas a `posix_madvise` por ubatch (ubatch actual y siguiente).
+Perfil anterior (2026-09-09, 108 s): GPU 80.7 s, densos 22.5, expertos 20.0, FA 15.8, elementwise
+13, `eh_proj` 2.5, no GPU 27; input fill 140-250 ms por ubatch. La medición previa del tamaño de
+ubatch (4.7k, 2026-09-09): ub512 326 t/s, ub2048 425, ub8192 348; con MTP a 40k ub4096 dio −9 %.
 
-Los ~20 s restantes no atribuidos: build+alloc del grafo (no se reutiliza en prefill: n_kv
-cambia en cada ubatch), lado host de `graph_compute`, copia D2H de `h_nextn` (84 MB por
-ubatch), las tres copias de 84 MB del catch-up del draft, huecos entre submisiones.
+## 3. Vías de optimización, ordenadas de mejor a peor ganancia estimada (tabla original, estados al 2026-09-16)
 
-Medición previa del tamaño de ubatch (prompts de 4.7k, 2026-09-09): ub512 326 t/s,
-ub2048 425, ub8192 348. El sobrecoste fijo por ubatch no es el término dominante.
-
-## 3. Vías de optimización, ordenadas de mejor a peor ganancia estimada
-
-Regla (2026-09-10, tras el punto retirado de la sección 5): ninguna vía se implementa sin la
+Cada fila lleva en negrita su estado cuando se midió; la lista de pendientes ordenada y vigente es
+la sección 13. Regla (2026-09-10, tras el punto retirado de la sección 5): ninguna vía se implementa sin la
 comprobación previa de su columna, un experimento acotado que aísle el cuello de botella con
 herramientas que ya existen (test-backend-ops perf, variables de entorno, perf logger). La
 ganancia es un porcentaje de la fase a 40k: del prefill de 108 s o del paso de decode de 66 ms.
@@ -137,27 +156,13 @@ encoder) es una aproximación entrenada, con pérdida por diseño y sin lugar pa
 capas GDN: fuera de esta lista. Revisión del 2026-09-15 (pwilkin Strix Halo Lab y
 halo-box/strix-llama.cpp): sección 6.
 
-## 4. Mediciones previas pendientes
+## 4. Mediciones previas pendientes (estado al 2026-09-16)
 
-- Línea de tiempo host por ubatch de prefill, producción descargada: set_inputs, build/alloc,
-  compute host, copias D2H, catch-up del draft. Decide cuánto vale la vía 12 y si existe una
-  vía mayor.
-- Coste de la FA sparse por token en prefill con `LLAMA_QSA_QUERY_BLOCK=8` y el perf logger.
-  Confirma o descarta la vía 2 antes de escribir el shader. **Hecha (sección 9): el brazo de
-  bloques de 8 no mide la geometría sino la ocupación (16 workgroups por dispatch, 3× más lento);
-  el brazo base fijó la FA sparse en 0.77-0.98 s por 2048 consultas (12 capas) entre 16k y 37k,
-  y la vía se midió directamente con el kernel.**
-- test-backend-ops perf de las formas reales de expertos (vías 1 y 3) y de los mezcladores
-  (vías 4 y 10).
-- El solape de expertos entre los tokens del verify ya está medido (sección 5): 27 % a n=3, y
-  no es una vía.
-- Compuertas compiladas (vía 6): test-backend-ops perf con `GGML_VK_DENSE_WAVE32=1`,
-  `GGML_VK_MMID_WAVE32=1` y `GGML_VK_MMID_WG256=1`, por separado, en las formas densas y de
-  expertos; después el rig de 40k con la combinación que gane.
-- Sombra f16 de los densos (vía 5): perf de MUL_MAT f16×f32 frente a q5_K, q8_0 e iq4_nl en las
-  formas densas.
-- Ubatch 4096 en el rig con MTP (vía 1): tamaño del compute buffer con `-lv 4` y prefill a 40k;
-  hoy solo hay medición a 4.7k (ub2048 425 t/s, ub8192 348).
+Hechas: la línea de tiempo del host (sección 8: el prefill es GPU, host 4-7 %), la FA sparse por
+token (sección 9), el perf de las formas de expertos (secciones 8 y 12) y de los mezcladores
+(sección 11), las compuertas compiladas (sección 8, neutras), la sombra f16 (sección 11,
+negativa) y ubatch 4096 (sección 8, −9 %). Quedan:
+
 - Robustez, sin rendimiento: acotar cada submisión por bytes movidos (halo-box
   `GGML_VK_MAX_MB_PER_SUBMIT`, 8 GiB por defecto) como guarda genérica del timeout de 2 s del
   kernel 7.0. Hoy solo la FA está acotada (`qsa_query_block`); los nodos sin estimación de flops
@@ -518,3 +523,46 @@ test-backend-ops perf, tres pases (el primero descartado: compila pipelines dent
 Q3_K descartado: 17 % más lento que IQ3_S y habría exigido recuantizar desde el UD-IQ4_XS (no hay BF16
 local). Quedan, sin tocar la memoria: gate y up en un solo tensor (vía 18, −1 a −2 s) y el desquantizado
 IQ3_S del kernel coopmat (−2 a −3 s, incierto).
+
+## 13. Lista de trabajo del prefill (vigente, 2026-09-16 noche)
+
+Prefill de 39.5k a 40k: 80.8 s. Pendientes ordenados por ganancia esperada por unidad de riesgo;
+la ganancia es sobre esos 80.8 s. Ninguna se implementa sin su comprobación previa y sin la
+cadena de medición completa (base primero y último, MTP on, determinismo).
+
+| # | Palanca | Ganancia estimada | Riesgo / coste | Comprobación previa |
+|---|---|---|---|---|
+| 1 | Vía 18: gate y up de expertos en un solo tensor `ffn_gate_up_exps` (un MUL_MAT_ID de m=1280 en vez de dos de 640; el loader ya lo soporta) | −1 a −2 s | bajo: transformación del archivo como la de `hc_*_down_inject` + rig | ninguna |
+| 2 | Vía 2 bis: lista por token de la FA sparse construida desde los índices del selector QSA (hoy el prepass barre la fila de máscara entera, 40k columnas por token) y las 4 filas coopmat vacías | −2 a −3 s a 40k, más a mayor profundidad | medio: los índices deben llegar al nodo FA (grafo) y el prepass cambia | diseño del paso índices → listas; perf logger del nodo FA por profundidad |
+| 3 | Desquantizado IQ3_S en el kernel coopmat de MUL_MAT_ID (recuento de instrucciones, cargas de 16 bits, tabla en shmem) | −2 a −3 s | medio-alto: días; el loader integer-dot de hoy fue correcto pero −2.1 % | microbench por variante (sección 12 como base: 9.0-9.2 ms) |
+| 4 | Vía 12: host (`prefetch_ple_rows`, 20k llamadas síncronas por ubatch; huecos entre submisiones, 204 ms por ciclo) | −2 a −3 s | medio | ya medida (sección 8): techo 4-7 s |
+| 5 | Vía 16: el draft reutiliza la selección QSA del target (sin indexador en el draft) | −2 s a 40k, crece con la profundidad | medio-alto: flujo del MTP | diseño |
+| 6 | Elementwise sobre el residual ancho (RMS_NORM_MUL 2.5 s, HC_GATED_MEAN 1.9, CONCAT+CONT 1.8, ADD 0.8): fusiones adicionales | −1 a −2 s | medio | perfil por nodo (sección 2) |
+| 7 | Vía 1 bis: expertos `down` (k=640, ~9 ms por dispatch, 7.3 TFLOPS): cargas de B fuera del bucle de filas, BK_STEP | −1 s, sin estimar bien | medio | microbench |
+| 8 | Vías menores 19-23: QSA por bloques, ssm_conv, mat-muls diminutos, MMVQ IQ4_NL, GDN chunked | −0.5 a −1 s cada una | bajo-medio | varias |
+
+Suma realista de 1-4: ~8 s (80.8 → ~73 s, ~540 t/s). Techo con todo: ~68-70 s.
+
+Cerradas (no volver sin un dato nuevo):
+
+- IQ4_NL para gate/up: +10 GiB residentes; descartado por orden del Director (2026-09-16).
+- Q3_K para gate/up: 17 % más lento que IQ3_S (sección 12).
+- Sombra f16 por nodo (vía 5): +4 a +7 % (sección 11).
+- split_k con menos de 80 tiles: +2 a +4.5 % (sección 11).
+- IQ4_NL en la lista f16-B (vía 11): neutro (sección 11).
+- Loader integer-dot para IQ3_S: correcto, −2.1 % (sección 7).
+- Tile por filas por experto (`GGML_VK_MMID_SMALLN`), `DENSE_WAVE32`, `MMID_WAVE32`, `MMID_WG256`: neutros (sección 8).
+- Ubatch 4096: −9 % y checkpoints de 4096 (sección 8).
+- `LLAMA_QSA_QUERY_BLOCK=8` como proxy de la FA por token: mide ocupación, no geometría (sección 9).
+- Suma sobre expertos dentro del MUL_MAT_ID: atómicos u orden por planificación, rompe el determinismo (sección 10).
+
+Decode (38-41 t/s a 40k; 39.3 ms de GPU por paso, sección 1), pendientes por interés:
+
+| # | Palanca | Ganancia estimada | Nota |
+|---|---|---|---|
+| D1 | Grafos del draft: 13.6 ms por paso (35 %), con 4.8 ms de expertos por mat-vec-id para un solo bloque y una FA densa que crece con n_kv; vías 9 (cabeza recortada) y 16 (selección QSA compartida) | −3 a −5 ms por paso | hallazgo nuevo del perfil del 2026-09-16; primero un perfil del draft por nodo |
+| D2 | Vía 3: forma del workgroup del mat-vec de expertos (gate/up IQ3_S 5.4 ms + down 2.8 por paso) | −2 a −3 ms | microbench de `MUL_MAT_ID` a n=3 por variante |
+| D3 | Vía 13: router f32 con NUM_ROWS=1 (1.32 ms por paso a 96 GB/s) | −0.7 ms | una línea en la tabla de NUM_ROWS |
+| D4 | Vía 14: estado GDN in place (GET_ROWS + CPY 1.2 ms por paso) | −0.8 ms | |
+| D5 | Vía 7: split_k en el modo compacto de la FA sparse (2.3 ms por paso, 6 workgroups por capa) | −1 ms | |
+| D6 | Vía 17: menos dispatches pequeños (~2500 por paso, ~2 ms) | −0.5 a −1 ms | fusiones |
