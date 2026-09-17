@@ -501,3 +501,20 @@ inject en f32.
 Estado de producción al cierre (build 382 con el tile alineado y el archivo `qwen4exp-nl3s-hcdi-oproj8.gguf`,
 `quant = nl3s-hcdi-oproj8` en config.ini): prefill 80.8 s a 40k (489 t/s; 109.6 s y 361 t/s al empezar el
 día), re-prefill de 2k 4.68 s, decode 38-41 t/s, MemAvailable 36 GiB con producción cargada.
+
+## 12. Los expertos gate/up en IQ3_S: alternativas de tipo medidas (2026-09-16, microbench)
+
+El nodo gate/up (512 expertos, 10 activos, m=640 k=2560, n=2048) es el más caro del prefill (19.3 s de
+80.8). Volverlo a IQ4_NL costaría los 10 GiB que ahorra IQ3_S y queda descartado por orden del Director.
+test-backend-ops perf, tres pases (el primero descartado: compila pipelines dentro de la medición):
+
+| Tipo | Ruta | ms por nodo |
+|---|---|---|
+| IQ4_NL | integer-dot | 8.0-8.6 |
+| IQ3_S (producción) | coopmat | 9.0-9.2 |
+| Q3_K (mismo tamaño, 3.44 bpw) | integer-dot | 10.5-10.8 |
+| Q3_K | coopmat | 10.5 |
+
+Q3_K descartado: 17 % más lento que IQ3_S y habría exigido recuantizar desde el UD-IQ4_XS (no hay BF16
+local). Quedan, sin tocar la memoria: gate y up en un solo tensor (vía 18, −1 a −2 s) y el desquantizado
+IQ3_S del kernel coopmat (−2 a −3 s, incierto).

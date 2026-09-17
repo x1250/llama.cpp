@@ -10987,7 +10987,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // qwen4exp gate/up experts (512 of which 10, m=640 k=2560) as iq3_s and iq4_nl: the integer-dot path at the
     // prefill and verify batch sizes, and the 64-expert variant with 320 rows per expert
-    for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}) {
+    for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_Q3_K}) {
         for (int n : {3, 2048}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, n, 2560));
         }
