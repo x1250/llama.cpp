@@ -103,7 +103,7 @@ exista aunque el cambio sea correcto.
 | 5 | GEMM densa con sombra f16 por nodo en prefill: desempaquetar el peso cuantizado a f16 una vez por nodo y ubatch (scratch transitorio) y correr el pipeline coopmat f16, en vez de dequantizar cada tile de A en cada workgroup que lo usa (16 veces por ubatch de 2048 con BN=128) | prefill | central −3 %, hasta −5.5 % (los densos grandes: 11.4 s a 18-23 TFLOPS; la sombra cuesta leer el quant y escribir f16 una vez por nodo) | Externa: la ablación de pwilkin en HIP vale 1.42× para "bf16 WMMA dequant GEMM" con ubatch 24576 (sección 6); halo-box atribuye la ganancia de wave32 al conteo de instrucciones de dequant inline (q6_K 3907 → 3433) | Medio-alto: otro backend y otro ubatch; en Vulkan la ruta coopmat f16 debe rendir ~2× la cuantizada para que la sombra se pague | test-backend-ops perf MUL_MAT f16×f32 frente a q5_K, q8_0 e iq4_nl×f32 en las formas densas de la sección 2 (wqkv, ssm_out, z, wq, wo, shexp); si f16 no dobla la tasa, la vía no existe |
 | 6 | **Medidas el 2026-09-16, neutras en este modelo (109.8, 110.1 y 110.9 s frente a 109.6 de la base; corrección 80/80 y 103/103):** compuertas ya compiladas y apagadas del backend: `GGML_VK_DENSE_WAVE32=1` (retile a wave32 de los pipelines coopmat cuantizados densos; `=2` también los f16), `GGML_VK_MMID_WAVE32=1` y `GGML_VK_MMID_WG256=1` (mismo retile y workgroup de 256 hilos para MUL_MAT_ID) | prefill | 0 a −5 % | Externa, misma GPU (halo-box, RADV gfx1151): GEMM densa q6_K +5.2..+10.8 %, q8_0 +5.4..+8.4 %, q4_K +0.7..+9.1 %, q4_0 −1.5..+1.8 %; a nivel de modelo pp2048 +3.9..+7.2 %; activadas allí por defecto desde 2026-08-30. IQ4_NL sin medir en ningún sitio | Medio: el grueso de nuestros pesos es IQ4_NL, del que no hay dato; q5_K y q8_0 (wqkv, o_proj) sí lo tienen | Tres variables de entorno, sin código: test-backend-ops perf en las formas densas y de expertos, luego el rig de 40k con la combinación que gane (auditoría, sección 10) |
 | 7 | split_k en el modo compacto de la FA sparse de decode (hoy 6 workgroups por capa, 350 µs) | decode | hasta −4.5 % (−3 ms), no probado | Inferencia: 6 workgroups en 40 CUs | Alto: el modo índice con split_k=13 fue más lento que el compacto sin split_k | test-backend-ops perf con la FA sparse de 3 tokens y split_k forzado |
-| 8 | Ponderación y suma de expertos en el epílogo del MUL_MAT_ID de prefill (MUL 3.0 s, MULTI_ADD 1.65 s) | prefill | −4.3 % (el MUL solo, −2.8 %) | Pasos de memoria medidos, 1 ms por tensor de 84-210 MB; implementación de referencia en halo-box: `GGML_VK_MMID_SCALE_EPILOGUE` aplica la escala por (experto, token) al escribir el MUL_MAT_ID de prefill (no en coopmat2) | Bajo para el MUL, medio para la suma | Ninguna para el MUL; la suma requiere diseño (orden de acumulación) |
+| 8 | Ponderación y suma de expertos en el epílogo del MUL_MAT_ID de prefill (MUL 3.0 s, MULTI_ADD 1.65 s). **Ponderación hecha y medida (2026-09-16, sección 10): prefill 89.0 → 86.8 s (−2.4 %), salida bit-idéntica; la suma (MULTI_ADD, 1.6 s) queda, no hay forma determinista de meterla en el kernel.** | prefill | −4.3 % (el MUL solo, −2.8 %) | Pasos de memoria medidos, 1 ms por tensor de 84-210 MB; implementación de referencia en halo-box: `GGML_VK_MMID_SCALE_EPILOGUE` aplica la escala por (experto, token) al escribir el MUL_MAT_ID de prefill (no en coopmat2) | Bajo para el MUL, medio para la suma | Ninguna para el MUL; la suma requiere diseño (orden de acumulación) |
 | 9 | Cabeza del draft MTP recortada a un subconjunto de vocabulario (248k → ~47k filas, tabla índice → token, muestreo del draft sobre K logits; converter + `common/speculative.cpp`). Aplazada por decisión del Director (2026-09-10) | decode | +4 % (la cabeza del draft mide 1.62 ms por token, 3.24 ms por paso; con 47k filas ~0.6 ms) | Medida directa del mat-vec de la cabeza (221 GB/s) | Medio: la aceptación cae con los tokens fuera del subconjunto; el subconjunto debe salir de nuestro tráfico (español), no de uno de código | Contar en las respuestas de los rigs qué fracción de tokens cae en los 47k más frecuentes de nuestro tráfico |
 | 10 | Mezclador hyper-connection en decode: reparto de k del mat-vec m=4 (14 µs en un solo workgroup), scale plegado, silu y gate fusionados | decode | hasta −3.8 % (−2.5 ms), rebajado desde −4.4 | Cadena medida: 61 µs por mezclador × 96; suelo por dispatch 2.5 µs | Alto si se fusiona todo en un kernel serial por token; medio como reparto de k | test-backend-ops perf del mat-vec m=4, k=10240 con reparto de k |
 | 11 | IQ4_NL en las listas f16-B del backend (B viaja en f32; `matmul_iq4_nl_f16` ya se genera) | prefill | −1 a −3 % | Medición del fork en otros tipos (+4.5 %) | Medio: los densos grandes van a cómputo, no a bytes de B | Dos líneas; se mide directamente |
@@ -415,3 +415,43 @@ sparse medida en el pre-check: el resto es el prepass por token (2048 workgroups
 fila de máscara completa, con una barrera por bloque de 128 columnas, 16× más iteraciones de
 barrera que el prepass por tile) y las 4 filas coopmat vacías. Siguiente palanca en esta vía:
 construir la lista por token desde los índices del selector QSA en vez de barrer la máscara.
+
+## 10. Vía 8 medida: la ponderación por los pesos del router en el epílogo del MUL_MAT_ID (2026-09-16, build 380)
+
+Perfil fresco del build 378 (perf logger, ubatch 2048, MTP, `~/dbg/merge/prof_nodes.py`): GPU 4.0 s por
+ubatch, 80.3 s por prefill de 39.5k sobre 88.8 s de pared. Por familia: MUL_MAT_ID 28.4 s (gate/up
+IQ3_S 19.3, down IQ4_NL 8.4), MUL_MAT 22.4, FA 9.7, MUL 3.05, RMS_NORM_MUL 2.5, HC_GATED_MEAN 1.9,
+HC_INJECT 1.6, MULTI_ADD 1.6. El MUL de 3.05 s es `ffn_moe_weighted`: `experts` [2560, 10, 2048] ×
+`weights` [1, 10, 2048] (420 MB de lectura+escritura por capa, kernel `mul` con broadcast a 137 GB/s).
+La fusión MUL_MAT_ID+MUL del backend existía solo en el kernel mat-vec (n ≤ 8) y exigía un solo token
+(`scale->ne[2] == 1`), así que el prefill y el lote de verificación del MTP corrían sin fusión.
+
+Cambio: los kernels de tiles (`mul_mm.comp` coopmat y escalar, `mul_mmq.comp`) multiplican cada fila
+(slot de experto, token) por `scale[token * nei0 + slot]` al escribir (binding 6, flag en el push
+constant); el host pasa el tensor del MUL como salida del MUL_MAT_ID y su `src[1]` como escala; la
+condición de fusión acepta la ruta de tiles (no en coopmat2, que no tiene el epílogo) y escalas
+[1, n_used, n_tokens]; el mat-vec indexa la escala por token (`expert_i1 * nei0 + slot`), con lo que
+el lote de verificación (3 tokens) también fusiona. El producto se hace en f32 sobre el mismo
+acumulador que antes se guardaba y volvía a leer: **salida bit-idéntica** (misma aceptación del draft
+139/230 en base y fusionado). Compuerta de apagado: `GGML_VK_DISABLE_MMID_SCALE_EPILOGUE=1`.
+
+Rigs de 40k con MTP (base con la compuerta, primero y último):
+
+| Config | Prefill 39.5k | Re-prefill 2k | Decode | Determinismo |
+|---|---|---|---|---|
+| Base (epílogo apagado) | 89.0 / 89.1 s | 4.81 / 4.81 s | 33-38 t/s | — |
+| Epílogo | **86.8 s (455 t/s, −2.4 %)** | **4.68 s** | 33-38 t/s | depth_repeat idéntico (2 = 3, 1 = 5) |
+
+Correctness: test-backend-ops MUL_MAT_ID_FUSION 23/23 con y sin epílogo (casos nuevos: down IQ4_NL
+n = 2048 y 100, gate/up IQ3_S, f16), MUL_MAT_ID 935/935. La ganancia (2.2 s) es menor que los 3.05 s
+del MUL porque parte del MUL solapaba con otros nodos por la concurrencia del optimizador de grafo.
+La suma sobre los 10 expertos (MULTI_ADD, 1.6 s) queda: hacerla en el kernel exige atómicos entre
+workgroups (orden por planificación, rompe la identidad entre peticiones) o un tiling por token que
+destruye el esquema expert-major de `row_ids`; descartada.
+
+Gate: graph_diff4 seq_rm 2048,631 con los mismos 72 nodos SET_ROWS que la referencia; repeat_probe
+sobre producción con una sola distribución en 5 prefills. Incidente de la ventana: el harness de la
+sesión mató las cadenas en segundo plano durante la recarga de producción ("memoria baja", con
+MemAvailable en 40 GiB, lo normal de toda carga) y la carga murió con ellas; desde entonces las
+recargas de producción se lanzan con `setsid` fuera del árbol de procesos de la cadena. Estado de
+producción al cierre: build 380, prefill 86.8 s a 40k (455 t/s).
