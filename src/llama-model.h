@@ -571,6 +571,9 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_down    = nullptr;
     struct ggml_tensor * hc_ffn_up      = nullptr;
     struct ggml_tensor * hc_ffn_inject  = nullptr;
+    // the down and inject weights of one mixer as one tensor [hc_dim, hc_lr + hc] (either layout loads)
+    struct ggml_tensor * hc_attn_down_inject = nullptr;
+    struct ggml_tensor * hc_ffn_down_inject  = nullptr;
 
     struct ggml_tensor * ple_key        = nullptr;
     struct ggml_tensor * ple_value      = nullptr;

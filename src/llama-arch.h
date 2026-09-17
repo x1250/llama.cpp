@@ -603,6 +603,8 @@ enum llm_tensor {
     LLM_TENSOR_HC_FFN_DOWN,    // qwen4exp
     LLM_TENSOR_HC_FFN_UP,      // qwen4exp
     LLM_TENSOR_HC_FFN_INJECT,  // qwen4exp
+    LLM_TENSOR_HC_ATTN_DOWN_INJECT, // qwen4exp: hc_attn_down and hc_attn_inject concatenated along the rows
+    LLM_TENSOR_HC_FFN_DOWN_INJECT,  // qwen4exp: the same for the FFN mixer
     LLM_TENSOR_PLE_KEY,        // qwen4exp
     LLM_TENSOR_PLE_VALUE,      // qwen4exp
     LLM_TENSOR_PLE_NORM_KEY,   // qwen4exp

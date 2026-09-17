@@ -2353,6 +2353,10 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // the down and inject weights of both mixers of a layer: the merged tensor [hc_dim, hc_lr + hc] when
+    // the file carries it, else the separate ones
+    void create_tensor_hc_down_inject(llama_layer & layer, int bid, int64_t hc_dim, int64_t hc_lr, int64_t hc, int flags);
+
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:
@@ -2366,6 +2370,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * w_down,
                     ggml_tensor * w_up,
                     ggml_tensor * w_inject,
+                    ggml_tensor * w_down_inject,
                     ggml_tensor ** inject,
                             int   il);
 
