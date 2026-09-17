@@ -566,3 +566,31 @@ Decode (38-41 t/s a 40k; 39.3 ms de GPU por paso, sección 1), pendientes por in
 | D4 | Vía 14: estado GDN in place (GET_ROWS + CPY 1.2 ms por paso) | −0.8 ms | |
 | D5 | Vía 7: split_k en el modo compacto de la FA sparse (2.3 ms por paso, 6 workgroups por capa) | −1 ms | |
 | D6 | Vía 17: menos dispatches pequeños (~2500 por paso, ~2 ms) | −0.5 a −1 ms | fusiones |
+
+## 14. Los cuatro frentes: estado y orden propuesto (2026-09-17)
+
+| Frente | Estado | Medido | Ganancia realista | Primer paso |
+|---|---|---|---|---|
+| Prefill | 80.8 s a 40k (489 t/s) | sí (secciones 2, 13) | −8 a −10 s con las filas 1-4 de la sección 13 (~550 t/s); techo ~68 s | vía 18 (gate/up en un tensor) |
+| Decode | 38-41 t/s a 40k; 39.3 ms de GPU por paso | sí (sección 1) | −6 a −9 ms por paso (46-48 t/s): los grafos del draft son el 35 % del paso y sus expertos cuestan 4.8 ms para un bloque frente a 8.5 ms de los 48 del target | perfil por nodo del draft (`GGML_VK_PERF_LOGGER` sobre los grafos pequeños) |
+| Imágenes | sin medir | no: ningún log de rig o producción contiene un encode de imagen | desconocida; candidatos: coste del encoder ViT (`mmproj-F16`, 863 MB, tiles y resolución), fragmentación del prefill por los cortes de imagen (ubatches de 618-1687 tokens en el log de producción del 2026-09-16), kernels del encoder | una petición con imagen contra producción con el log de mtmd (tiempo de encode por imagen); si es alto, perfil del grafo del encoder con producción descargada |
+| Ejecución paralela (NP=2) | sin medir | no: todos los rigs son NP=1 | desconocida; el server mete los tokens de ambos slots en un batch, así que el decode de dos peticiones debería costar poco más que uno; abiertos: reparto del prefill entre slots, MTP con dos slots activos, memoria de estados GDN y checkpoints por slot | rig con dos peticiones concurrentes (prefill y decode) con el conjunto de producción |
+
+Prefill de 76.5k tokens en producción (log del Director, 2026-09-16, NP=2, con cortes de imagen):
+
+| Tramo | Tiempo por ubatch de 2048 | t/s marginal |
+|---|---|---|
+| 0-8k | 4.0-4.3 s | ~500 |
+| 20-40k | 4.2-4.5 s | ~470 |
+| 60-76k | 4.9-5.1 s | ~410 |
+| Acumulado a 40k | 83.8 s | 480 (rig NP=1: 80.8 s, 489) |
+| Acumulado a 76.5k | 172 s | 444 |
+
+La caída con la profundidad (~20 % de 0 a 76k) es el término lineal con n_kv: la atención densa del
+draft (un bloque sin QSA sobre todo el contexto), el prepass de la FA sparse (barre la fila de máscara
+completa por token) y el top-k del selector QSA. A 40k pesan poco; a 128k dominan (2026-09-03: 126k a
+241 t/s; el ritmo de hoy extrapola a ~410-420). Son las filas 2 y 5 de la sección 13 y D1. Los
+ubatches cortos de los cortes de imagen pagan el coste fijo por ubatch sin amortizarlo.
+
+Orden propuesto con la GPU libre: dos ventanas cortas de solo lectura (imágenes, paralelo) para saber
+si hay problema, y en paralelo la vía 18 y el perfil del draft.
