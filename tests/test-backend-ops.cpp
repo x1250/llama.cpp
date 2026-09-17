@@ -10994,6 +10994,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 10, false, 640, 2048, 2560));
     }
 
+    // qwen4exp dense prefill nodes (n = 2048) with their weight types and as f16 (the bound of a per-node f16
+    // shadow): the hyper-connection mixers (m=320 k=10240, m=10240 k=320, m=4 k=10240) and the large projections
+    for (const auto & c : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{{GGML_TYPE_IQ4_NL, 320, 10240}, {GGML_TYPE_IQ4_NL, 10240, 320},
+                                                                             {GGML_TYPE_IQ4_NL, 4, 10240}, {GGML_TYPE_IQ4_NL, 2560, 6144},
+                                                                             {GGML_TYPE_IQ4_NL, 6144, 2560}, {GGML_TYPE_IQ4_NL, 12288, 2560},
+                                                                             {GGML_TYPE_Q5_K, 10240, 2560}, {GGML_TYPE_Q8_0, 2560, 6144}}) {
+        for (ggml_type type_a : {std::get<0>(c), GGML_TYPE_F16}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, std::get<1>(c), 2048, std::get<2>(c), {1, 1}, {1, 1}));
+        }
+    }
+
     // decode mat-vec with a few columns (MTP verification batches): the qwen4exp f32 router [2560 x 512]
     // and the same shape in f16 / q8_0, 1 to 4 columns
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0}) {

@@ -10021,9 +10021,18 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
+    bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+
+    // k a multiple of the medium tile's alignment but not of the large one's: the aligned medium kernel
+    // instead of the large one with bounds checks on every load (measured on gfx1151 with the qwen4exp
+    // hyper-connection up mixer, m=10240 n=2048 k=320: -1.6% of a 40k prefill, same output)
+    if (!aligned && !quantize_y && ne01 > 64 && ne11 > 64 && pipeline == mmp->l &&
+        mmp->a_m != nullptr && mmp->a_m->align != 0 && ne10 == ggml_vk_align_size(ne10, mmp->a_m->align)) {
+        pipeline = mmp->a_m;
+        aligned  = true;
+    }
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
