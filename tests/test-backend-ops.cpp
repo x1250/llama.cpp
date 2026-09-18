@@ -10992,6 +10992,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, n, 2560));
         }
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 10, false, 640, 2048, 2560));
+        // gate and up merged in one tensor (ffn_gate_up_exps): m = 1280 in one node instead of two of 640
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 1280, 2048, 2560));
     }
 
     // qwen4exp dense prefill nodes (n = 2048) with their weight types and as f16 (the bound of a per-node f16
