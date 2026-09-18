@@ -48,3 +48,20 @@ n_ctx 135168, lazy mode, regla de splits, determinismo).
 3. `50182a53f` y `6788edb4f`(c): una ventana de medición cada uno si se quieren los 0.1-0.5 %.
 4. `91f6a6cf3`: ventana propia cuando toque un merge de la ruta matmul; antes no.
 5. `fc82583e6`: decisión explícita de mantener la FA sparse del fork y resolver el conflicto a su favor.
+
+## Aplicado (2026-09-17 noche)
+
+Cherry-picks en `master` (con `-x`): `481c65f09` → 5a273ee63, `43f3dda62` → 9680478a9, `5cdd3d1da` → f0101a43f,
+`fa6769818` → 1aa0fd128, `093a2f86c` → 099991d8f, `37b53fd45` (solo `ggml/`) → fec3ee116, `b0dcb8192` →
+9361fffb2 (aplicó limpio con la fusión a tres vías: `n_past → pos0` en los 10 sitios de
+`common/speculative.cpp`, `server-context.cpp` pasa `pos_next()`). Build 396.
+
+Verificación: test-backend-ops ARGSORT 98/98 y TOP_K 525/525; rig de 40k con MTP: prefill 81.5 s (485 t/s),
+decode 38-41 t/s, misma aceptación del draft (153/202), depth_repeat idéntico; graph_diff4 seq_rm 2048,631
+con los mismos 72 nodos SET_ROWS y la misma distribución que la referencia; conversación texto → imagen →
+texto → texto → texto dos veces contra producción: 5/5 turnos, respuestas idénticas entre corridas y
+con las del 2026-09-04; repeat_probe sobre producción. Incidente de la ventana: otro proceso (ComfyUI)
+tomó la GPU y 50 GiB en medio de la primera pasada (rig sin margen, graph_diff4 cortado por el kill
+switch, el launcher rechazó la recarga); se repitió íntegra con la máquina libre. La puerta del rig se
+bajó de 37 a 36 GiB porque el escritorio retiene ~4 GiB más que ayer; la huella real del rig es 67 GiB
+(mínimo disponible 43 GiB durante la corrida, por encima de la regla de 40).
