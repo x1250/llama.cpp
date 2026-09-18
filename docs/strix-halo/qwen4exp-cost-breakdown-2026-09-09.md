@@ -544,8 +544,14 @@ cadena de medición completa (base primero y último, MTP on, determinismo).
 | 6 | Elementwise sobre el residual ancho (RMS_NORM_MUL 2.5 s, HC_GATED_MEAN 1.9, CONCAT+CONT 1.8, ADD 0.8): fusiones adicionales | −1 a −2 s | medio | perfil por nodo (sección 2) |
 | 7 | Vía 1 bis: expertos `down` (k=640, ~9 ms por dispatch, 7.3 TFLOPS): cargas de B fuera del bucle de filas, BK_STEP | −1 s, sin estimar bien | medio | microbench |
 | 8 | Vías menores 19-23: QSA por bloques, ssm_conv, mat-muls diminutos, MMVQ IQ4_NL, GDN chunked | −0.5 a −1 s cada una | bajo-medio | varias |
+| 9 | Draft MTP en prefill recortado a n_outputs (sección 17.1): K/V y el store al cache siguen a n_tokens; Q, gate, FA densa, wo, FFN y hc_combine solo para las filas de salida. Exacto con un solo head (`nextn_predict_layers = 1`) | −3.6 s a 40k (FA densa del draft 2.7 + wo/FFN/hc 0.9); crece con la profundidad | medio: `build_layer_attn` con filas de query distintas de las de K/V; verificar aceptación del draft idéntica | ninguna (código leído) |
+| 10 | Tile medio para la matmul alineada de pocos workgroups (sección 17.2): `hc_down_inject` m=324 k=10240 corre el tile L con 48 workgroups en 40 CU (8 TFLOPS); la regla k-alineada del fork exige `!aligned` y no la alcanza | −1.5 a −2 s (el nodo son 3.16 s) | bajo: A/B como 6459c5bb9 + probe | ninguna |
+| 11 | `ggml_ssm_conv` con un src de historial y x con sus strides (sección 17.3): hoy `ggml_concat(state, transpose(x))` materializa 84 MB por capa GDN por ubatch solo para el layout | −0.9 s (CONCAT 0.93) | medio: op compartido por todas las arquitecturas SSM (CPU + shader) | ninguna |
+| 12 | RMS norm agrupada con gamma [n_embd, hc] como un op (sección 17.4): el par RMS_NORM+MUL fusionado corre a 123 GB/s frente a 186-217 de los otros ops del residual | −0.7 s | bajo | ninguna |
+| 13 | Host entre batches del prompt (sección 17.5): una sola sincronización en vez de 2048 y `verify_h` acotado a las filas alcanzables | −1 s (60 ms por batch, 1.6 % del ciclo, techo) | bajo: reescritura equivalente | ninguna |
+| 14 | Camino split de la QSA (n_kv > 32768): salidas por bloque en vistas de un tensor preasignado en vez de concats encadenados (O(B²) copias) | < 0.5 s a 40k; crece hacia 262k | bajo | ninguna |
 
-Suma realista de 2 y 3: ~4-6 s (80.9 → ~75-77 s, ~520 t/s). Techo con todo: ~68-70 s.
+Suma realista de 2, 3, 9 y 10: ~9-11 s (80.9 → ~70-72 s, ~560 t/s). Techo con todo: ~65-67 s.
 
 Cerradas (no volver sin un dato nuevo):
 
@@ -685,4 +691,105 @@ ignora los procesos que apuntan a 127.0.0.1 y el log de la carga anterior se con
 commit del 2026-09-09: el ejecutable es un stub que no se relinkea; las librerías que mapea producción son
 las de `build/bin` y llevan el build vigente. (3) El "compute host" de 1130 ms por ubatch (30 % del ciclo)
 sigue sin atribuir entre la grabación de comandos Vulkan y el gather PLE con sus faults.
+
+## 17. Auditoría de código de palancas de prefill no inventariadas (2026-09-18, solo lectura)
+
+Tres lecturas independientes (backend Vulkan: alimentación de las matmuls densas; grafo qwen4exp sobre el
+residual ancho; camino host por ubatch: contexto, scheduler, server, speculative), sin ninguna ejecución
+(GPU ocupada). Las cifras son las del perfil de la sección 2 (72.6 s de GPU por prefill de 39.5k) y de la
+línea de tiempo de la sección 16; los cambios propuestos no se han medido.
+
+Correcciones al perfil de la sección 2, verificadas por aritmética sobre las formas:
+
+- El elementwise sobre el residual ancho es 6.0 s (RMS_NORM_MUL 2.52 + HC_GATED_MEAN 1.88 + HC_INJECT
+  1.61; 13 pasadas de 84 MB por capa = 1010 GB por prefill a 168 GB/s efectivos), no 12.3: CONCAT 0.93
+  es el estado conv de la GDN (17.3), MULTI_ADD 1.44 es la suma de los 10 expertos sobre vectores de 2560
+  (214 GB, ya en su óptimo de banda), CONT 0.85 y MUL 0.96 son el gate de atención y las compuertas.
+- El perfil por nodo serializa el grafo (barrera tras cada nodo): son cotas superiores sin solape entre
+  nodos. Su suma (3.63 s por ubatch) coincide con compute + gpu_wait de la línea de tiempo: el solape del
+  optimizador no aporta en prefill.
+- El residual ancho es F32 por los asserts de `ggml_hc_gated_mean` y `ggml_hc_inject` (ggml.c); el repo no
+  documenta el dtype de la referencia. Pasarlo a f16 ahorraría como mucho 3 s (la mitad de 6.0) a cambio
+  de f16 en todos los ops hc (shaders + ops) y una compuerta de PPL; no se propone.
+- El tiempo host entre decodes es bimodal: 52-82 ms por batch dentro del prefill (19 intervalos, media 60)
+  y 530-590 ms en los 7 bordes de turno (256 pasos de decode con ~2.2 ms de server cada uno, 3.5-4 % del
+  decode). La media de 193 ms de la sección 16 mezclaba ambos.
+- La grabación Vulkan de los ~12k nodos (`compute` 1130 ms por ubatch, 93 µs por nodo) corre por delante
+  de la GPU y queda oculta (compute + gpu_wait = GPU); sin syncs ni readbacks dentro del grafo (verificado:
+  un solo `waitForFences` por grafo, submits cada 100 nodos o 200 GFLOP). Se vuelve suelo cuando la GPU baje
+  de ~1.3 s por ubatch.
+
+### 17.1 Draft MTP en prefill: atención y FFN a n_tokens con un solo head (−3.6 s, crece con la profundidad)
+
+`graph_mtp` (qwen4exp.cpp:472-581) corre el bloque completo a n_tokens y recorta a n_outputs solo antes
+de la cabeza; `res->t_h_nextn = flat` se fija antes del recorte para un segundo head encadenado. El draft
+de producción tiene `qwen4exp.nextn_predict_layers = 1` (`n_mtp_layers = 1`, `chain_heads = false`,
+speculative.cpp:1425-1504): nadie consume `t_h_nextn` del draft. Lo que el draft necesita a n_tokens en
+un batch de prompt es K, V y su store al cache (y `eh_proj`, `hc_mix` de entrada, que los alimentan); Q,
+el gate, la FA densa (2.7 s por prefill, lineal en n_kv), `wo`, `hc_combine`, `hc_mix` de FFN y la FFN
+(~0.9 s) solo hacen falta para las filas de salida. El recorte sigue la regla del tronco (`!embeddings_nextn
+|| embeddings_nextn_masked`, qwen4exp.cpp:648-659; el contexto draft corre masked). Gate: aceptación del
+draft y depth_repeat idénticos. Defecto latente anotado: con masked el host lee n_outputs filas desde el
+inicio de `t_h_nextn` (llama-context.cpp:2005-2016) mientras el nodo no está recortado: filas equivocadas
+si algún día se encadenan heads.
+
+### 17.2 Tile medio para la matmul alineada de 48 workgroups (−1.5 a −2 s)
+
+`ggml_vk_guess_matmul_pipeline` (ggml-vulkan.cpp:9569-9578, rama coopmat1) elige el tile L en cuanto
+m > 64 y n > 64; la regla k-alineada del fork (10026-10031) baja a `a_m` solo con `!aligned`. Para
+`hc_*_down_inject` (m=324, k=10240, n=2048, IQ4_NL, f32-B) k es múltiplo de 128 → aligned → L:
+3 × 16 = 48 workgroups de 256 hilos en 40 CU, 60 de 384 filas de padding, 8 TFLOPS (3.16 s por prefill).
+Con `a_m` (64×64): 6 × 32 = 192 workgroups. Cambio: extender la regla con una condición de ocupación
+(`aligned && tiles_l < 2 × shader_core_count`). Distinto del split_k cerrado (sección 11): cambia el tile,
+no parte k. Dato adicional: MMQ denso (B a q8_1) no existe en coopmat (`create_mmq_pipelines(dense=false)`),
+los IQ4_NL densos corren f32-B sin pasada de conversión, y los Q5_K/Q8_0/Q6_K f16-B con una conversión de
+31.5 MB por nodo (k=2560), compartida por wq/wk/wv: sin palanca ahí. Un `ggml_cast` a f16 delante de una
+matmul IQ4_NL hoy desreferencia un pipeline vacío (275-282, 8511-8514): no usar.
+
+### 17.3 El estado conv de la GDN: 84 MB por capa por ubatch solo por layout (−0.9 s)
+
+`ggml_concat(state, ggml_transpose(x))` (qwen4exp.cpp:1709) materializa [n_tokens+3, 10240] f32 desde
+una lectura transpuesta, para que `ggml_ssm_conv` vea tiempo-canal contiguo con las 3 columnas de
+historial: 36 capas × 19.3 ubatches × 168 MB = 117 GB, lo que explica CONCAT 0.93 s y parte de SSM_CONV
+0.64. Cambio: `ggml_ssm_conv` con un segundo src de historial y x leído con sus strides. Op compartido
+por todas las arquitecturas SSM (referencia CPU + shader Vulkan): cambio de ggml, con test-backend-ops.
+
+### 17.4 RMS norm agrupada (−0.7 s)
+
+El par `ggml_rms_norm` + `ggml_mul` sobre [2560, 4, n_tokens] (qwen4exp.cpp:375-376) se fusiona en el
+backend, pero corre a 123 GB/s frente a 186 (HC_GATED_MEAN) y 217 (HC_INJECT) sobre los mismos 84 MB.
+Un op de norma agrupada con gamma [n_embd, hc] leería y escribiría una vez a la banda de los otros.
+
+### 17.5 Host entre batches del prompt: 2048 sincronizaciones y dos copias de 84 MB (−1 s)
+
+Tras cada `llama_decode` del prompt, `common_speculative_process` (speculative.cpp:1605-1690) copia los
+83.9 MB de `embd_nextn` del target (n_embd_out = 10240 × 2048) a `batch.embd` (desplazados una fila),
+decodifica el draft, y luego copia las 2048 filas a `verify_h` con 2048 llamadas a
+`llama_get_embeddings_nextn_ith`, cada una con `ctx->synchronize()` (llama-context.cpp:3974-3978) →
+`ggml_backend_vk_synchronize` → `ggml_vk_graph_cleanup` incondicional (reset del command pool, vectores,
+descriptores; 17529-17565). `accept()` solo lee las filas `min(n_accepted, n_rows-1)` con n_accepted ≤
+n_max (2) y `pending_h` la última (1849-1856): las filas 3..2046 son inalcanzables. Cambio: una sola
+sincronización (`llama_get_embeddings_nextn` ya la hace) y `verify_h` con las filas 0..n_max y la última.
+Techo: los 60 ms por batch medidos (1.6 % del ciclo); el reparto exacto entre las 2048 sincronizaciones y
+las copias no es determinable sin medir. El viaje D2H → host → H2D de los 84 MB es inherente a los dos
+contextos (el fork prohíbe dos contextos en vuelo: "syncobj interlock", speculative.cpp:1659-1663).
+
+### 17.6 Verificado y descartado o menor
+
+- Selector QSA en régimen denso: se construye siempre (condición estática, qwen4exp.cpp:1154) y no es
+  trabajo perdido: la máscara restringe la atención también bajo el umbral (que vive en el backend,
+  ggml-vulkan.cpp:11779). El único salto exacto (`width == n_kv`, :990) solo aplica a contextos cortos.
+- Materialización de la máscara QSA en 3 pasadas de [n_kv × n_tokens] f16 (fill, set_rows, add): ~0.45 s
+  (0.6 %); pasar `top_k` directo a la FA es medio-alto en riesgo (vía 19, ya listada).
+- Reuso del grafo entre ubatches de 2048 (build + alloc 28 ms, 0.7 %): lo bloquean n_kv en la máscara y
+  en el input QSA (padeables) y `kv_head` horneado en offsets de vistas de la GDN (delta-net-base.cpp:493-600):
+  refactor, no cambio barato; el beneficio GPU sería inferido.
+- Sin ops del modelo en CPU salvo el `get_rows` del PLE (buft CPU de la tabla lazy; `offload_op` lo deja
+  en host, ggml-vulkan.cpp:20714-20731): un split de CPU al inicio, 6.55 MB H2D por ubatch. Es la espera
+  de E/S de la sección 16, no un costo nuevo.
+- `apply_ubatch` del KV corre dos veces por ubatch (prepare en seco + apply, llama-kv-cache.cpp:761-820 y
+  2725-2735): sub-ms. `seq_pos` como `std::set` por token: sub-ms.
+- El `ggml_cont_2d` del gate de atención (qwen4exp.cpp:1205): 50 MB por capa de atención, ~0.15 s (0.2 %).
+- La caché de B convertida del backend tiene una sola entrada (ggml-vulkan.cpp:2620-2623): con las formas
+  de este modelo no hay reconversiones que valgan (31.5 MB por capa).
 
