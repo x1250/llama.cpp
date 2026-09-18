@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include <typeinfo>
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1354,9 +1356,26 @@ void llm_graph_result::reset() {
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
-    for (auto & input : inputs) {
-        input->set_input(ubatch);
+    // LLAMA_INPUT_TIMING=1 (see llama_context::process_ubatch): with it, the inputs of a ubatch of 512
+    // tokens or more that took 1 ms or more are listed on stderr, by class, so the input fill of the
+    // timeline can be attributed
+    static const bool ubatch_timing = getenv("LLAMA_INPUT_TIMING") != nullptr;
+    if (!ubatch_timing || ubatch->n_tokens < 512) {
+        for (auto & input : inputs) {
+            input->set_input(ubatch);
+        }
+        return;
     }
+    std::string detail;
+    for (auto & input : inputs) {
+        const int64_t t0 = ggml_time_us();
+        input->set_input(ubatch);
+        const int64_t dt = ggml_time_us() - t0;
+        if (dt >= 1000) {
+            detail += format(" %s=%.1f", typeid(*input).name(), dt / 1000.0);
+        }
+    }
+    fprintf(stderr, "input timing detail: n_tokens = %u:%s\n", ubatch->n_tokens, detail.c_str());
 }
 
 void llm_graph_result::set_outputs(const llm_graph_params & params) {

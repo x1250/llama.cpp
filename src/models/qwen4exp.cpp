@@ -1650,12 +1650,19 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
+    // LLAMA_INPUT_TIMING=1: the phases of this input are listed per big ubatch (see llm_graph_result::set_inputs)
+    static const bool ubatch_timing = getenv("LLAMA_INPUT_TIMING") != nullptr;
+    const int64_t t0 = ubatch_timing ? ggml_time_us() : 0;
+
     std::vector<int32_t> idx;
     ple_hash_rows(hp, *ubatch, img_tok, prev, idx);
+    const int64_t t1 = ubatch_timing ? ggml_time_us() : 0;
 
     prefetch_ple_rows(pmodel.per_layer_tok_embd, idx);
+    const int64_t t2 = ubatch_timing ? ggml_time_us() : 0;
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    const int64_t t3 = ubatch_timing ? ggml_time_us() : 0;
 
     // the rows of the next ubatch of this batch are read while this one computes: madvise only
     // queues the reads, so by its own set_input they are resident instead of being waited for
@@ -1663,6 +1670,11 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         ple_prev_tokens_ahead(mctx, *next, n_prev, prev);
         ple_hash_rows(hp, *next, img_tok, prev, idx);
         prefetch_ple_rows(pmodel.per_layer_tok_embd, idx);
+    }
+    if (ubatch_timing && n_tokens >= 2048) {
+        const int64_t t4 = ggml_time_us();
+        fprintf(stderr, "ple input detail: n_tokens = %" PRId64 ", hash = %.1f, prefetch = %.1f, set = %.1f, next = %.1f\n",
+                n_tokens, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0, (t4 - t3) / 1000.0);
     }
 }
 
