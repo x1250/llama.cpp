@@ -1,12 +1,13 @@
 # qwen4exp en Strix Halo: dónde va el tiempo y vías de optimización (2026-09-09, actualizado 2026-09-16)
 
-## Estado actual (2026-09-16, noche)
+## Estado actual (2026-09-18)
 
-- Árbol: master `5f6128357` (build 382+). Producción: `strix load qwen38flash` (NP=2, `-c 524288`
-  = 262144 × 2 slots, ubatch 2048, KV q8_0, lazy mode auto, draft MTP IQ4_NL n-max 2, mmproj,
-  `--ctx-checkpoints 8`), archivo `NL3S/qwen4exp-nl3s-hcdi-oproj8.gguf` (`quant = nl3s-hcdi-oproj8`).
-- Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **80.8 s (489 t/s)**,
-  re-prefill de 2k 4.68 s, decode 38-41 t/s. Residentes 56.5 GiB; MemAvailable 36 GiB con producción
+- Árbol: master `8177aecf8` (build 399) más la instrumentación de la sección 16. Producción: `strix load
+  qwen38flash` (NP=2, `-c 524288` = 262144 × 2 slots, batch = ubatch 2048, KV q8_0, lazy mode auto, draft
+  MTP IQ4_NL n-max 2, mmproj, `--ctx-checkpoints 8`), archivo `NL3S/qwen4exp-nl3s-hcdi-gu-oproj8.gguf`
+  (`quant = nl3s-hcdi-gu-oproj8`).
+- Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **80.9 s (488 t/s)**,
+  re-prefill de 2k 4.57 s, decode 36-41 t/s. Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13. Desglose por nodo vigente: sección 2. Las secciones 5-12 son el
   registro de cada ventana de medición, en orden cronológico.
@@ -26,6 +27,7 @@ Cronología del prefill de 39.5k a 40k (misma máquina, mismo rig):
 | hc inject fusionado en down (c12f6777c, archivo hcdi) | 80.8 s | 489 | −5.8 %, decode +15 % |
 | 2026-09-17: cherry-picks de upstream (build 396) | 81.5 s | 485 | correcciones, sin efecto |
 | gate y up fusionados (archivo hcdi-gu, 2026-09-18) | **80.9 s** | **488** | −0.8 %, re-prefill −2.8 % |
+| vía 12 medida (2026-09-18, sección 16) | 80.9 s | 488 | cerrada sin cambio: el input PLE es E/S |
 
 Lo que sigue es el documento original del 2026-09-09 con sus secciones anotadas; el desglose de
 la sección 2 está reemplazado por el perfil del build actual.
@@ -537,13 +539,13 @@ cadena de medición completa (base primero y último, MTP on, determinismo).
 | 1 | Vía 18: gate y up de expertos en un solo tensor `ffn_gate_up_exps`. **Hecha (2026-09-18, sección 15): −0.6 s de prefill, −2.8 % de re-prefill, PPL idéntica; archivo `nl3s-hcdi-gu-oproj8` en producción** | −1 a −2 s | bajo | ninguno |
 | 2 | Vía 2 bis: lista por token de la FA sparse construida desde los índices del selector QSA (hoy el prepass barre la fila de máscara entera, 40k columnas por token) y las 4 filas coopmat vacías | −2 a −3 s a 40k, más a mayor profundidad | medio: los índices deben llegar al nodo FA (grafo) y el prepass cambia | diseño del paso índices → listas; perf logger del nodo FA por profundidad |
 | 3 | Desquantizado IQ3_S en el kernel coopmat de MUL_MAT_ID (recuento de instrucciones, cargas de 16 bits, tabla en shmem) | −2 a −3 s | medio-alto: días; el loader integer-dot de hoy fue correcto pero −2.1 % | microbench por variante (sección 12 como base: 9.0-9.2 ms) |
-| 4 | Vía 12: host (`prefetch_ple_rows`, 20k llamadas síncronas por ubatch; huecos entre submisiones, 204 ms por ciclo) | −2 a −3 s | medio | ya medida (sección 8): techo 4-7 s |
+| 4 | Vía 12: host (`prefetch_ple_rows`, 20k llamadas síncronas por ubatch; huecos entre submisiones, 204 ms por ciclo). **Cerrada (2026-09-18, sección 16): el input PLE son 130-190 ms de E/S aleatoria por ubatch; agrupar o repartir el encolado no cambia el total, batch 8192 pierde decode. Queda solo el read-ahead entre decodes por hint del server (techo 3.9 %)** | −2 a −3 s | medio | ya medida (sección 8): techo 4-7 s |
 | 5 | Vía 16: el draft reutiliza la selección QSA del target (sin indexador en el draft) | −2 s a 40k, crece con la profundidad | medio-alto: flujo del MTP | diseño |
 | 6 | Elementwise sobre el residual ancho (RMS_NORM_MUL 2.5 s, HC_GATED_MEAN 1.9, CONCAT+CONT 1.8, ADD 0.8): fusiones adicionales | −1 a −2 s | medio | perfil por nodo (sección 2) |
 | 7 | Vía 1 bis: expertos `down` (k=640, ~9 ms por dispatch, 7.3 TFLOPS): cargas de B fuera del bucle de filas, BK_STEP | −1 s, sin estimar bien | medio | microbench |
 | 8 | Vías menores 19-23: QSA por bloques, ssm_conv, mat-muls diminutos, MMVQ IQ4_NL, GDN chunked | −0.5 a −1 s cada una | bajo-medio | varias |
 
-Suma realista de 1-4: ~8 s (80.8 → ~73 s, ~540 t/s). Techo con todo: ~68-70 s.
+Suma realista de 2 y 3: ~4-6 s (80.9 → ~75-77 s, ~520 t/s). Techo con todo: ~68-70 s.
 
 Cerradas (no volver sin un dato nuevo):
 
@@ -557,6 +559,8 @@ Cerradas (no volver sin un dato nuevo):
 - Ubatch 4096: −9 % y checkpoints de 4096 (sección 8).
 - `LLAMA_QSA_QUERY_BLOCK=8` como proxy de la FA por token: mide ocupación, no geometría (sección 9).
 - Suma sobre expertos dentro del MUL_MAT_ID: atómicos u orden por planificación, rompe el determinismo (sección 10).
+- Vía 12, encolado del prefetch PLE: `process_madvise` por lotes, reparto en 4/8 hilos, batch 8192 con
+  read-ahead síncrono o en hilo: el total por ubatch no se mueve, es E/S (sección 16).
 
 Decode (38-41 t/s a 40k; 39.3 ms de GPU por paso, sección 1), pendientes por interés:
 
@@ -620,3 +624,65 @@ idéntica. La sonda cambió de distribución respecto del archivo anterior ('The
 el nodo fusionado no es bit-idéntico al par (otro reparto de tiles y de fusiones del grafo). Perplejidad
 en la misma ventana: fusionado 1.5928 ± 0.0158, anterior 1.5928 ± 0.0158; sin efecto en la calidad.
 Adoptado: `quant = nl3s-hcdi-gu-oproj8`.
+
+## 16. Vía 12 medida: el input PLE está acotado por la E/S (2026-09-18, build 399)
+
+La palanca host del prefill. Instrumentación nueva, bajo `LLAMA_INPUT_TIMING=1`: `llm_graph_result::set_inputs`
+lista por clase de input los que cuestan 1 ms o más en cada ubatch de 512+ tokens (`input timing detail`), y el
+input PLE de qwen4exp desglosa sus fases (`ple input detail`: hash, prefetch, set, next). Rigs de 40k con MTP,
+forma de producción (batch = ubatch 2048) salvo donde se indica.
+
+Qué es el input PLE: `per_layer_token_embd.weight` [160, 320 001 536] IQ4_NL, 28.8 GB, mmap lazy en disco;
+90 bytes por fila. Cada token trae 3 n-gramas × 8 cabezas = 24 filas por hash, 49k filas por ubatch de 2048,
+que tras ordenar y fusionar son ~30k rangos de una página de 4 KiB cada uno, aleatorios sobre 28.8 GB:
+120-190 MB de E/S de páginas por ubatch para 4.4 MB de datos útiles. El hash cuesta 0.1 ms.
+
+Medido (por ubatch de 2048, medias de 18 ubatches; primeros ubatches hasta 190 ms):
+
+| Variante | set_inputs | compute host | gpu_wait | total | prefill |
+|---|---|---|---|---|---|
+| `posix_madvise` por rango (producción) | 150 | 1130 | 2510 | 3818 | 489.5 t/s |
+| `process_madvise` por lotes de 1024 rangos | 168 frente a 158 | | | | sin cambio |
+| lotes repartidos en 4 hilos | 117 | 1167 | 2505 | 3819 | 489.0 t/s |
+| lotes repartidos en 8 hilos | 78 | 1201 | 2496 | 3803 | 491.4 t/s |
+
+Lo que se ahorra en `set_inputs` reaparece íntegro en `compute` (la suma de ambos es constante, 1280 ms): el
+`get_rows` del PLE en CPU espera esas mismas páginas. El costo es el dispositivo sirviendo ~30k lecturas
+aleatorias de 4 KiB por ubatch (130-150 ms), no el encolado en el hilo principal. Decode sin efecto en
+todas (el reparto en hilos solo se activaba con 2048+ rangos; un ubatch de decode trae ≤ 192).
+
+El read-ahead del siguiente ubatch (`get_next_ubatch`, que existía) nunca corre en producción: con
+batch = ubatch cada `llama_decode` lleva un solo ubatch (`next = 0.0 ms` en todos). Con `BATCH=8192`
+(knob nuevo del launcher, strix-halo 1d44594; ubatch 2048) sí corre, y se midió con el encolado del siguiente en el hilo
+principal y en un hilo aparte:
+
+| Config | prefill | re-prefill 2k | decode | PLE por ubatch |
+|---|---|---|---|---|
+| base 2048 | 494.5 t/s | 448.7 t/s | 36.3-39.9 t/s | prefetch 134-137 |
+| batch 8192, siguiente en el hilo principal | 486.9 (−1.5 %) | 455.0 | 35.1-35.6 | prefetch 45 (páginas ya pedidas) + next 87 |
+| batch 8192, siguiente en un hilo | 498.2 (+0.7 %) | 460.6 (+2.7 %) | 34.6-34.8 | prefetch 46 + next 0.1 |
+
+Descartado: el decode cae 5-13 % con el batch grande (los buffers `embd_nextn` y `embd_layer_inp` del
+draft escalan con n_batch), los checkpoints del server se crean por batch (4x más espaciados: el re-prefill
+tras una edición de contexto crece hasta 8192 + nuevos), y el grafo se reconstruye en cada ubatch de 2048
+(`reused 0`), así que el estado "este ubatch ya fue leído" que vive en el objeto de input muere con él y
+el prefetch síncrono se repite (46 ms) aunque las páginas estén pedidas. La generación a temperatura 0 es
+idéntica entre 2048 y 8192 en el turno 1 y difiere desde el turno 2 (otro punto de checkpoint, otro corte
+de ubatches en el re-prefill); dentro de una misma config es idéntica entre corridas.
+
+Conclusión: el input PLE cuesta 130-190 ms por ubatch de 2048 (3.6-5 % del ciclo de 3.8 s) y es E/S. La
+única forma de quitarlo es leer las filas del batch siguiente mientras computa el actual, y con batch =
+ubatch eso exige que el server pase los tokens del próximo batch al contexto (hint) y que el estado viva
+en el contexto, no en el grafo: cambio transversal server → contexto → input del modelo, techo 3.9 % de
+prefill más lo que hoy espere el `get_rows` dentro de `compute` (sin atribuir). No se implementa sin
+decisión del Director. Código: la instrumentación queda (inerte sin la variable); los helpers medidos sin
+ganancia se retiraron.
+
+Hallazgos laterales de la ventana: (1) el gate de descargas del launcher (`pgrep -x curl`) atrapaba su propio
+`curl` de health y mató una recarga de producción en menos de 1 s (00:46, producción caída 9 min); ahora
+ignora los procesos que apuntan a 127.0.0.1 y el log de la carga anterior se conserva como
+`.strix.log.prev` (strix-halo 9fae19f, 4ac4e01). (2) `~/.local/bin/llama-server --version` reporta el
+commit del 2026-09-09: el ejecutable es un stub que no se relinkea; las librerías que mapea producción son
+las de `build/bin` y llevan el build vigente. (3) El "compute host" de 1130 ms por ubatch (30 % del ciclo)
+sigue sin atribuir entre la grabación de comandos Vulkan y el gather PLE con sus faults.
+
