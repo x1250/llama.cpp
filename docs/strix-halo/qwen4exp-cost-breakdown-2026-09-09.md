@@ -23,7 +23,9 @@ Cronología del prefill de 39.5k a 40k (misma máquina, mismo rig):
 | FA sparse token-major (4ac37b4a4) | 88.8 s | 445 | −6.3 % |
 | epílogo de escala del MUL_MAT_ID (cad680f62) | 86.8 s | 455 | −2.4 % |
 | tile medio alineado (6459c5bb9) | 85.8 s | 461 | −1.3 % |
-| hc inject fusionado en down (c12f6777c, archivo hcdi) | **80.8 s** | **489** | −5.8 %, decode +15 % |
+| hc inject fusionado en down (c12f6777c, archivo hcdi) | 80.8 s | 489 | −5.8 %, decode +15 % |
+| 2026-09-17: cherry-picks de upstream (build 396) | 81.5 s | 485 | correcciones, sin efecto |
+| gate y up fusionados (archivo hcdi-gu, 2026-09-18) | **80.9 s** | **488** | −0.8 %, re-prefill −2.8 % |
 
 Lo que sigue es el documento original del 2026-09-09 con sus secciones anotadas; el desglose de
 la sección 2 está reemplazado por el perfil del build actual.
@@ -532,7 +534,7 @@ cadena de medición completa (base primero y último, MTP on, determinismo).
 
 | # | Palanca | Ganancia estimada | Riesgo / coste | Comprobación previa |
 |---|---|---|---|---|
-| 1 | Vía 18: gate y up de expertos en un solo tensor `ffn_gate_up_exps` (un MUL_MAT_ID de m=1280 en vez de dos de 640; el loader ya lo soporta) | −1 a −2 s | bajo: transformación del archivo como la de `hc_*_down_inject` + rig | ninguna |
+| 1 | Vía 18: gate y up de expertos en un solo tensor `ffn_gate_up_exps`. **Hecha (2026-09-18, sección 15): −0.6 s de prefill, −2.8 % de re-prefill, PPL idéntica; archivo `nl3s-hcdi-gu-oproj8` en producción** | −1 a −2 s | bajo | ninguno |
 | 2 | Vía 2 bis: lista por token de la FA sparse construida desde los índices del selector QSA (hoy el prepass barre la fila de máscara entera, 40k columnas por token) y las 4 filas coopmat vacías | −2 a −3 s a 40k, más a mayor profundidad | medio: los índices deben llegar al nodo FA (grafo) y el prepass cambia | diseño del paso índices → listas; perf logger del nodo FA por profundidad |
 | 3 | Desquantizado IQ3_S en el kernel coopmat de MUL_MAT_ID (recuento de instrucciones, cargas de 16 bits, tabla en shmem) | −2 a −3 s | medio-alto: días; el loader integer-dot de hoy fue correcto pero −2.1 % | microbench por variante (sección 12 como base: 9.0-9.2 ms) |
 | 4 | Vía 12: host (`prefetch_ple_rows`, 20k llamadas síncronas por ubatch; huecos entre submisiones, 204 ms por ciclo) | −2 a −3 s | medio | ya medida (sección 8): techo 4-7 s |
@@ -594,3 +596,27 @@ ubatches cortos de los cortes de imagen pagan el coste fijo por ubatch sin amort
 
 Orden propuesto con la GPU libre: dos ventanas cortas de solo lectura (imágenes, paralelo) para saber
 si hay problema, y en paralelo la vía 18 y el perfil del draft.
+
+## 15. Vía 18 medida: gate y up de los expertos en un solo tensor (2026-09-18, build 396)
+
+`scripts/qwen4exp-merge-gate-up-exps.py` escribe `blk.N.ffn_gate_up_exps.weight` [2560, 1280, 512] con, por
+experto, las filas de gate seguidas de las de up (concatenación de bytes por experto, sin recuantizar;
+la disposición que `build_moe_ffn` parte en las dos vistas). El loader ya aceptaba ambos formatos
+(`create_tensor_gate_up_exps`). Archivo `NL3S/qwen4exp-nl3s-hcdi-gu-oproj8.gguf` (1080 tensores), 7 min
+de copia en el kernel.
+
+Pre-check (test-backend-ops perf, 512 expertos de 10, n = 2048): IQ3_S dos nodos de m=640 18.3 ms frente
+a uno de m=1280 16.8 ms (−8 %); IQ4_NL 16.6 → 15.8 (−5 %).
+
+Rigs de 40k con MTP: base 81.5 s (485 t/s), fusionado **80.9 s (488 t/s, −0.8 %)**, re-prefill 4.70 →
+4.57 s (−2.8 %), decode igual, misma aceptación del draft, depth_repeat idéntico; la base 2 dio 89.5 s con
+presión de E/S (psi_io 9-11 % durante ese prefill, 44 GiB disponibles frente a 47-48 el día anterior) y no
+cuenta. Menos que el microbench (1.4 s por prefill) porque el nodo fusionado ahorra sobre todo el prólogo
+por nodo, que en el modelo solapa con otros nodos.
+
+Gate: graph_diff4 seq_rm 2048,631 con 12156 nodos (144 menos), los mismos 72 SET_ROWS y la misma
+distribución; conversación con imagen ×2 idéntica entre sí y con el archivo anterior; repeat_probe 5/5
+idéntica. La sonda cambió de distribución respecto del archivo anterior ('The' 98.2 % frente a 99.7 %):
+el nodo fusionado no es bit-idéntico al par (otro reparto de tiles y de fusiones del grafo). Perplejidad
+en la misma ventana: fusionado 1.5928 ± 0.0158, anterior 1.5928 ± 0.0158; sin efecto en la calidad.
+Adoptado: `quant = nl3s-hcdi-gu-oproj8`.
