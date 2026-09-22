@@ -11080,6 +11080,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 1280, 2048, 2560));
     }
 
+    // qwen4exp down experts (512 of which 10, m=2560 k=640) as iq4_nl: the integer-dot path at the prefill and
+    // verify batch sizes, 40 rows per expert at 2048
+    for (int n : {3, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
+    }
+
     // qwen4exp dense prefill nodes (n = 2048) with their weight types and as f16 (the bound of a per-node f16
     // shadow): the hyper-connection mixers (m=324 k=10240 with the inject rows merged, m=10240 k=320, m=4 k=10240)
     // and the large projections
