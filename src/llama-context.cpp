@@ -1184,6 +1184,26 @@ void llama_context::set_embeddings(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::hint_next_tokens(llama_seq_id seq_id, llama_pos p0, const llama_token * tokens, int32_t n_tokens) {
+    // LLAMA_NO_NEXT_TOKENS_HINT=1: the hints are dropped (measurement switch)
+    static const bool disabled = getenv("LLAMA_NO_NEXT_TOKENS_HINT") != nullptr;
+
+    if (disabled || tokens == nullptr || n_tokens <= 0) {
+        return;
+    }
+
+    // one run per sequence: a newer hint replaces the older one
+    for (auto & run : next_tokens) {
+        if (run.seq_id == seq_id) {
+            run.p0 = p0;
+            run.tokens.assign(tokens, tokens + n_tokens);
+            return;
+        }
+    }
+
+    next_tokens.push_back({ seq_id, p0, std::vector<llama_token>(tokens, tokens + n_tokens) });
+}
+
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
@@ -2030,6 +2050,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    // the batch is submitted and the device computes it: read ahead for the tokens announced by
+    // llama_hint_next_tokens() now, before the caller waits for the outputs
+    if (!next_tokens.empty()) {
+        model.prefetch_tokens(mctx.get(), next_tokens);
+        next_tokens.clear();
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -3893,6 +3920,10 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+void llama_hint_next_tokens(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, const llama_token * tokens, int32_t n_tokens) {
+    ctx->hint_next_tokens(seq_id, p0, tokens, n_tokens);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {

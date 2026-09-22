@@ -119,6 +119,9 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // see llama_hint_next_tokens()
+    void hint_next_tokens(llama_seq_id seq_id, llama_pos p0, const llama_token * tokens, int32_t n_tokens);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -333,6 +336,9 @@ private:
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+
+    // the tokens announced by llama_hint_next_tokens(), read ahead by the decode that follows
+    std::vector<llama_token_run> next_tokens;
 
     struct swap_info {
         uint32_t i0;

@@ -1899,6 +1899,29 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     }
 }
 
+void llama_kv_cache::get_prev_tokens(llama_seq_id seq_id, llama_pos p0, const llama_token * tokens, uint32_t n_tokens, uint32_t n, std::vector<llama_token> & res) const {
+    res.clear();
+    res.resize(n_tokens*n, LLAMA_TOKEN_NULL);
+
+    if (n == 0) {
+        return;
+    }
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        for (uint32_t j = 0; j < n; ++j) {
+            const llama_pos p = p0 + (llama_pos) i - (llama_pos) (n - j);
+
+            if (p < 0) {
+                continue;
+            }
+
+            res[i*n + j] = p >= p0 ? tokens[p - p0] : cells.seq_pos_tok_le(seq_id, p);
+        }
+    }
+}
+
 size_t llama_kv_cache::total_size() const {
     size_t size = 0;
 
@@ -2828,4 +2851,8 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+void llama_kv_cache_context::get_prev_tokens(llama_seq_id seq_id, llama_pos p0, const llama_token * tokens, uint32_t n_tokens, uint32_t n, std::vector<llama_token> & res) const {
+    kv->get_prev_tokens(seq_id, p0, tokens, n_tokens, n, res);
 }

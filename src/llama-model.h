@@ -768,6 +768,14 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
+    // read ahead the inputs the runs of tokens will need (see llama_hint_next_tokens); mctx is the memory
+    // context of the batch just submitted, so the cells hold its tokens. Only for architectures with inputs
+    // that live on disk (a lazily mapped table); the default does nothing.
+    virtual void prefetch_tokens(const llama_memory_context_i * mctx, const std::vector<llama_token_run> & runs) const {
+        GGML_UNUSED(mctx);
+        GGML_UNUSED(runs);
+    }
+
 protected:
     llama_model_params params;
 

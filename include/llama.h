@@ -1010,6 +1010,18 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
+    // Announce the tokens of one sequence that the caller will decode after the next llama_decode(), i.e. the next
+    // batch of a prompt, at the positions p0, p0 + 1, ... Only a hint: the context reads ahead what those tokens
+    // need (the rows of a lazily mapped table) while the batch computes, the results never depend on it, and a
+    // decode that does not follow the hint costs nothing but the read-ahead. Consumed by the next llama_decode(),
+    // one call per sequence; models without such inputs ignore it.
+    LLAMA_API void llama_hint_next_tokens(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+               const llama_token * tokens,
+                         int32_t   n_tokens);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     //

@@ -1609,11 +1609,18 @@ static void prefetch_ple_rows(const ggml_tensor * t, const std::vector<int32_t> 
     llama_madvise_willneed(base + cur_beg, cur_end - cur_beg);
 }
 
-// the ple_n_heads table rows of every token of a ubatch: prev holds its predecessors, oldest first,
-// n_gram - 1 per token, LLAMA_TOKEN_NULL where there is none (see llama_kv_cache::get_prev_tokens)
-static void ple_hash_rows(const llama_hparams & hp, const llama_ubatch & ubatch, llama_token img_tok,
+// the row of the image token: an image arrives as an embd batch without token ids, but every position still
+// needs a row for ggml_get_rows. Stand in the image token id that the reference hashes, or EOS if the file
+// has no such key (gemma3n and gemma4 do the same with a hardcoded row 0 of per_layer_token_embd).
+static llama_token ple_image_token(const llama_hparams & hp) {
+    return hp.ple_image_token_id != 0 ? (llama_token) hp.ple_image_token_id : (llama_token) hp.ple_eos_token_id;
+}
+
+// the ple_n_heads table rows of every token of a run (tokens == nullptr: the image token for all of them):
+// prev holds its predecessors, oldest first, n_gram - 1 per token, LLAMA_TOKEN_NULL where there is none
+// (see llama_kv_cache::get_prev_tokens)
+static void ple_hash_rows(const llama_hparams & hp, int64_t n_tokens, const llama_token * tokens, llama_token img_tok,
         const std::vector<llama_token> & prev, std::vector<int32_t> & idx) {
-    const int64_t n_tokens = ubatch.n_tokens;
     const int64_t n_gram   = hp.ple_ngram_size;
     const int64_t n_heads  = hp.ple_n_heads;
     const int64_t per_gram = hp.ple_heads_per_ngram;
@@ -1627,7 +1634,7 @@ static void ple_hash_rows(const llama_hparams & hp, const llama_ubatch & ubatch,
         // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
         // the EOS of the token itself does not cut its own context, as in the reference
         std::vector<int64_t> ctx(n_gram);
-        ctx[0] = ubatch.token ? ubatch.token[i] : img_tok;
+        ctx[0] = tokens ? tokens[i] : img_tok;
         bool cut = false;
         for (int64_t s = 1; s < n_gram; ++s) {
             // predecessor s positions back
@@ -1685,12 +1692,7 @@ static void ple_prev_tokens_ahead(const llama_kv_cache_context * mctx, const lla
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
-    // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
-    // stand in the image token id that the reference hashes, or EOS if the file has no such key
-    // gemma3n and gemma4 do the same with a hardcoded row 0 of per_layer_token_embd.
-    const llama_token img_tok = hp.ple_image_token_id != 0
-        ? (llama_token) hp.ple_image_token_id
-        : (llama_token) hp.ple_eos_token_id;
+    const llama_token img_tok = ple_image_token(hp);
 
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t n_prev   = hp.ple_ngram_size - 1;
@@ -1710,7 +1712,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t t0 = ubatch_timing ? ggml_time_us() : 0;
 
     std::vector<int32_t> idx;
-    ple_hash_rows(hp, *ubatch, img_tok, prev, idx);
+    ple_hash_rows(hp, n_tokens, ubatch->token, img_tok, prev, idx);
     const int64_t t1 = ubatch_timing ? ggml_time_us() : 0;
 
     prefetch_ple_rows(pmodel.per_layer_tok_embd, idx);
@@ -1723,13 +1725,35 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     // queues the reads, so by its own set_input they are resident instead of being waited for
     if (const llama_ubatch * next = mctx->get_next_ubatch(); next != nullptr && next->token != nullptr) {
         ple_prev_tokens_ahead(mctx, *next, n_prev, prev);
-        ple_hash_rows(hp, *next, img_tok, prev, idx);
+        ple_hash_rows(hp, next->n_tokens, next->token, img_tok, prev, idx);
         prefetch_ple_rows(pmodel.per_layer_tok_embd, idx);
     }
     if (ubatch_timing && n_tokens >= 2048) {
         const int64_t t4 = ggml_time_us();
         fprintf(stderr, "ple input detail: n_tokens = %" PRId64 ", hash = %.1f, prefetch = %.1f, set = %.1f, next = %.1f\n",
                 n_tokens, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0, (t4 - t3) / 1000.0);
+    }
+}
+
+// the PLE rows of the tokens announced for the next batch (llama_hint_next_tokens) are read while this
+// batch computes; the predecessors of the first ones are in the cells, the batch just submitted included
+void llama_model_qwen4exp::prefetch_tokens(const llama_memory_context_i * mctx, const std::vector<llama_token_run> & runs) const {
+    const auto & hp = hparams;
+
+    const auto * mctx_attn = static_cast<const llama_memory_hybrid_idx_context *>(mctx)->get_attn();
+
+    const llama_token img_tok = ple_image_token(hp);
+    const int64_t     n_prev  = hp.ple_ngram_size - 1;
+
+    std::vector<llama_token> prev;
+    std::vector<int32_t>     idx;
+
+    for (const auto & run : runs) {
+        const uint32_t n_tokens = (uint32_t) run.tokens.size();
+
+        mctx_attn->get_prev_tokens(run.seq_id, run.p0, run.tokens.data(), n_tokens, n_prev, prev);
+        ple_hash_rows(hp, n_tokens, run.tokens.data(), img_tok, prev, idx);
+        prefetch_ple_rows(per_layer_tok_embd, idx);
     }
 }
 

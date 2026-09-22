@@ -3602,6 +3602,25 @@ private:
                         }
                     }
 
+                    // the rows of the next chunk of this prompt are read ahead while this batch computes
+                    // (llama_hint_next_tokens): the text tokens up to the next media chunk, at most one batch.
+                    // Copied one by one: with media in the prompt the plain token array is not exposed.
+                    {
+                        llama_tokens next_tokens;
+                        for (int32_t i = slot.prompt.n_tokens(); i < slot.task->n_tokens() && (int32_t) next_tokens.size() < n_batch; ++i) {
+                            const llama_token tok = input_tokens[i];
+                            if (tok == LLAMA_TOKEN_NULL) {
+                                break;
+                            }
+                            next_tokens.push_back(tok);
+                        }
+
+                        if (!next_tokens.empty()) {
+                            llama_hint_next_tokens(ctx_tgt, slot.id, slot.prompt.tokens.pos_next(),
+                                    next_tokens.data(), (int32_t) next_tokens.size());
+                        }
+                    }
+
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
 

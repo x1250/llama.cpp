@@ -243,6 +243,10 @@ public:
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // the same for a run of n_tokens consecutive tokens of one sequence starting at p0 that is not in the cache
+    // yet: the cells resolve the positions before p0, the run resolves the rest (same layout of res)
+    void get_prev_tokens(llama_seq_id seq_id, llama_pos p0, const llama_token * tokens, uint32_t n_tokens, uint32_t n, std::vector<llama_token> & res) const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -431,6 +435,7 @@ public:
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+    void get_prev_tokens(llama_seq_id seq_id, llama_pos p0, const llama_token * tokens, uint32_t n_tokens, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     llama_memory_status status;

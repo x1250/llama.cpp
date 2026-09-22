@@ -2353,6 +2353,9 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // the PLE rows of the announced tokens (llama_hint_next_tokens) are read ahead
+    void prefetch_tokens(const llama_memory_context_i * mctx, const std::vector<llama_token_run> & runs) const override;
+
     // the down and inject weights of both mixers of a layer: the merged tensor [hc_dim, hc_lr + hc] when
     // the file carries it, else the separate ones
     void create_tensor_hc_down_inject(llama_layer & layer, int bid, int64_t hc_dim, int64_t hc_lr, int64_t hc, int flags);

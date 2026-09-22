@@ -11,6 +11,14 @@
 #include <memory>
 #include <unordered_map>
 
+// consecutive tokens of one sequence, the first one at p0
+struct llama_token_run {
+    llama_seq_id seq_id;
+    llama_pos    p0;
+
+    std::vector<llama_token> tokens;
+};
+
 // keep this struct lightweight
 struct llama_ubatch {
     bool equal_seqs() const {
