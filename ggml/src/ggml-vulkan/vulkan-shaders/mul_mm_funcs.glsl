@@ -502,7 +502,57 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                                    (sign &   8) != 0 ? -v.w : v.w));
 #elif defined(DATA_A_IQ3_S)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+            const uint k_pair = row * LOAD_VEC_A / 2;
+#if LOAD_VEC_A == 16
+            // 16 values per idx: four grid indices, two sign bytes, one qh and one scale nibble
+            const uint ib   = idx / 16;
+            const uint iqs4 = idx % 16;          // 0..15: qs[4 * iqs4 .. 4 * iqs4 + 3]
+            const uint iqs  = 4 * iqs4;
+            const uint iqh  = iqs / 8;
 
+            const float d = float(data_a[ib].d);
+            const uint qs01 = uint(data_a_packed16[ib].qs[2 * iqs4]);
+            const uint qs23 = uint(data_a_packed16[ib].qs[2 * iqs4 + 1]);
+            const uint qh = data_a[ib].qh[iqh];
+            const uint sign16 = uint(data_a_packed16[ib].signs[iqs4]);   // nibble j: values 4 * j .. 4 * j + 3
+            const uint scale = data_a[ib].scales[iqs / 16];
+            const float db = d * (1 + 2 * ((scale >> (4 * (iqh & 1))) & 0xf));
+            const uint qhs = qh << (8 - (iqs % 8));   // bit 8 + j is the high bit of qs[iqs + j]
+            const vec4 v0 = db * vec4(unpack8(iq3s_grid[(qs01 & 0xff) | ( qhs       & 256)]));
+            const vec4 v1 = db * vec4(unpack8(iq3s_grid[(qs01 >> 8)   | ((qhs >> 1) & 256)]));
+            const vec4 v2 = db * vec4(unpack8(iq3s_grid[(qs23 & 0xff) | ((qhs >> 2) & 256)]));
+            const vec4 v3 = db * vec4(unpack8(iq3s_grid[(qs23 >> 8)   | ((qhs >> 3) & 256)]));
+
+            store_a(col, k_pair,     FLOAT_TYPEV2((sign16 &      1) != 0 ? -v0.x : v0.x, (sign16 &      2) != 0 ? -v0.y : v0.y));
+            store_a(col, k_pair + 1, FLOAT_TYPEV2((sign16 &      4) != 0 ? -v0.z : v0.z, (sign16 &      8) != 0 ? -v0.w : v0.w));
+            store_a(col, k_pair + 2, FLOAT_TYPEV2((sign16 &   0x10) != 0 ? -v1.x : v1.x, (sign16 &   0x20) != 0 ? -v1.y : v1.y));
+            store_a(col, k_pair + 3, FLOAT_TYPEV2((sign16 &   0x40) != 0 ? -v1.z : v1.z, (sign16 &   0x80) != 0 ? -v1.w : v1.w));
+            store_a(col, k_pair + 4, FLOAT_TYPEV2((sign16 &  0x100) != 0 ? -v2.x : v2.x, (sign16 &  0x200) != 0 ? -v2.y : v2.y));
+            store_a(col, k_pair + 5, FLOAT_TYPEV2((sign16 &  0x400) != 0 ? -v2.z : v2.z, (sign16 &  0x800) != 0 ? -v2.w : v2.w));
+            store_a(col, k_pair + 6, FLOAT_TYPEV2((sign16 & 0x1000) != 0 ? -v3.x : v3.x, (sign16 & 0x2000) != 0 ? -v3.y : v3.y));
+            store_a(col, k_pair + 7, FLOAT_TYPEV2((sign16 & 0x4000) != 0 ? -v3.z : v3.z, (sign16 & 0x8000) != 0 ? -v3.w : v3.w));
+#elif LOAD_VEC_A == 8
+            // 8 values per idx: two grid indices, one sign byte, one qh and one scale nibble
+            const uint ib   = idx / 32;
+            const uint iqs2 = idx % 32;          // 0..31: qs[2 * iqs2], qs[2 * iqs2 + 1]
+            const uint iqs  = 2 * iqs2;
+            const uint iqh  = iqs / 8;
+
+            const float d = float(data_a[ib].d);
+            const uint qs01 = uint(data_a_packed16[ib].qs[iqs2]);
+            const uint qh = data_a[ib].qh[iqh];
+            const uint sign8 = data_a[ib].signs[iqs2];   // low nibble: values 0..3, high nibble: 4..7
+            const uint scale = data_a[ib].scales[iqs / 16];
+            const float db = d * (1 + 2 * ((scale >> (4 * (iqh & 1))) & 0xf));
+            const uint qhs = qh << (8 - (iqs % 8));
+            const vec4 v0 = db * vec4(unpack8(iq3s_grid[(qs01 & 0xff) | ( qhs       & 256)]));
+            const vec4 v1 = db * vec4(unpack8(iq3s_grid[(qs01 >> 8)   | ((qhs >> 1) & 256)]));
+
+            store_a(col, k_pair,     FLOAT_TYPEV2((sign8 &    1) != 0 ? -v0.x : v0.x, (sign8 &    2) != 0 ? -v0.y : v0.y));
+            store_a(col, k_pair + 1, FLOAT_TYPEV2((sign8 &    4) != 0 ? -v0.z : v0.z, (sign8 &    8) != 0 ? -v0.w : v0.w));
+            store_a(col, k_pair + 2, FLOAT_TYPEV2((sign8 & 0x10) != 0 ? -v1.x : v1.x, (sign8 & 0x20) != 0 ? -v1.y : v1.y));
+            store_a(col, k_pair + 3, FLOAT_TYPEV2((sign8 & 0x40) != 0 ? -v1.z : v1.z, (sign8 & 0x80) != 0 ? -v1.w : v1.w));
+#else
             const uint ib = idx / 64;            // 4 values per idx
             const uint iqs = idx % 64;           // 0..63
             const uint iqh = iqs / 8;
@@ -517,11 +567,11 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint32_t grid = iq3s_grid[qs | ((qh << (8 - (iqs % 8))) & 256)];
             const vec4 v = db * vec4(unpack8(grid));
 
-            const uint k_pair = row * LOAD_VEC_A / 2;
             store_a(col, k_pair,     FLOAT_TYPEV2((sign &   1) != 0 ? -v.x : v.x,
                                                    (sign &   2) != 0 ? -v.y : v.y));
             store_a(col, k_pair + 1, FLOAT_TYPEV2((sign &   4) != 0 ? -v.z : v.z,
                                                    (sign &   8) != 0 ? -v.w : v.w));
+#endif
 #elif defined(DATA_A_IQ4_XS)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
