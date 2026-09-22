@@ -2,12 +2,12 @@
 
 ## Estado actual (2026-09-18)
 
-- Árbol: master `8177aecf8` (build 399) más la instrumentación de la sección 16. Producción: `strix load
-  qwen38flash` (NP=2, `-c 524288` = 262144 × 2 slots, batch = ubatch 2048, KV q8_0, lazy mode auto, draft
-  MTP IQ4_NL n-max 2, mmproj, `--ctx-checkpoints 8`), archivo `NL3S/qwen4exp-nl3s-hcdi-gu-oproj8.gguf`
+- Árbol: master con el recorte del draft (sección 19, build 405). Producción: `strix load qwen38flash`
+  (NP=2, `-c 524288` = 262144 × 2 slots, batch = ubatch 2048, KV q8_0, lazy mode auto, draft MTP IQ4_NL
+  n-max 2, mmproj, `--ctx-checkpoints 8`), archivo `NL3S/qwen4exp-nl3s-hcdi-gu-oproj8.gguf`
   (`quant = nl3s-hcdi-gu-oproj8`).
-- Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **80.9 s (488 t/s)**,
-  re-prefill de 2k 4.57 s, decode 36-41 t/s. Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
+- Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **76.8 s (515 t/s)**,
+  re-prefill de 2k 4.27 s, decode 37-41 t/s. Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13. Desglose por nodo vigente: sección 2. Las secciones 5-12 son el
   registro de cada ventana de medición, en orden cronológico.
@@ -28,6 +28,8 @@ Cronología del prefill de 39.5k a 40k (misma máquina, mismo rig):
 | 2026-09-17: cherry-picks de upstream (build 396) | 81.5 s | 485 | correcciones, sin efecto |
 | gate y up fusionados (archivo hcdi-gu, 2026-09-18) | **80.9 s** | **488** | −0.8 %, re-prefill −2.8 % |
 | vía 12 medida (2026-09-18, sección 16) | 80.9 s | 488 | cerrada sin cambio: el input PLE es E/S |
+| lote de riesgo bajo (2026-09-22, sección 18) | 80.4-80.5 s | 491 | sin cambio |
+| draft MTP recortado a las filas de salida (2026-09-22, sección 19) | **76.8 s** | **515** | −4.6 %, re-prefill −6.8 % |
 
 Lo que sigue es el documento original del 2026-09-09 con sus secciones anotadas; el desglose de
 la sección 2 está reemplazado por el perfil del build actual.
@@ -544,15 +546,16 @@ cadena de medición completa (base primero y último, MTP on, determinismo).
 | 6 | Elementwise sobre el residual ancho (RMS_NORM_MUL 2.5 s, HC_GATED_MEAN 1.9, CONCAT+CONT 1.8, ADD 0.8): fusiones adicionales | −1 a −2 s | medio | perfil por nodo (sección 2) |
 | 7 | Vía 1 bis: expertos `down` (k=640, ~9 ms por dispatch, 7.3 TFLOPS): cargas de B fuera del bucle de filas, BK_STEP | −1 s, sin estimar bien | medio | microbench |
 | 8 | Vías menores 19-23: QSA por bloques, ssm_conv (= fila 11), mat-muls diminutos (techo 0.5 s repartido en 2-3 arreglos, sección 18), MMVQ IQ4_NL, GDN chunked | −0.5 a −1 s cada una | bajo-medio | varias |
-| 9 | Draft MTP en prefill recortado a n_outputs (sección 17.1): K/V y el store al cache siguen a n_tokens; Q, gate, FA densa, wo, FFN y hc_combine solo para las filas de salida. Exacto con un solo head (`nextn_predict_layers = 1`) | −3.6 s a 40k (FA densa del draft 2.7 + wo/FFN/hc 0.9); crece con la profundidad | medio: `build_layer_attn` con filas de query distintas de las de K/V; verificar aceptación del draft idéntica | ninguna (código leído) |
+| 9 | Draft MTP en prefill recortado a n_outputs (sección 17.1). **Hecha (2026-09-22, sección 19): −3.7 s de prefill (−4.6 %), re-prefill −6.8 %, exacta; crece con la profundidad** | — | — | — |
 | 10 | Tile medio para la matmul alineada de pocos workgroups (sección 17.2). **Cerrada (2026-09-22, sección 18): igual en el nodo aislado, −1 % en el modelo y no bit-idéntica; el nodo no está limitado por ocupación** | — | — | — |
 | 11 | `ggml_ssm_conv` con un src de historial y x con sus strides (sección 17.3; es la vía 20 de la lista original): hoy `ggml_concat(state, transpose(x))` materializa 84 MB por capa GDN por ubatch solo para el layout | −0.9 s (CONCAT 0.93) | medio: op compartido por todas las arquitecturas SSM (CPU + shader) | ninguna |
 | 12 | RMS norm agrupada como un op (sección 17.4). **Cerrada (2026-09-22, sección 18): el nodo ya corre a 210 GB/s, la premisa de 123 era un error de reparto; un kernel por subgrupo probado y neutro** | — | — | — |
 | 13 | Host entre batches del prompt (sección 17.5). **Hecha (2026-09-22, sección 18): −7 ms por batch (0.2 %); las 2048 sincronizaciones costaban 7 ms, no 60** | — | — | — |
 | 14 | Camino split de la QSA: concats encadenados. **Cerrada por aritmética (2026-09-22, sección 18): 0.1 % incluso a 262k** | — | — | — |
 
-Suma realista de 2, 3 y 9: ~7-9 s (80.9 → ~72-74 s, ~540 t/s). Techo con todo: ~67-69 s. El lote de riesgo bajo
-(filas 10, 12, 13, 14 y vía 21) se midió el 2026-09-22 y no mueve el prefill (sección 18).
+Suma realista de 2 y 3: ~4-6 s (76.8 → ~71-73 s, ~550 t/s). Techo con todo: ~64-66 s. El lote de riesgo bajo
+(filas 10, 12, 13, 14 y vía 21) se midió el 2026-09-22 y no mueve el prefill (sección 18); la fila 9 está hecha
+(sección 19).
 
 Cerradas (no volver sin un dato nuevo):
 
@@ -845,3 +848,35 @@ respecto de la sección 2 salvo el orden de los dos primeros.
 Rigs y herramientas: `mtp_depth.sh` pasa la estimación del footprint con MTP de 74 a 68 GiB (medido en cinco rigs
 del 18/09: 110.6-111.2 disponibles al inicio, 43-44 en el mínimo) con el gate de 40 GiB de CLAUDE.md;
 `prof_nodes2.py` es `prof_nodes.py` con la clave del down actual.
+
+## 19. Fila 9 medida y adoptada: el draft MTP recortado a las filas de salida (2026-09-22, build 405)
+
+`graph_mtp` corría el bloque completo del draft para los 2048 tokens de cada ubatch de prompt y recortaba a las
+filas de salida solo antes de la cabeza. Con un único bloque nextn (`qwen4exp.nextn_predict_layers = 1` en el
+GGUF del draft, `chain_heads = false`) nadie lee su hidden por token: K y V de todos los tokens siguen yendo al
+cache, y Q, sus filas de máscara y el gate se recogen para las filas de salida (`build_layer_attn` con `out_rows`),
+con lo que la atención densa, `wo`, los mezcladores hc y la FFN corren sobre esas filas. El tensor de hand-over se
+expande al grafo para que el host siga leyendo sus filas de salida (el primer intento asertó en
+`llama-context.cpp:2010` por no hacerlo). La condición es la del tronco (`!embeddings_nextn ||
+embeddings_nextn_masked`, el contexto draft corre masked) más un solo stream en la máscara; `LLAMA_MTP_NO_TRIM=1`
+restaura el bloque completo. Sin recorte en los batches de verificación (todas las filas son salida) ni en el draft
+de un token; los batches de imagen no pasan por el draft.
+
+Rigs de 40k con MTP, misma cadena (base = `LLAMA_MTP_NO_TRIM=1`):
+
+| Rig | Prefill 39.5k | Re-prefill 2k | Decode | Ubatch del draft | Aceptación |
+|---|---|---|---|---|---|
+| base 1 | 80.51 s (490.7 t/s) | 4.59 s (447.6) | 36.8-40.4 | 232 ms | 153/202, 161/187 |
+| **recorte** | **76.77 s (514.7)** | **4.27 s (480.2)** | 37.4-41.3 | **64 ms** (gpu_wait 170 → 27) | 153/202, 161/187 |
+| base 3 | 80.40 s (491.4) | 4.57 s (449.1) | 37.4-40.3 | 221 ms | 153/202, 161/187 |
+
+**−3.7 s (−4.6 %) de prefill y −6.8 % de re-prefill**, decode igual. Exactitud: los turnos a temperatura 0 (1-5)
+idénticos entre base y recorte (6-8 son muestreados a 0.7 y difieren igual que entre dos bases); `depth_repeat`
+idéntico; probe 5/5 con la distribución de siempre (98.2 %); conversación texto → imagen → texto ×2 idéntica entre
+sí y con la de la ventana gu (sección 15). La ganancia crece con la profundidad: la FA densa del draft es lineal en
+n_kv (30 ms por ubatch a 8k, 49 a 15k en el perfil de la sección 18), así que a 126k el ahorro por ubatch es ~3
+veces mayor. Adoptado; producción recargada con el recorte activo.
+
+Anotación lateral: la conversación con imagen b corrió a 17-19 t/s de decode y 47.7 s de imagen (a: 36-40 t/s y
+30.5 s), con las mismas respuestas: otra carga en la máquina durante ese minuto, no el cambio.
+
