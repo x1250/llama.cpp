@@ -190,31 +190,68 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
-static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
-    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
-    GGML_ASSERT(n_kv_max > 0 && n_kv_max <= tensor->ne[0]);
+// the sparse mask rows: per row, n_kv_max distinct columns in a shuffled order, of which the first
+// `count` are the finite entries (count varies with the row); the mask and its candidate index
+// tensor (ggml_flash_attn_ext_set_kv_idx) are written from the same draw
+struct sparse_mask_row {
+    std::vector<int32_t> cols;   // n_kv_max distinct columns, shuffled
+    int64_t              count;  // the finite ones: cols[0..count)
+};
 
-    const int64_t ne0 = tensor->ne[0];
-    const int64_t nrows = ggml_nrows(tensor);
-    std::vector<float> data_f32(ggml_nelements(tensor), -INFINITY);
-    std::vector<ggml_fp16_t> data_f16(ggml_nelements(tensor));
+static std::vector<sparse_mask_row> sparse_mask_rows(int64_t ne0, int64_t nrows, int64_t n_kv_max) {
+    GGML_ASSERT(n_kv_max > 0 && n_kv_max <= ne0);
+
     std::vector<int32_t> order(ne0);
     for (int64_t i = 0; i < ne0; ++i) {
         order[i] = i;
     }
 
+    std::vector<sparse_mask_row> rows(nrows);
     std::mt19937 gen(0x5A17);
     for (int64_t row = 0; row < nrows; ++row) {
         std::shuffle(order.begin(), order.end(), gen);
-        const int64_t count = n_kv_max - row % std::min<int64_t>(n_kv_max, 17);
-        std::sort(order.begin(), order.begin() + count);
-        for (int64_t i = 0; i < count; ++i) {
-            data_f32[row*ne0 + order[i]] = -0.03125f * (1 + (i + row) % 7);
+        rows[row].cols.assign(order.begin(), order.begin() + n_kv_max);
+        rows[row].count = n_kv_max - row % std::min<int64_t>(n_kv_max, 17);
+    }
+    return rows;
+}
+
+static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+
+    const int64_t ne0 = tensor->ne[0];
+    const int64_t nrows = ggml_nrows(tensor);
+    std::vector<float> data_f32(ggml_nelements(tensor), -INFINITY);
+    std::vector<ggml_fp16_t> data_f16(ggml_nelements(tensor));
+
+    const auto rows = sparse_mask_rows(ne0, nrows, n_kv_max);
+    for (int64_t row = 0; row < nrows; ++row) {
+        std::vector<int32_t> cols(rows[row].cols.begin(), rows[row].cols.begin() + rows[row].count);
+        std::sort(cols.begin(), cols.end());
+        for (int64_t i = 0; i < (int64_t) cols.size(); ++i) {
+            data_f32[row*ne0 + cols[i]] = -0.03125f * (1 + (i + row) % 7);
         }
     }
 
     ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+}
+
+// the candidates of every mask row, in their shuffled order: the finite columns and, after them,
+// masked ones (a backend must skip those)
+static void init_tensor_kv_idx_sparse(ggml_tensor * tensor, int64_t ne0_mask, int64_t n_kv_max) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_I32);
+    GGML_ASSERT(tensor->ne[0] == n_kv_max);
+
+    const int64_t nrows = ggml_nrows(tensor);
+    std::vector<int32_t> data(ggml_nelements(tensor));
+
+    const auto rows = sparse_mask_rows(ne0_mask, nrows, n_kv_max);
+    for (int64_t row = 0; row < nrows; ++row) {
+        std::copy(rows[row].cols.begin(), rows[row].cols.end(), data.begin() + row*n_kv_max);
+    }
+
+    ggml_backend_tensor_set(tensor, data.data(), 0, data.size()*sizeof(int32_t));
 }
 
 // generate a lower triangular matrix
@@ -462,6 +499,7 @@ static std::string var_to_str(ggml_scale_mode mode) {
 #define VARS_TO_STR15(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) VAR_TO_STR(a) + "," + VARS_TO_STR14(b, c, d, e, f, g, h, i, j, k, l, m, n, o)
 #define VARS_TO_STR16(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) VAR_TO_STR(a) + "," + VARS_TO_STR15(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p)
 #define VARS_TO_STR17(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) VAR_TO_STR(a) + "," + VARS_TO_STR16(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
+#define VARS_TO_STR18(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r) VAR_TO_STR(a) + "," + VARS_TO_STR17(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r)
 
 #ifdef GGML_USE_SYCL
 static bool inline _isinf(float f) {
@@ -7746,9 +7784,10 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    const bool kv_idx; // the candidate columns of every mask row given to the op (ggml_flash_attn_ext_set_kv_idx)
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR18(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, kv_idx);
     }
 
     double max_nmse_err() override {
@@ -7765,9 +7804,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool kv_idx = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), kv_idx(kv_idx) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7828,6 +7867,12 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
+        if (kv_idx) {
+            GGML_ASSERT(mask && n_kv_max > 0);
+            ggml_tensor * idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_kv_max, nb, 1, nr23[1]);
+            ggml_set_name(idx, "kv_idx");
+            ggml_flash_attn_ext_set_kv_idx(out, idx);
+        }
         ggml_prec_set_acc(out, prec);
         ggml_set_name(out, "out");
 
@@ -7845,6 +7890,8 @@ struct test_flash_attn_ext : public test_case {
                 } else {
                     init_tensor_kq_mask(t);
                 }
+            } else if (strcmp(t->name, "kv_idx") == 0) {
+                init_tensor_kv_idx_sparse(t, kv, n_kv_max);
             } else {
                 init_tensor_uniform(t);
             }
@@ -10807,11 +10854,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // qwen4exp shapes: head 256, 2 KV heads, GQA 12; the bounds keep kv >= 8 x n_kv_max, where the Vulkan
     // sparse path runs, and the last pairs use the model's own 2051-cell selection. Batches of 64 rows
     // and more take the compact mode (per-tile gathered rows), the rest the index mode
-    for (const auto & c : std::vector<std::tuple<int64_t, int, int64_t>>{{4096, 1, 64}, {4096, 3, 512}, {4096, 512, 64}, {16384, 1, 1024},
-                                                                          {16384, 16, 64}, {16384, 64, 1024}, {32768, 1, 2051}, {32768, 3, 2051},
-                                                                          {32768, 128, 2051}, {131072, 3, 2051}, {131072, 128, 2051}, {131072, 512, 2051}}) {
-        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, std::get<0>(c), std::get<1>(c), true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, std::get<2>(c)));
+    // With kv_idx the op also receives the candidate columns of every row (the finite ones and masked
+    // ones after them, shuffled): the Vulkan index mode builds its lists from them
+    for (bool kv_idx : {false, true}) {
+        for (const auto & c : std::vector<std::tuple<int64_t, int, int64_t>>{{4096, 1, 64}, {4096, 3, 512}, {4096, 512, 64}, {16384, 1, 1024},
+                                                                              {16384, 16, 64}, {16384, 64, 1024}, {32768, 1, 2051}, {32768, 3, 2051},
+                                                                              {32768, 128, 2051}, {131072, 3, 2051}, {131072, 128, 2051}, {131072, 512, 2051}}) {
+            for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, std::get<0>(c), std::get<1>(c), true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, std::get<2>(c), kv_idx));
+            }
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0));
@@ -11100,6 +11151,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // qwen4exp hyper-connection norm of the wide residual: RMS_NORM + MUL by the per-stream gamma [2560, 4]
     test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, {2560, 4, 2048, 1}, {2560, 4, 1, 1}, 1e-6f));
+
+    // qwen4exp QSA attention at depth (head 256, 2 KV heads, GQA 12, q8_0 cache, 2051-cell selection): the
+    // token-major sparse index mode, its lists built by scanning the mask rows or from the candidate columns
+    // (512 rows: the token-major index mode of a prefill; 3 rows: the compact mode of a verification batch)
+    for (bool kv_idx : {false, true}) {
+        for (int64_t kv : {32768, 131072}) {
+            for (int64_t nb : {512, 3}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051, kv_idx));
+            }
+        }
+    }
 
     // qwen4exp GDN conv fused with its silu (36 layers, 10240 channels, d_conv 4, ubatch 2048): the padded
     // operand and the history + tokens form

@@ -1,0 +1,122 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Sparse K/V lists for flash attention from the candidate columns of every mask row
+// (ggml_flash_attn_ext_set_kv_idx): the candidates whose mask entry is finite in at least one row of
+// a tile of list_rows rows (list_rows = 1: one list per row), in ascending order, the same list
+// flash_attn_sparse_idx.comp builds by scanning the rows, so the attention accumulates the same cells
+// in the same order whichever prepass built the list. One workgroup per (tile, batch): the candidates
+// set their bit in a shared bitmap of the columns, and the set bits are compacted in column order, so
+// the list does not depend on the order the candidates came in and repeats collapse. Output as
+// flash_attn_sparse_idx.comp: counts[n_lists] then lists[n_lists][list_stride].
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 256;
+layout (constant_id = 1) const uint NUM_SUBGROUPS = 4;
+layout (constant_id = 2) const uint WORDS = 2048;   // bitmap words (32 columns each), >= ceil(nem0 / 32)
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer M {float16_t data_m[];};
+layout (binding = 1) readonly buffer I {int data_i[];};
+layout (binding = 2) buffer L {uint data_l[];};
+
+layout (push_constant) uniform parameter {
+    uint nem0;
+    uint nem1;
+    uint nem2;
+    uint nem3;
+    uint nbm1;
+    uint nbm2;
+    uint nbm3;
+    uint n_idx;
+    uint nbi1;
+    uint nbi2;
+    uint nbi3;
+    uint list_stride;
+    uint list_rows;
+    uint list_tiles;
+};
+
+shared uint bits[WORDS];
+shared uint sg_total[NUM_SUBGROUPS];
+
+float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint i1  = gl_WorkGroupID.x;                   // tile of list_rows mask rows
+    const uint ib  = gl_WorkGroupID.y;                   // mask batch: i3 * nem2 + i2
+    const uint i2  = ib % nem2;
+    const uint i3  = ib / nem2;
+
+    const uint li        = ib * list_tiles + i1;
+    const uint n_lists   = list_tiles * nem2 * nem3;
+    const uint list_base = n_lists + li * list_stride;
+    const uint row0      = i1 * list_rows;
+    const uint row1      = min(row0 + list_rows, nem1);
+    const uint m_base    = i2 * nbm2 + i3 * nbm3;
+    const uint i_base    = i2 * nbi2 + i3 * nbi3;
+
+    const uint n_words = (nem0 + 31) / 32;
+
+    for (uint w = tid; w < n_words; w += BLOCK_SIZE) {
+        bits[w] = 0;
+    }
+    barrier();
+
+    // the finite candidates of every row of the tile set their bit
+    for (uint r = row0; r < row1; ++r) {
+        const uint m_row = m_base + r * nbm1;
+        const uint i_row = i_base + r * nbi1;
+        for (uint k = tid; k < n_idx; k += BLOCK_SIZE) {
+            const int c = data_i[i_row + k];
+            if (c >= 0 && uint(c) < nem0 && float(data_m[m_row + uint(c)]) > NEG_FLT_MAX_OVER_2) {
+                atomicOr(bits[uint(c) >> 5], 1u << (uint(c) & 31));
+            }
+        }
+    }
+    barrier();
+
+    // every thread owns a run of words; its cells go after those of the threads before it
+    const uint per_thread = (n_words + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const uint w0 = tid * per_thread;
+    const uint w1 = min(w0 + per_thread, n_words);
+
+    uint mine = 0;
+    for (uint w = w0; w < w1; ++w) {
+        mine += bitCount(bits[w]);
+    }
+
+    const uint sg_excl = subgroupExclusiveAdd(mine);
+    if (gl_SubgroupInvocationID == gl_SubgroupSize - 1) {
+        sg_total[gl_SubgroupID] = sg_excl + mine;
+    }
+    barrier();
+
+    uint base = sg_excl;
+    uint total = 0;
+    [[unroll]] for (uint s = 0; s < NUM_SUBGROUPS; ++s) {
+        base  += (s < gl_SubgroupID) ? sg_total[s] : 0u;
+        total += sg_total[s];
+    }
+
+    for (uint w = w0; w < w1; ++w) {
+        uint word = bits[w];
+        while (word != 0) {
+            const uint b = findLSB(word);
+            word &= word - 1;
+            if (base < list_stride) {
+                data_l[list_base + base] = w * 32 + b;
+            }
+            base++;
+        }
+    }
+
+    if (tid == 0) {
+        data_l[li] = min(total, list_stride);
+    }
+}

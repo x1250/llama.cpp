@@ -1188,6 +1188,7 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
+            ggml_tensor * kv_idx,  // [n_kv_max, n_tokens, 1, n_stream] the candidate cells of every mask row (nullptr: none)
                   float   kq_scale,
                     int   il) const;
 

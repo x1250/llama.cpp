@@ -1145,10 +1145,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
 
     // every mask row keeps at most n_top_k finite cells, so a backend with sparse flash attention
-    // can attend those cells only (ggml_flash_attn_ext_set_n_kv_max); the others ignore the bound
-    const int64_t n_kv_max = qsa_sparse_fa_enabled() ? top_k->ne[0] : 0;
+    // can attend those cells only (ggml_flash_attn_ext_set_n_kv_max) and build each row's list from
+    // the selection itself instead of scanning the row (ggml_flash_attn_ext_set_kv_idx: top_k is
+    // laid out like the mask rows); the others ignore both
+    const bool    sparse   = qsa_sparse_fa_enabled();
+    const int64_t n_kv_max = sparse ? top_k->ne[0] : 0;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, n_kv_max, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, n_kv_max, sparse ? top_k : nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     return cur;
@@ -1268,7 +1271,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
         gate = ggml_get_rows(ctx0, gate, out_rows);
 
-        cur = build_attn_mha(q_out, k, v, nullptr, mask_out, nullptr, nullptr, 0, kq_scale, il);
+        cur = build_attn_mha(q_out, k, v, nullptr, mask_out, nullptr, nullptr, 0, nullptr, kq_scale, il);
         if (inp->self_v_rot) {
             cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
         }
@@ -1325,7 +1328,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
                         out_b = build_attn_qsa(q_b, k_s, v_s, top_k_b, mask_b, kq_scale, il);
                     } else {
-                        out_b = build_attn_mha(q_b, k_s, v_s, nullptr, mask_b, nullptr, nullptr, 0, kq_scale, il);
+                        out_b = build_attn_mha(q_b, k_s, v_s, nullptr, mask_b, nullptr, nullptr, 0, nullptr, kq_scale, il);
                         cb(out_b, "kqv_out", il);
                     }
 

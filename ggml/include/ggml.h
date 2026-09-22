@@ -2514,6 +2514,14 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // The columns that may hold the finite entries of every mask row, distinct within a row:
+    //   idx: [n_idx, ne31, ne32, ne33] I32, one row of candidates per mask row (n_idx bounds n_kv_max)
+    // A sparse backend builds each row's cell list from them instead of scanning the row; a candidate
+    // outside the mask or at a -INFINITY entry is skipped. Set NULL to drop them.
+    GGML_API void ggml_flash_attn_ext_set_kv_idx(
+            struct ggml_tensor * a,
+            struct ggml_tensor * idx);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

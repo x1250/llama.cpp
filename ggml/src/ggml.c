@@ -5571,6 +5571,27 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+void ggml_flash_attn_ext_set_kv_idx(
+        struct ggml_tensor * a,
+        struct ggml_tensor * idx) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    if (!idx) {
+        a->src[5] = NULL;
+        return;
+    }
+
+    const struct ggml_tensor * mask = a->src[3];
+
+    GGML_ASSERT(mask != NULL);
+    GGML_ASSERT(idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(idx->ne[1] == mask->ne[1]);
+    GGML_ASSERT(idx->ne[2] == mask->ne[2]);
+    GGML_ASSERT(idx->ne[3] == mask->ne[3]);
+
+    a->src[5] = idx;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

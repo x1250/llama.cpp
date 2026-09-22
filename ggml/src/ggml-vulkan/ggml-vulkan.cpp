@@ -1172,6 +1172,7 @@ struct vk_device_struct {
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
     std::map<uint32_t, vk_pipeline> pipeline_fa_sparse_idx;   // keyed by the mask rows per list
+    std::map<uint32_t, vk_pipeline> pipeline_fa_sparse_list;  // keyed by the bitmap words (power of two >= the mask columns / 32)
     std::map<std::pair<ggml_type, ggml_type>, vk_pipeline> pipeline_fa_sparse_gather;   // keyed by (K type, V type)
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
@@ -1519,6 +1520,20 @@ struct vk_op_flash_attn_sparse_idx_push_constants {
     uint32_t chunk_cols;   // 0: one workgroup per tile; else columns per workgroup
     uint32_t chunk_pass;   // chunked: 1 = write the chunk counts, 2 = place the cells after the chunks before
 };
+
+// the per-row lists built from the candidate columns of ggml_flash_attn_ext_set_kv_idx
+// (see flash_attn_sparse_list.comp): the finite candidates compacted through a shared bitmap of the row
+struct vk_op_flash_attn_sparse_list_push_constants {
+    uint32_t nem0, nem1, nem2, nem3;
+    uint32_t nbm1, nbm2, nbm3;
+    uint32_t n_idx;
+    uint32_t nbi1, nbi2, nbi3;
+    uint32_t list_stride;
+    uint32_t list_rows;    // mask rows per list: 1 in the index mode, the tile's rows in the compact mode
+    uint32_t list_tiles;
+};
+// the bitmap is shared memory (one bit per mask column): 64 KB, 524288 columns
+#define FA_SPARSE_LIST_MAX_WORDS 16384u
 
 // flag bits of vk_fa_pipeline_state for the sparse K/V shader variant and its compact mode
 #define FA_PIPELINE_FLAG_SPARSE 16u
@@ -6155,6 +6170,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     for (auto &it : device->pipeline_fa_sparse_idx) {
         ggml_vk_create_pipeline(device, it.second, "fa_sparse_idx", fa_sparse_idx_len, fa_sparse_idx_data, "main", 2, sizeof(vk_op_flash_attn_sparse_idx_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, it.first, FA_SPARSE_IDX_ITERS}, 1, true, true, device->subgroup_size);
+    }
+
+    for (auto &it : device->pipeline_fa_sparse_list) {
+        ggml_vk_create_pipeline(device, it.second, "fa_sparse_list", fa_sparse_list_len, fa_sparse_list_data, "main", 3, sizeof(vk_op_flash_attn_sparse_list_push_constants), {1, 1, 1}, {256, 256 / device->subgroup_size, it.first}, 1, true, true, device->subgroup_size);
     }
 
     for (auto &it : device->pipeline_fa_sparse_gather) {
@@ -11699,7 +11718,7 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     return supported;
 }
 
-static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, const ggml_tensor * kv_idx, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
     std::cerr << "), (" << v << ", name=" << v->name << ", type=" << v->type << ", ne0=" << v->ne[0] << ", ne1=" << v->ne[1] << ", ne2=" << v->ne[2] << ", ne3=" << v->ne[3] << ", nb0=" << v->nb[0] << ", nb1=" << v->nb[1] << ", nb2=" << v->nb[2] << ", nb3=" << v->nb[3];
@@ -11845,10 +11864,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>> seen;
         if (seen.insert({ (uint32_t) neq1, (uint32_t) KV, (uint32_t) n_kv_max, (uint32_t) nem2 }).second) {
             fprintf(stderr, "sparse fa: neq1=%u KV=%u n_kv_max=%d nem1=%u nem2=%u nem3=%u neq3=%u k=%s v=%s q_stride=%u path=%d "
-                            "sparse_candidate=%d compact_candidate=%d use_sparse=%d use_compact=%d gqa_ratio=%u\n",
+                            "sparse_candidate=%d compact_candidate=%d use_sparse=%d use_compact=%d gqa_ratio=%u kv_idx=%d\n",
                     (uint32_t) neq1, (uint32_t) KV, n_kv_max, nem1, nem2, nem3, (uint32_t) neq3,
                     ggml_type_name(k->type), ggml_type_name(v->type), (uint32_t) (nbq1 / ggml_type_size(q->type)), (int) tuning_params.path,
-                    sparse_candidate, compact_candidate, use_sparse, use_compact, gqa_ratio);
+                    sparse_candidate, compact_candidate, use_sparse, use_compact, gqa_ratio, kv_idx != nullptr ? (int) kv_idx->ne[0] : 0);
         }
     }
     if (compact_candidate && !use_compact) {
@@ -11961,9 +11980,23 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t list_tiles  = use_sparse ? CEIL_DIV(nem1, list_rows) : 0;
     const uint32_t list_stride = use_sparse ? ROUNDUP_POW2(std::min<uint32_t>(KV, (uint32_t) n_kv_max * list_rows), Bc) : 0;
     const uint32_t n_lists     = list_tiles * nem2 * nem3;
+    // the candidate columns of every row (ggml_flash_attn_ext_set_kv_idx): a list is the finite
+    // candidates of its rows compacted through a shared bitmap of the columns instead of a scan of the
+    // whole rows, one workgroup per list whatever the batch, so no chunks either.
+    // GGML_VK_DISABLE_SPARSE_FA_KV_IDX=1 keeps the scan
+    static const bool disable_sparse_fa_kv_idx = getenv("GGML_VK_DISABLE_SPARSE_FA_KV_IDX") != nullptr;
+    const uint32_t n_kv_idx    = kv_idx ? (uint32_t) kv_idx->ne[0] : 0;
+    uint32_t       words_cap   = 64;   // the shader's bitmap: the power of two at or above the mask columns / 32
+    while (words_cap * 32 < nem0) {
+        words_cap <<= 1;
+    }
+    const bool     use_kv_idx  = !disable_sparse_fa_kv_idx && use_sparse && kv_idx != nullptr &&
+                                 kv_idx->type == GGML_TYPE_I32 && kv_idx->nb[0] == sizeof(int32_t) &&
+                                 kv_idx->ne[1] == (int64_t) nem1 && kv_idx->ne[2] == (int64_t) nem2 && kv_idx->ne[3] == (int64_t) nem3 &&
+                                 words_cap <= FA_SPARSE_LIST_MAX_WORDS;
     // a prefill has tiles enough to fill the GPU (one workgroup per tile); a decode has one tile per
     // token and splits the columns into chunks, whose counts follow the lists in the scratch
-    const bool     chunked     = use_sparse && n_lists < 32;
+    const bool     chunked     = use_sparse && !use_kv_idx && n_lists < 32;
     const uint32_t n_chunks    = chunked ? CEIL_DIV(nem0, FA_SPARSE_IDX_CHUNK) : 0;
     const uint64_t sparse_size = use_sparse ? sizeof(uint32_t) * ((uint64_t) n_lists + (uint64_t) n_lists * list_stride + (uint64_t) n_lists * n_chunks) : 0;
     const uint32_t KV_split    = use_sparse ? list_stride : KV;
@@ -12030,20 +12063,36 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         }
     }
 
-    vk_pipeline pipeline_fa_sparse_idx = nullptr;
+    vk_pipeline pipeline_fa_sparse_idx  = nullptr;
+    vk_pipeline pipeline_fa_sparse_list = nullptr;
     if (use_sparse) {
         {
             std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
-            auto &pipelines = ctx->device->pipeline_fa_sparse_idx;
-            auto it = pipelines.find(list_rows);
-            if (it != pipelines.end()) {
-                pipeline_fa_sparse_idx = it->second;
+            if (use_kv_idx) {
+                auto &pipelines = ctx->device->pipeline_fa_sparse_list;
+                auto it = pipelines.find(words_cap);
+                if (it != pipelines.end()) {
+                    pipeline_fa_sparse_list = it->second;
+                } else {
+                    pipelines[words_cap] = pipeline_fa_sparse_list = std::make_shared<vk_pipeline_struct>();
+                }
             } else {
-                pipelines[list_rows] = pipeline_fa_sparse_idx = std::make_shared<vk_pipeline_struct>();
+                auto &pipelines = ctx->device->pipeline_fa_sparse_idx;
+                auto it = pipelines.find(list_rows);
+                if (it != pipelines.end()) {
+                    pipeline_fa_sparse_idx = it->second;
+                } else {
+                    pipelines[list_rows] = pipeline_fa_sparse_idx = std::make_shared<vk_pipeline_struct>();
+                }
             }
         }
-        assert(pipeline_fa_sparse_idx);
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline_fa_sparse_idx, chunked ? 2 : 1);
+        if (use_kv_idx) {
+            assert(pipeline_fa_sparse_list);
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline_fa_sparse_list, 1);
+        } else {
+            assert(pipeline_fa_sparse_idx);
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline_fa_sparse_idx, chunked ? 2 : 1);
+        }
 
         if (ctx->prealloc_size_y < sparse_size) {
             ctx->prealloc_size_y = sparse_size;
@@ -12108,6 +12157,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
     vk_subbuffer idx_buf = use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+    vk_subbuffer kv_idx_buf = use_kv_idx ? ggml_vk_tensor_subbuffer(ctx, kv_idx) : q_buf;
 
     if (use_dequant_kv) {
         const uint64_t fp = sizeof(ggml_fp16_t);
@@ -12139,7 +12189,22 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
 
-    if (use_sparse) {
+    if (use_kv_idx) {
+        // one workgroup per (tile, batch): the finite candidates of its rows in column order (the same list the scan builds)
+        const vk_op_flash_attn_sparse_list_push_constants list_pc = {
+            nem0, nem1, nem2, nem3,
+            (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)),
+            (uint32_t)(mask->nb[2] / sizeof(ggml_fp16_t)),
+            (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)),
+            n_kv_idx,
+            (uint32_t)(kv_idx->nb[1] / sizeof(int32_t)),
+            (uint32_t)(kv_idx->nb[2] / sizeof(int32_t)),
+            (uint32_t)(kv_idx->nb[3] / sizeof(int32_t)),
+            list_stride, list_rows, list_tiles,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_sparse_list, { mask_buf, kv_idx_buf, idx_buf }, list_pc, { list_tiles, nem2 * nem3, 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+    } else if (use_sparse) {
         // a prefill's tiles fill the GPU on their own: one workgroup per tile writes the ascending list.
         // A decode has one tile per token and splits the columns into chunks; two passes place every
         // chunk after the chunks before it, so the list is the same ascending list whichever order the
@@ -17394,7 +17459,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_FLASH_ATTN_EXT:
-        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
+        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node->src[5], node);
 
         break;
 
