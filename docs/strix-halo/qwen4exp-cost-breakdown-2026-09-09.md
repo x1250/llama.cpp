@@ -2,12 +2,12 @@
 
 ## Estado actual (2026-09-22)
 
-- Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410) y las listas de la FA sparse desde la selección QSA (sección 21, build 413).
+- Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410), las listas de la FA sparse desde la selección QSA (sección 21, build 413) y la carga IQ3_S de 16 valores por hilo (sección 22, build 415).
   Producción: `strix load qwen38flash`
   (NP=2, `-c 524288` = 262144 × 2 slots, batch = ubatch 2048, KV q8_0, lazy mode auto, draft MTP IQ4_NL
   n-max 2, mmproj, `--ctx-checkpoints 8`), archivo `NL3S/qwen4exp-nl3s-hcdi-gu-oproj8.gguf`
   (`quant = nl3s-hcdi-gu-oproj8`).
-- Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **73.3 s (539 t/s)**,
+- Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **72.9 s (542 t/s)**,
   re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s. Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13. Desglose por nodo vigente: sección 2. Las secciones 5-12 son el
@@ -33,6 +33,7 @@ Cronología del prefill de 39.5k a 40k (misma máquina, mismo rig):
 | draft MTP recortado a las filas de salida (2026-09-22, sección 19) | **76.8 s** | **515** | −4.6 %, re-prefill −6.8 % |
 | hint del server para el PLE + conv sin concat + guard y BK_STEP 2 del MMQ (2026-09-22, sección 20) | **73.3 s** | **539** | −5.0 %: el hint −3.3 s, las otras ~−0.6 s |
 | listas de la FA sparse desde la selección QSA, vía 2 bis (2026-09-22, sección 21) | 73.2 s | 539 | −0.2 s (−0.3 %); −9 % del nodo FA a 131k |
+| carga IQ3_S de 16 valores por hilo en el coopmat (2026-09-22, sección 22) | **72.9 s** | **542** | −0.6 s (−0.9 %), bit-idéntica |
 
 Lo que sigue es el documento original del 2026-09-09 con sus secciones anotadas; el desglose de
 la sección 2 está reemplazado por el perfil del build actual.
@@ -543,7 +544,7 @@ cadena de medición completa (base primero y último, MTP on, determinismo).
 |---|---|---|---|---|
 | 1 | Vía 18: gate y up de expertos en un solo tensor `ffn_gate_up_exps`. **Hecha (2026-09-18, sección 15): −0.6 s de prefill, −2.8 % de re-prefill, PPL idéntica; archivo `nl3s-hcdi-gu-oproj8` en producción** | −1 a −2 s | bajo | ninguno |
 | 2 | Vía 2 bis: lista por token de la FA sparse construida desde los índices del selector QSA (hoy el prepass barre la fila de máscara entera, 40k columnas por token) y las 4 filas coopmat vacías. **Hecha la lista desde los índices (2026-09-22, sección 21): −0.4 s a 40k, −0.2 s a 55k, −9 % del nodo a 131k; el barrido era ~1 % del nodo, no el 40 % que suponía la sección 9: lo que queda de la FA sparse son los gathers de K/V por token. Las 4 filas vacías no cambian ese tráfico** | — | — | — |
-| 3 | Desquantizado IQ3_S en el kernel coopmat de MUL_MAT_ID (recuento de instrucciones, cargas de 16 bits, tabla en shmem) | −2 a −3 s | medio-alto: días; el loader integer-dot de hoy fue correcto pero −2.1 % | microbench por variante (sección 12 como base: 9.0-9.2 ms) |
+| 3 | Desquantizado IQ3_S en el kernel coopmat de MUL_MAT_ID (recuento de instrucciones, cargas de 16 bits, tabla en shmem). **Hecha la anchura de carga (2026-09-22, sección 22): 16 valores por hilo, −4 a −7 % del nodo, −0.6 s en el modelo, bit-idéntica. Lo que queda del nodo es el MMA desperdiciado del tile (128 columnas para 40 filas por experto), no el desquantizado** | ≤ −0.5 s más | medio | microbench |
 | 4 | Vía 12: host (`prefetch_ple_rows`, 20k llamadas síncronas por ubatch; huecos entre submisiones, 204 ms por ciclo). **Cerrada (2026-09-18, sección 16): el input PLE son 130-190 ms de E/S aleatoria por ubatch; agrupar o repartir el encolado no cambia el total, batch 8192 pierde decode. El read-ahead entre decodes por hint del server está hecho (2026-09-22, sección 20): −3.3 s, set_inputs 157 → 27 ms por ubatch** | — | — | — |
 | 5 | Vía 16: el draft reutiliza la selección QSA del target (sin indexador en el draft) | −2 s a 40k, crece con la profundidad | medio-alto: flujo del MTP | diseño |
 | 6 | Elementwise sobre el residual ancho (RMS_NORM_MUL 2.5 s, HC_GATED_MEAN 1.9, CONT 0.85, ADD 0.8): fusiones adicionales. **Rebajada (2026-09-22, sección 20): quitar el CONCAT entero (0.93 s en el perfil serializado) dio −0.13 s en el modelo; el backend solapa estos nodos con las matmuls, así que el perfil serializado sobreestima su costo real varias veces** | ≤ −0.5 s | medio | perfil por nodo (sección 2) |
@@ -1050,3 +1051,33 @@ en el microbench. Adoptada: exacta, contenida (un op opcional, un shader, un par
 decode el único trabajo que crecía linealmente con la profundidad del caché por token; la estimación de
 −2 a −3 s de la sección 13 estaba equivocada en un orden de magnitud porque atribuía al prepass lo que son
 los gathers de K/V.
+
+## 22. IQ3_S en el coopmat de expertos: la anchura de carga (2026-09-22, build 415)
+
+El tile coopmat de MUL_MAT_ID es 128×128×16 con 128 hilos: por bloque de k cada hilo desquantiza 16 valores de A.
+Con IQ3_S los cargaba de 4 en 4: cinco cargas de bytes (d, qs, qh, signs, scales) y una búsqueda en la rejilla
+por cada 4 valores. Ahora 16 por hilo (un hilo por fila del tile): dos lecturas empaquetadas de qs, un byte de
+qh, dos de signos y un nibble de escala por 16 valores, cuatro búsquedas; la ruta de 8 queda disponible y la de
+4 es el código anterior (`load_vec_quant` de `iq3_s` en el generador). Los valores escritos a memoria compartida
+son los mismos, así que el resultado es bit-idéntico.
+
+Microbench (test-backend-ops perf, 512 expertos de 10, n = 2048; dos sesiones, la segunda entre paréntesis):
+
+| Forma | 4 (antes) | 8 | 16 |
+|---|---|---|---|
+| m=640 k=2560 | 9.57 ms | 9.28 | **8.91 (9.22)** |
+| m=1280 k=2560 (gate+up de producción) | 16.85 | 16.36 | **16.21 (16.64)** |
+| 64 expertos (320 filas por experto) | 5.60 | 5.05 | **5.01** |
+
+Correctness por variante: MUL_MAT_ID 935/935, MUL_MAT_ID_FUSION 23/23, MUL_MAT 1176/1176. Rigs de 40k con MTP
+(chain_v18b, base = build 414): base 73.79 / 73.38 s, **lv 16 72.94 s (541.7 t/s, −0.6 s)**, lv 16 + sonda de
+tile pequeño (`GGML_VK_MMID_SMALLN=1`) 72.76 s (−0.2 s más, ruido: la sonda sigue apagada). Textos greedy
+idénticos a la base en los 5 turnos, depth_repeat 5/5, probe igual a la 405, imágenes idénticas, graph_diff4
+con los 72 SET_ROWS.
+
+Lo que enseña el microbench sobre el nodo: a 512 expertos con 40 filas por experto, cada tile de 128 columnas
+calcula 3.2× las multiplicaciones útiles, y el nodo corre a ~24 TFLOPS brutos (7.5 útiles), cerca del techo
+coopmat de los densos. El desquantizado de A es secundario (por eso 16 valores dan 4-7 % y no 20-30 %), y la
+sonda de tile pequeño no ayuda porque el tile chico carga A proporcionalmente más veces por columna útil. Lo
+que queda en este nodo es el MMA desperdiciado, y la única vía contra eso es agrupar filas de varios expertos
+en un tile (otra arquitectura de kernel), no el desquantizado.
