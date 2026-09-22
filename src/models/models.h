@@ -2380,13 +2380,16 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inject,
                             int   il);
 
+        // out_rows (I32 token indices) restricts the queries, the gate and wo to those rows: K and V of every
+        // token still go to the cache. Dense attention only (the MTP draft in a prompt ubatch)
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il);
+                            int   il,
+                    ggml_tensor * out_rows = nullptr);
 
         // rotate q/k/v for a quantized cache and store k/v; returns the rotated q
         ggml_tensor * build_attn_store(

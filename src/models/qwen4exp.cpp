@@ -544,8 +544,22 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "mtp_hc_attn_pre", il);
 
     // dense attention for the draft: a QSA indexer would need a cache of its own, and one
-    // block spends its time reading weights rather than attending
-    cur = build_layer_attn(inp_attn, nullptr, cur, inp_pos, sections, il);
+    // block spends its time reading weights rather than attending.
+    // In a prompt ubatch only the rows that produce an output feed the head, and this single block has no
+    // chained head reading its hidden state per token: K and V of every token still go to the cache, the
+    // attention, the gate, wo, the mixers and the FFN run for the output rows only. The condition is the
+    // trunk's (an unmasked hand-over needs every position). LLAMA_MTP_NO_TRIM=1 keeps the full block
+    static const bool no_trim = getenv("LLAMA_MTP_NO_TRIM") != nullptr;
+    const bool trim = !no_trim && inp_out_ids != nullptr && n_outputs < n_tokens &&
+                      (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) &&
+                      inp_attn->get_kq_mask()->ne[3] == 1;
+    cur = build_layer_attn(inp_attn, nullptr, cur, inp_pos, sections, il, trim ? inp_out_ids : nullptr);
+    if (trim) {
+        inject = ggml_get_rows(ctx0, inject, inp_out_ids);
+        inpL   = ggml_reshape_2d(ctx0, inpL, hc*n_embd, n_tokens);
+        inpL   = ggml_get_rows(ctx0, inpL, inp_out_ids);
+        inpL   = ggml_reshape_3d(ctx0, inpL, n_embd, hc, n_outputs);
+    }
     inpL = build_hc_combine(inpL, cur, inject, il);
     cb(inpL, "mtp_hc_attn_post", il);
 
@@ -559,12 +573,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     inpL = build_hc_combine(inpL, cur, inject, il);
     cb(inpL, "mtp_l_out", il);
 
-    ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, hc*n_embd, n_tokens);
+    ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, hc*n_embd, inpL->ne[2]);
 
-    // a chained head reads the streams back the way the trunk hands them over
+    // a chained head reads the streams back the way the trunk hands them over, and the host reads it after
+    // the compute: it has to be in the graph even when nothing below consumes it (the trimmed block)
     res->t_h_nextn = flat;
+    ggml_build_forward_expand(gf, flat);
 
-    if (inp_out_ids) {
+    if (inp_out_ids && !trim) {
         flat = ggml_get_rows(ctx0, flat, inp_out_ids);
         inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
     }
@@ -1144,7 +1160,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
-        int                       il) {
+        int                       il,
+        ggml_tensor *             out_rows) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -1226,7 +1243,37 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    if (!qsa && !split) {
+    if (out_rows != nullptr) {
+        // K and V of every token go to the cache; the queries, their mask rows and the gate are gathered for
+        // the output rows only, so the attention, wo and everything after run on those rows. The cells the
+        // kept queries attend to are the same, and a block of a few queries needs no split
+        GGML_ASSERT(!qsa);
+        GGML_ASSERT(inp->get_kq_mask()->ne[3] == 1);
+
+        Qcur = build_attn_store(inp, Qcur, Kcur, Vcur, il);
+
+        ggml_tensor * k       = inp->mctx->get_k(ctx0, il);
+        ggml_tensor * v       = inp->mctx->get_v(ctx0, il);
+        ggml_tensor * kq_mask = inp->get_kq_mask();
+
+        const int64_t n_out = out_rows->ne[0];
+
+        ggml_tensor * q_out = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, Qcur, n_embd_head*n_head, n_tokens), out_rows);
+        q_out = ggml_reshape_3d(ctx0, q_out, n_embd_head, n_head, n_out);
+        cb(q_out, "q_out", il);
+
+        ggml_tensor * mask_out = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, kq_mask, kq_mask->ne[0], n_tokens), out_rows);
+        mask_out = ggml_cast(ctx0, mask_out, kq_mask->type);
+        cb(mask_out, "kq_mask_out", il);
+
+        gate = ggml_get_rows(ctx0, gate, out_rows);
+
+        cur = build_attn_mha(q_out, k, v, nullptr, mask_out, nullptr, nullptr, 0, kq_scale, il);
+        if (inp->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        }
+        cb(cur, "kqv_out", il);
+    } else if (!qsa && !split) {
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
