@@ -1,13 +1,14 @@
 # qwen4exp en Strix Halo: dónde va el tiempo y vías de optimización (2026-09-09, actualizado 2026-09-16)
 
-## Estado actual (2026-09-18)
+## Estado actual (2026-09-22)
 
-- Árbol: master con el recorte del draft (sección 19, build 405). Producción: `strix load qwen38flash`
+- Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410).
+  Producción: `strix load qwen38flash`
   (NP=2, `-c 524288` = 262144 × 2 slots, batch = ubatch 2048, KV q8_0, lazy mode auto, draft MTP IQ4_NL
   n-max 2, mmproj, `--ctx-checkpoints 8`), archivo `NL3S/qwen4exp-nl3s-hcdi-gu-oproj8.gguf`
   (`quant = nl3s-hcdi-gu-oproj8`).
-- Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **76.8 s (515 t/s)**,
-  re-prefill de 2k 4.27 s, decode 37-41 t/s. Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
+- Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **73.3 s (539 t/s)**,
+  re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s. Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13. Desglose por nodo vigente: sección 2. Las secciones 5-12 son el
   registro de cada ventana de medición, en orden cronológico.
@@ -30,6 +31,7 @@ Cronología del prefill de 39.5k a 40k (misma máquina, mismo rig):
 | vía 12 medida (2026-09-18, sección 16) | 80.9 s | 488 | cerrada sin cambio: el input PLE es E/S |
 | lote de riesgo bajo (2026-09-22, sección 18) | 80.4-80.5 s | 491 | sin cambio |
 | draft MTP recortado a las filas de salida (2026-09-22, sección 19) | **76.8 s** | **515** | −4.6 %, re-prefill −6.8 % |
+| hint del server para el PLE + conv sin concat + guard y BK_STEP 2 del MMQ (2026-09-22, sección 20) | **73.3 s** | **539** | −5.0 %: el hint −3.3 s, las otras ~−0.6 s |
 
 Lo que sigue es el documento original del 2026-09-09 con sus secciones anotadas; el desglose de
 la sección 2 está reemplazado por el perfil del build actual.
@@ -541,21 +543,21 @@ cadena de medición completa (base primero y último, MTP on, determinismo).
 | 1 | Vía 18: gate y up de expertos en un solo tensor `ffn_gate_up_exps`. **Hecha (2026-09-18, sección 15): −0.6 s de prefill, −2.8 % de re-prefill, PPL idéntica; archivo `nl3s-hcdi-gu-oproj8` en producción** | −1 a −2 s | bajo | ninguno |
 | 2 | Vía 2 bis: lista por token de la FA sparse construida desde los índices del selector QSA (hoy el prepass barre la fila de máscara entera, 40k columnas por token) y las 4 filas coopmat vacías | −2 a −3 s a 40k, más a mayor profundidad | medio: los índices deben llegar al nodo FA (grafo) y el prepass cambia | diseño del paso índices → listas; perf logger del nodo FA por profundidad |
 | 3 | Desquantizado IQ3_S en el kernel coopmat de MUL_MAT_ID (recuento de instrucciones, cargas de 16 bits, tabla en shmem) | −2 a −3 s | medio-alto: días; el loader integer-dot de hoy fue correcto pero −2.1 % | microbench por variante (sección 12 como base: 9.0-9.2 ms) |
-| 4 | Vía 12: host (`prefetch_ple_rows`, 20k llamadas síncronas por ubatch; huecos entre submisiones, 204 ms por ciclo). **Cerrada (2026-09-18, sección 16): el input PLE son 130-190 ms de E/S aleatoria por ubatch; agrupar o repartir el encolado no cambia el total, batch 8192 pierde decode. Queda solo el read-ahead entre decodes por hint del server (techo 3.9 %)** | −2 a −3 s | medio | ya medida (sección 8): techo 4-7 s |
+| 4 | Vía 12: host (`prefetch_ple_rows`, 20k llamadas síncronas por ubatch; huecos entre submisiones, 204 ms por ciclo). **Cerrada (2026-09-18, sección 16): el input PLE son 130-190 ms de E/S aleatoria por ubatch; agrupar o repartir el encolado no cambia el total, batch 8192 pierde decode. El read-ahead entre decodes por hint del server está hecho (2026-09-22, sección 20): −3.3 s, set_inputs 157 → 27 ms por ubatch** | — | — | — |
 | 5 | Vía 16: el draft reutiliza la selección QSA del target (sin indexador en el draft) | −2 s a 40k, crece con la profundidad | medio-alto: flujo del MTP | diseño |
-| 6 | Elementwise sobre el residual ancho (RMS_NORM_MUL 2.5 s, HC_GATED_MEAN 1.9, CONCAT+CONT 1.8, ADD 0.8): fusiones adicionales | −1 a −2 s | medio | perfil por nodo (sección 2) |
-| 7 | Vía 1 bis: expertos `down` (k=640, ~9 ms por dispatch, 7.3 TFLOPS): cargas de B fuera del bucle de filas, BK_STEP | −1 s, sin estimar bien | medio | microbench |
+| 6 | Elementwise sobre el residual ancho (RMS_NORM_MUL 2.5 s, HC_GATED_MEAN 1.9, CONT 0.85, ADD 0.8): fusiones adicionales. **Rebajada (2026-09-22, sección 20): quitar el CONCAT entero (0.93 s en el perfil serializado) dio −0.13 s en el modelo; el backend solapa estos nodos con las matmuls, así que el perfil serializado sobreestima su costo real varias veces** | ≤ −0.5 s | medio | perfil por nodo (sección 2) |
+| 7 | Vía 1 bis: expertos `down` (k=640, ~9 ms por dispatch, 7.3 TFLOPS): cargas de B fuera del bucle de filas, BK_STEP. **Hecha en parte (2026-09-22, sección 20): ceros en las columnas sin fila del tile, −3.8 % en el nodo MMQ (−0.3 s); BK_STEP=2 medido en el microbench (sección 20)** | — | — | — |
 | 8 | Vías menores 19-23: QSA por bloques, ssm_conv (= fila 11), mat-muls diminutos (techo 0.5 s repartido en 2-3 arreglos, sección 18), MMVQ IQ4_NL, GDN chunked | −0.5 a −1 s cada una | bajo-medio | varias |
 | 9 | Draft MTP en prefill recortado a n_outputs (sección 17.1). **Hecha (2026-09-22, sección 19): −3.7 s de prefill (−4.6 %), re-prefill −6.8 %, exacta; crece con la profundidad** | — | — | — |
 | 10 | Tile medio para la matmul alineada de pocos workgroups (sección 17.2). **Cerrada (2026-09-22, sección 18): igual en el nodo aislado, −1 % en el modelo y no bit-idéntica; el nodo no está limitado por ocupación** | — | — | — |
-| 11 | `ggml_ssm_conv` con un src de historial y x con sus strides (sección 17.3; es la vía 20 de la lista original): hoy `ggml_concat(state, transpose(x))` materializa 84 MB por capa GDN por ubatch solo para el layout | −0.9 s (CONCAT 0.93) | medio: op compartido por todas las arquitecturas SSM (CPU + shader) | ninguna |
+| 11 | `ggml_ssm_conv` con un src de historial y x con sus strides (sección 17.3; es la vía 20 de la lista original): hoy `ggml_concat(state, transpose(x))` materializa 84 MB por capa GDN por ubatch solo para el layout. **Hecha (2026-09-22, sección 20): `ggml_ssm_conv_state`, −0.13 s en el modelo (el concat solapaba con las matmuls), 108 nodos y 117 GB de tráfico menos por prefill, exacta** | — | — | — |
 | 12 | RMS norm agrupada como un op (sección 17.4). **Cerrada (2026-09-22, sección 18): el nodo ya corre a 210 GB/s, la premisa de 123 era un error de reparto; un kernel por subgrupo probado y neutro** | — | — | — |
 | 13 | Host entre batches del prompt (sección 17.5). **Hecha (2026-09-22, sección 18): −7 ms por batch (0.2 %); las 2048 sincronizaciones costaban 7 ms, no 60** | — | — | — |
 | 14 | Camino split de la QSA: concats encadenados. **Cerrada por aritmética (2026-09-22, sección 18): 0.1 % incluso a 262k** | — | — | — |
 
-Suma realista de 2 y 3: ~4-6 s (76.8 → ~71-73 s, ~550 t/s). Techo con todo: ~64-66 s. El lote de riesgo bajo
+Suma realista de 2 y 3: ~4-6 s (73.7 → ~68-70 s, ~570 t/s). Techo con todo: ~62-64 s. El lote de riesgo bajo
 (filas 10, 12, 13, 14 y vía 21) se midió el 2026-09-22 y no mueve el prefill (sección 18); la fila 9 está hecha
-(sección 19).
+(sección 19); el hint del server (fila 4), la fila 11 y parte de la 7 están hechas (sección 20).
 
 Cerradas (no volver sin un dato nuevo):
 
@@ -880,3 +882,112 @@ veces mayor. Adoptado; producción recargada con el recorte activo.
 Anotación lateral: la conversación con imagen b corrió a 17-19 t/s de decode y 47.7 s de imagen (a: 36-40 t/s y
 30.5 s), con las mismas respuestas: otra carga en la máquina durante ese minuto, no el cambio.
 
+## 20. Las tres palancas simples medidas: hint del server para el PLE, conv sin concat, guard del MMQ (2026-09-22, build 407)
+
+Tres cambios en una ventana (chain_v16, base primero y último, MTP on, rig `mtp_depth.sh` de 40k) más una
+segunda de calidad (chain_v16b: perplejidad y el experimento BK_STEP). Base: build 405 con el recorte del
+draft, 77.09 / 77.21 s (512.6 / 511.8 t/s), re-prefill 4.25 s, decode 38.4 t/s; los textos greedy de las
+dos bases son idénticos entre sí (los rigs son reproducibles entre cargas).
+
+| Config | Prefill 39.5k | t/s | Re-prefill 2k | Δ prefill |
+|---|---|---|---|---|
+| base (405) | 77.09 / 77.21 s | 512.6 / 511.8 | 4.25 s | — |
+| **las tres (407)** | **73.65 s** | **536.5** | 4.11-4.20 s | **−3.5 s (−4.5 %)** |
+| sin hint (`LLAMA_NO_NEXT_TOKENS_HINT=1`) | 76.77 s | 514.7 | 4.20 s | −0.4 s |
+| sin conv nueva (`LLAMA_GDN_CONV_CONCAT=1`) | 73.78 s | 535.5 | 4.20 s | −3.4 s |
+
+Reparto: el hint −3.3 s; la conv sin concat −0.13 s; el guard del MMQ ~−0.3 s (por diferencia y por
+microbench). Decode sin cambio en todas (35-41 t/s, mismo rango que la base).
+
+### 20.1 `llama_hint_next_tokens`: las filas PLE del batch siguiente se leen mientras computa el actual
+
+El mecanismo de read-ahead existía (`get_next_ubatch`, sección 16) pero nunca corre con batch = ubatch. Ahora el
+server anuncia en `pre_decode` el siguiente trozo de texto de cada prompt (hasta `n_batch` tokens, hasta el
+próximo chunk de imagen) con `llama_hint_next_tokens(ctx, seq, p0, tokens, n)`; el contexto guarda un run por
+secuencia y, al final de `llama_decode`, con el grafo ya enviado y la GPU computando 2.5 s, llama al hook
+`llama_model::prefetch_tokens` (qwen4exp: predecesores desde las celdas con `get_prev_tokens(seq, p0, tokens)`,
+hash de n-gramas, `madvise WILLNEED` de las filas). Es solo un prefetch: los resultados no dependen de él y un
+decode que no siga el hint solo cuesta esa lectura. Los 87 ms de encolar 30k madvise (sección 16) quedan fuera
+del camino crítico.
+
+Diagnóstico con `LLAMA_INPUT_TIMING=1` (fuerza la espera de la GPU por ubatch, no es producción), por ubatch de 2048:
+
+| | set_inputs | compute | gpu_wait | total | `ple input detail` prefetch |
+|---|---|---|---|---|---|
+| sin hint | 157.2 ms | 1097 | 2449 | 3740 | 141.5 ms |
+| con hint | 27.4 ms | 1079 | 2464 | 3607 | 12.7 ms |
+
+−133 ms por ubatch: la E/S desaparece del `set_inputs` y no reaparece en `compute` (el `get_rows` en CPU ya
+encuentra las páginas), y el prefetch síncrono del ubatch actual baja a 12.7 ms sobre páginas residentes, así que
+no hace falta lógica para saltarlo. El re-prefill de 2k no cambia (una sola batch, el hint cubre 4 tokens).
+
+Incidente: la primera petición con imagen de la verificación mató producción (14:31-14:33): el server copiaba el
+trozo siguiente con `server_tokens::get_tokens()`, que asserta con medios en el prompt. Corregido copiando por
+índice (`operator[]`, se detiene en el primer `LLAMA_TOKEN_NULL`); la conversación texto → imagen → texto es la
+compuerta que lo atrapó y tras el arreglo pasa (5/5 turnos, respuestas idénticas a las de la ventana gu y a las
+de la build 405).
+
+### 20.2 `ggml_ssm_conv_state`: la conv de la GDN lee el historial y `qkv_mixed` sin el concat
+
+Mismo op `GGML_OP_SSM_CONV` con `src[2]` opcional: `state` [d_conv−1, d_inner, n_s] y `x` [d_inner, n_t, n_s]
+(canales contiguos, como sale de la proyección); CPU y Vulkan lo implementan (mismo orden de acumulación, el
+`dot` de 4 taps sobre los mismos valores), los otros nueve backends lo rechazan en `supports_op`. `build_conv_state_at`
+devuelve el historial y escribe las colas de rollback directamente desde `x` (transposición de 3 columnas);
+el concat solo se construye cuando una cola alcanza el historial (ubatches de 1-3 tokens en decode, 245 KB) o
+para la conv dilatada del PLE (una capa). `LLAMA_GDN_CONV_CONCAT=1` restaura el operando concatenado.
+
+Microbench (test-backend-ops perf, 10240 canales, 2048 tokens, silu fusionado): 733 µs el operando concatenado,
+729 µs la forma nueva, 215 GB/s ambas: el kernel ya estaba al ancho de banda. En el modelo −0.13 s por prefill
+frente a los 0.93 s del CONCAT en el perfil serializado: el backend Vulkan solapa los nodos elementwise sin
+dependencias con las matmuls, y quitarlos apenas mueve el total. Eso rebaja la fila 6 (fusiones del residual).
+Quedan 108 nodos menos por grafo (12156 → 12048) y 117 GB menos de tráfico por prefill de 40k. Tests: SSM_CONV
+90/90 y SSM_CONV_BIAS_SILU 180/180 en ambas formas.
+
+### 20.3 MMQ de expertos: ceros en las columnas del tile sin fila
+
+Con el hoisting de ids, `row_ids[]` queda sin inicializar para las columnas del tile por encima de `_ne1` (88
+de 128 con 40 filas por experto) y `mul_mmq.comp` hacía gathers de B con esos índices (dentro o fuera del
+buffer) para resultados que después descarta. Ahora `block_b_to_shmem` recibe `col_in_bounds` y escribe ceros.
+Microbench de la ruta entera (IQ4_NL, 512 de 10, n = 2048): m=640 8.81 → 8.47 ms (−3.8 %), m=1280 17.09 → 16.27
+(−4.8 %), 64 expertos (columnas casi llenas) 5.57 → 5.42; el nodo down (m=2560, k=640, caso perf nuevo) 8.26 ms
+(8.12 TFLOPS). La ruta coopmat, sin tocar, oscila ±3 % entre corridas (IQ3_S 9.26 → 9.58), que es la escala del
+ruido del microbench. MUL_MAT_ID 935/935, MUL_MAT_ID_FUSION 23/23.
+
+BK_STEP=2 para MUL_MAT_ID (dos bloques de k por barrera, la mitad de barreras; `build-bk2` aparte con
+`BUILD_DIR`, solo test-backend-ops): MUL_MAT_ID 935/935, MUL_MAT_ID_FUSION 23/23; microbench frente al guard
+solo, misma sesión: m=640 k=2560 8.47 → 7.70 ms (−9.0 %), m=1280 16.27 → 15.19 (−6.6 %), 64 expertos 5.42 → 5.13
+(−5.4 %), down m=2560 k=640 8.26 → 8.09 (−2.1 %: con k=640 son 20 bloques de k, hay menos barreras que ahorrar).
+En producción solo el down va por la ruta entera (gate/up son IQ3_S coopmat), así que vale ~−0.2 s por prefill;
+se adopta por ser consistente en todas las formas MoE de la ruta entera. Rig de confirmación: sección 20.6.
+Nota de proceso: el rebuild de emergencia de las 14:31 (arreglo del hint) tomó esta línea del árbol antes de
+medirla, así que producción corrió BK_STEP=2 desde las 14:33 con el probe y las imágenes en verde pero sin rig;
+la sección 20.6 lo cierra.
+
+### 20.4 Exactitud
+
+- Determinismo: depth_repeat 5 corridas idénticas (tokens y logprobs); repeat_probe 5/5 con la misma
+  distribución que la build 405 (`'The':98.2%`); textos greedy iguales entre corridas de la misma configuración.
+- No bit-idéntica a la 405: los textos greedy a 40k difieren desde el carácter 478 del turno 1 y el primer
+  logprob de depth_repeat pasa de −0.2109 a −0.2154. Las tres palancas son exactas por construcción (mismos
+  valores, mismo orden de acumulación, o solo prefetch); el cambio de bits viene de otro orden de nodos y otro
+  reparto de fusiones del grafo (108 nodos menos), como en la fusión gate+up (sección 15). Perplejidad en la
+  misma ventana (holdout, c=4096, 12 chunks): **1.5928 ± 0.01584 con la build 407 y 1.5928 ± 0.01584 con la 405**.
+- graph_diff4 (seq_rm, split 2048,631): 72 nodos de 12048 difieren entre corridas, todos `SET_ROWS` de los cachés
+  QSA (`cache_idx_k`, `cache_k`, `cache_v` de las 12 capas, dos ubatches); la build 405 da exactamente lo mismo
+  (72 de 12156). Es un artefacto del tool desde el merge del camino SET_ROWS: compara la vista entera del caché
+  en el momento del nodo, y las celdas del segundo ubatch, aún sin escribir, valen cero en la corrida 1 y guardan
+  el dato en la 2. Los otros 11976 nodos y las probabilidades finales son idénticos. Pendiente: que el tool
+  compare solo las filas escritas.
+
+### 20.5 Compuertas y herramientas
+
+Compuertas de medición: `LLAMA_NO_NEXT_TOKENS_HINT=1`, `LLAMA_GDN_CONV_CONCAT=1`. `build-llama.sh` acepta
+`BUILD_DIR` para un directorio de experimento con las mismas compuertas de memoria. Casos perf nuevos: la conv de
+la GDN en ambas formas y el nodo down IQ4_NL (m=2560, k=640).
+
+### 20.6 BK_STEP=2 confirmado en el modelo (build 410)
+
+Rig de 40k con MTP, mismo día y misma base: 73.65 s (las tres palancas, BK_STEP 1) → **73.26 s (539.3 t/s)** con
+BK_STEP 2, re-prefill 4.16 s, decode igual. Textos greedy de los turnos 1-5 idénticos a los de la corrida sin
+BK_STEP 2 y depth_repeat con los mismos logprobs (`'El' −0.2154`): el cambio no mueve ningún bit (misma
+acumulación por columna, solo cambia cuántos bloques de k entran por barrera). Adoptado.
