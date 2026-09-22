@@ -543,15 +543,16 @@ cadena de medición completa (base primero y último, MTP on, determinismo).
 | 5 | Vía 16: el draft reutiliza la selección QSA del target (sin indexador en el draft) | −2 s a 40k, crece con la profundidad | medio-alto: flujo del MTP | diseño |
 | 6 | Elementwise sobre el residual ancho (RMS_NORM_MUL 2.5 s, HC_GATED_MEAN 1.9, CONCAT+CONT 1.8, ADD 0.8): fusiones adicionales | −1 a −2 s | medio | perfil por nodo (sección 2) |
 | 7 | Vía 1 bis: expertos `down` (k=640, ~9 ms por dispatch, 7.3 TFLOPS): cargas de B fuera del bucle de filas, BK_STEP | −1 s, sin estimar bien | medio | microbench |
-| 8 | Vías menores 19-23: QSA por bloques, ssm_conv, mat-muls diminutos, MMVQ IQ4_NL, GDN chunked | −0.5 a −1 s cada una | bajo-medio | varias |
+| 8 | Vías menores 19-23: QSA por bloques, ssm_conv (= fila 11), mat-muls diminutos (techo 0.5 s repartido en 2-3 arreglos, sección 18), MMVQ IQ4_NL, GDN chunked | −0.5 a −1 s cada una | bajo-medio | varias |
 | 9 | Draft MTP en prefill recortado a n_outputs (sección 17.1): K/V y el store al cache siguen a n_tokens; Q, gate, FA densa, wo, FFN y hc_combine solo para las filas de salida. Exacto con un solo head (`nextn_predict_layers = 1`) | −3.6 s a 40k (FA densa del draft 2.7 + wo/FFN/hc 0.9); crece con la profundidad | medio: `build_layer_attn` con filas de query distintas de las de K/V; verificar aceptación del draft idéntica | ninguna (código leído) |
-| 10 | Tile medio para la matmul alineada de pocos workgroups (sección 17.2): `hc_down_inject` m=324 k=10240 corre el tile L con 48 workgroups en 40 CU (8 TFLOPS); la regla k-alineada del fork exige `!aligned` y no la alcanza | −1.5 a −2 s (el nodo son 3.16 s) | bajo: A/B como 6459c5bb9 + probe | ninguna |
-| 11 | `ggml_ssm_conv` con un src de historial y x con sus strides (sección 17.3): hoy `ggml_concat(state, transpose(x))` materializa 84 MB por capa GDN por ubatch solo para el layout | −0.9 s (CONCAT 0.93) | medio: op compartido por todas las arquitecturas SSM (CPU + shader) | ninguna |
-| 12 | RMS norm agrupada con gamma [n_embd, hc] como un op (sección 17.4): el par RMS_NORM+MUL fusionado corre a 123 GB/s frente a 186-217 de los otros ops del residual | −0.7 s | bajo | ninguna |
-| 13 | Host entre batches del prompt (sección 17.5): una sola sincronización en vez de 2048 y `verify_h` acotado a las filas alcanzables | −1 s (60 ms por batch, 1.6 % del ciclo, techo) | bajo: reescritura equivalente | ninguna |
-| 14 | Camino split de la QSA (n_kv > 32768): salidas por bloque en vistas de un tensor preasignado en vez de concats encadenados (O(B²) copias) | < 0.5 s a 40k; crece hacia 262k | bajo | ninguna |
+| 10 | Tile medio para la matmul alineada de pocos workgroups (sección 17.2). **Cerrada (2026-09-22, sección 18): igual en el nodo aislado, −1 % en el modelo y no bit-idéntica; el nodo no está limitado por ocupación** | — | — | — |
+| 11 | `ggml_ssm_conv` con un src de historial y x con sus strides (sección 17.3; es la vía 20 de la lista original): hoy `ggml_concat(state, transpose(x))` materializa 84 MB por capa GDN por ubatch solo para el layout | −0.9 s (CONCAT 0.93) | medio: op compartido por todas las arquitecturas SSM (CPU + shader) | ninguna |
+| 12 | RMS norm agrupada como un op (sección 17.4). **Cerrada (2026-09-22, sección 18): el nodo ya corre a 210 GB/s, la premisa de 123 era un error de reparto; un kernel por subgrupo probado y neutro** | — | — | — |
+| 13 | Host entre batches del prompt (sección 17.5). **Hecha (2026-09-22, sección 18): −7 ms por batch (0.2 %); las 2048 sincronizaciones costaban 7 ms, no 60** | — | — | — |
+| 14 | Camino split de la QSA: concats encadenados. **Cerrada por aritmética (2026-09-22, sección 18): 0.1 % incluso a 262k** | — | — | — |
 
-Suma realista de 2, 3, 9 y 10: ~9-11 s (80.9 → ~70-72 s, ~560 t/s). Techo con todo: ~65-67 s.
+Suma realista de 2, 3 y 9: ~7-9 s (80.9 → ~72-74 s, ~540 t/s). Techo con todo: ~67-69 s. El lote de riesgo bajo
+(filas 10, 12, 13, 14 y vía 21) se midió el 2026-09-22 y no mueve el prefill (sección 18).
 
 Cerradas (no volver sin un dato nuevo):
 
@@ -793,3 +794,54 @@ contextos (el fork prohíbe dos contextos en vuelo: "syncobj interlock", specula
 - La caché de B convertida del backend tiene una sola entrada (ggml-vulkan.cpp:2620-2623): con las formas
   de este modelo no hay reconversiones que valgan (31.5 MB por capa).
 
+## 18. Lote de riesgo bajo de la sección 17 medido (2026-09-22, build 402)
+
+Orden acordado: filas 10, 13, 14, vía 21 y fila 12; las de riesgo medio quedan para después. Resultado: el lote
+no mueve el prefill. Rigs de 40k con MTP, timing en todos (`LLAMA_INPUT_TIMING=1`), footprint del rig medido
+68 GiB y gate 40 GiB (el escritorio con 10-12 GiB de navegadores dejó MemAvailable en 103-108 y la ventana
+abrió a 113 tras cerrar apps).
+
+| Rig | Prefill 39.5k | Re-prefill 2k | Decode | Ubatch de 2048 | Host entre batches |
+|---|---|---|---|---|---|
+| base 1 (tile y kernel RMS apagados) | 80.28 s (492.2 t/s) | 444.1 t/s | 36.1-39.6 | 3795 ms | 50-57 ms (mediana 53) |
+| fila 10: tile medio para m=324 | 81.10 s (487.2) | 439.3 | 36.5-41.4 | 3825 ms | |
+| fila 12: RMS norm por subgrupo | 80.64 s (490.0) | 451.5 | 36.5-38.1 | 3802 ms | |
+| base 2 | 81.09 s (487.2) | 447.0 | 35.5-39.4 | 3825 ms | |
+
+- Fila 13 (host entre batches): una sola lectura de `embd_nextn` con su única sincronización y un `memcpy` por
+  secuencia en vez de 2048 llamadas que sincronizaban y limpiaban el contexto Vulkan. Medido en el "outside" de la
+  línea de tiempo: 52-82 ms por batch (mediana 60, sección 17) → 50-57 (mediana 53). **−7 ms por batch, 0.2 % del
+  ciclo**: las 2048 sincronizaciones costaban ~7 ms, el resto del batch es otro trabajo host. Se queda por exacta y
+  más simple, no por ganancia.
+- Fila 10 (tile medio para `hc_down_inject` m=324): en el nodo aislado (test-backend-ops perf) tile L 1360.7 µs y
+  tile medio 1358.0 (10 TFLOPS ambos); en el modelo −1 % (487.2 frente a 492.2 t/s, +30 ms por ubatch) y no
+  bit-idéntico (otra aceptación del draft). El nodo no está limitado por ocupación. **Retirada**.
+- Fila 12 (RMS norm por subgrupo: un subgrupo por fila, la fila en registros como vec4, `subgroupAdd`, 4 filas por
+  workgroup): correcta (test-backend-ops RMS_NORM 71/71, par fusionado RMS_NORM_MUL 20/20 con casos nuevos de 256 y
+  2560 columnas, con vista y con gamma [n, 4]); en el nodo aislado 821 µs frente a 809 del kernel actual (192 frente
+  a 194.5 GB/s, ambos en el límite de banda de la iGPU); en el modelo neutra (490.0 frente a 492.2 t/s) y no
+  bit-idéntica; en los grafos de decode del perfil por nodo un 23 % más lenta (994 frente a 808 µs: pocas filas,
+  4 por workgroup). **Retirada**; los tests del par fusionado quedan (no existían). La premisa de la sección 17.4
+  (123 GB/s) era un error de reparto: la familia RMS_NORM_MUL (2.52 s) incluye los QK norms (128, 48, 2048) 0.76 s
+  y otros; el nodo del residual (2560, 4, 2048) son 1.53 s = 0.80 ms por nodo = **210 GB/s**, igual que aislado.
+- Fila 14 (concats del camino split): descartada por aritmética. La salida por bloque de la FA son ~4 MB (256
+  queries × 24 cabezas × 256 × f32); a 262k son 8 bloques por stream y 28 copias por capa: ~1 GB por ubatch, 5 ms
+  sobre 3.8 s (0.1 %).
+- Vía 21 (mat-muls diminutas), con el perfil por nodo fresco (18.8 ubatches, 146 claves): router f32 m=512
+  0.37 s pero a 13.8 TFLOPS (ya eficiente), `m=48` IQ4_NL 0.28 s (1.2 ms por nodo, 0.4 TFLOPS: 16-32 workgroups),
+  `m=1` f32 0.27 s (un producto punto por token en el pipeline de matmul), bf16 m=512 0.23 y m=128 0.10 del
+  indexador, f32 m=256 n=49152 0.12 y m=64 n=196608 0.09 de los resúmenes QSA. Techo realista **0.5 s (0.6 %)**
+  repartido en dos o tres arreglos distintos (m=1 como MUL + SUM_ROWS, tile pequeño para m=48). Queda en las menores
+  con esa cifra; no se abre ventana.
+
+Perfil por nodo fresco del prefill (2026-09-22, kernel RMS apagado; `prof_nodes2.py`, clave del down con la escala
+fusionada): GPU 3594 ms por ubatch = 71.9 s por 20. MUL_MAT 18.35 s (25.5 %), MUL_MAT_ID gate/up IQ3_S 17.01 s
+(23.7 %), FLASH_ATTN_EXT 9.81 s (13.6 %, la densa del draft crece de 30 a 49 ms por ubatch entre 8k y 15k de n_kv),
+MUL_MAT_ID_MUL down 8.57 s (11.9 %), RMS_NORM_MUL 2.52, HC_GATED_MEAN 1.87, HC_INJECT 1.61, GATED_DELTA_NET 1.45,
+MULTI_ADD 1.44, TOPK_QSA 1.32, MUL 0.96, CONCAT 0.93, CONT 0.84, ADD 0.78, SSM_CONV_SILU 0.64. Densos: wqkv q5_K
+3.33, hc_down_inject 3.15, ssm_out 2.59, z 2.02, hc up 1.54, wq 1.44, shexp 0.83, o_proj q8_0 0.75. Sin cambios
+respecto de la sección 2 salvo el orden de los dos primeros.
+
+Rigs y herramientas: `mtp_depth.sh` pasa la estimación del footprint con MTP de 74 a 68 GiB (medido en cinco rigs
+del 18/09: 110.6-111.2 disponibles al inicio, 43-44 en el mínimo) con el gate de 40 GiB de CLAUDE.md;
+`prof_nodes2.py` es `prof_nodes.py` con la clave del down actual.
