@@ -5409,8 +5409,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         }
         case GGML_OP_SSM_CONV: {
-            // assumes d_inner % threads == 0
-            return op->src[0]->ne[1] % 128 == 0;
+            // assumes d_inner % threads == 0; no ggml_ssm_conv_state
+            return op->src[0]->ne[1] % 128 == 0 && op->src[2] == nullptr;
         }
         case GGML_OP_CONT:
             return true;

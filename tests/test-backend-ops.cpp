@@ -4392,24 +4392,42 @@ struct test_hc_inject : public test_case {
 };
 
 
+// the padded operand ne_a = [d_conv - 1 + n_t, d_inner, n_s] of ggml_ssm_conv as the history and the
+// tokens of ggml_ssm_conv_state
+static ggml_tensor * build_ssm_conv_state(ggml_context * ctx, ggml_type type, const std::array<int64_t, 4> & ne_a, ggml_tensor * c) {
+    const int64_t d_conv = c->ne[0];
+
+    ggml_tensor * state = ggml_new_tensor_3d(ctx, type, d_conv - 1, ne_a[1], ne_a[2]);
+    ggml_tensor * x     = ggml_new_tensor_3d(ctx, type, ne_a[1], ne_a[0] - d_conv + 1, ne_a[2]);
+    ggml_set_name(state, "state");
+    ggml_set_name(x, "x");
+
+    return ggml_ssm_conv_state(ctx, state, x, c);
+}
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
     const std::array<int64_t, 4> ne_b;
+    const bool split_state; // ggml_ssm_conv_state
 
     std::string vars() override {
-        return VARS_TO_STR3(type, ne_a, ne_b);
+        return VARS_TO_STR4(type, ne_a, ne_b, split_state);
     }
 
     test_ssm_conv(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne_a = {10, 10, 10, 1},
-            std::array<int64_t, 4> ne_b = {3, 3, 1, 1})
-        : type(type), ne_a(ne_a), ne_b(ne_b) {}
+            std::array<int64_t, 4> ne_b = {3, 3, 1, 1},
+            bool split_state = false)
+        : type(type), ne_a(ne_a), ne_b(ne_b), split_state(split_state) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne_b.data());
+        if (split_state) {
+            return build_ssm_conv_state(ctx, type, ne_a, b);
+        }
         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
-        ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
         return out;
     }
@@ -4421,6 +4439,7 @@ struct test_ssm_conv_bias_silu : public test_case {
     const std::array<int64_t, 4> ne_a;
     const std::array<int64_t, 4> ne_b;
     const bool fuse_bias;
+    const bool split_state; // ggml_ssm_conv_state
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4430,20 +4449,25 @@ struct test_ssm_conv_bias_silu : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne_a, ne_b, fuse_bias);
+        return VARS_TO_STR5(type, ne_a, ne_b, fuse_bias, split_state);
     }
 
     test_ssm_conv_bias_silu(ggml_type type, std::array<int64_t, 4> ne_a, std::array<int64_t, 4> ne_b,
-            bool fuse_bias)
-        : type(type), ne_a(ne_a), ne_b(ne_b), fuse_bias(fuse_bias) {}
+            bool fuse_bias, bool split_state = false)
+        : type(type), ne_a(ne_a), ne_b(ne_b), fuse_bias(fuse_bias), split_state(split_state) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne_b.data());
-        ggml_set_name(a, "a");
         ggml_set_name(b, "b");
 
-        ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
+        ggml_tensor * out;
+        if (split_state) {
+            out = build_ssm_conv_state(ctx, type, ne_a, b);
+        } else {
+            ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+            ggml_set_name(a, "a");
+            out = ggml_ssm_conv(ctx, a, b);
+        }
 
         if (fuse_bias) {
             ggml_tensor * bias = ggml_new_tensor_1d(ctx, type, out->ne[0]);
@@ -9783,34 +9807,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    for (int64_t d_conv : {3, 4, 9}) {
-        for (int64_t d_inner: {1024, 1536, 2048}) {
-            test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
-            test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {2 * d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
-            test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
-            // long token (n_t > 32, exercises the long_token kernel path)
-            test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
-            test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
+    // the padded operand and the history + tokens form (ggml_ssm_conv_state)
+    for (bool split_state : {false, true}) {
+        for (int64_t d_conv : {3, 4, 9}) {
+            for (int64_t d_inner: {1024, 1536, 2048}) {
+                test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}, split_state));
+                test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {2 * d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}, split_state));
+                test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, split_state));
+                // long token (n_t > 32, exercises the long_token kernel path)
+                test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}, split_state));
+                test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, split_state));
+            }
         }
     }
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
-    for (int64_t d_conv : {3, 4, 9}) {
-        for (int64_t d_inner : {1024, 1536, 2048}) {
-            for (bool fuse_bias : {false, true}) {
-                // short token path (n_t <= 32)
-                test_cases.emplace_back(new test_ssm_conv_bias_silu(
-                    GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
-                test_cases.emplace_back(new test_ssm_conv_bias_silu(
-                    GGML_TYPE_F32, {2 * d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
-                test_cases.emplace_back(new test_ssm_conv_bias_silu(
-                    GGML_TYPE_F32, {d_conv, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
-                // long token path (n_t > 32)
-                test_cases.emplace_back(new test_ssm_conv_bias_silu(
-                    GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
-                test_cases.emplace_back(new test_ssm_conv_bias_silu(
-                    GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
+    for (bool split_state : {false, true}) {
+        for (int64_t d_conv : {3, 4, 9}) {
+            for (int64_t d_inner : {1024, 1536, 2048}) {
+                for (bool fuse_bias : {false, true}) {
+                    // short token path (n_t <= 32)
+                    test_cases.emplace_back(new test_ssm_conv_bias_silu(
+                        GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}, fuse_bias, split_state));
+                    test_cases.emplace_back(new test_ssm_conv_bias_silu(
+                        GGML_TYPE_F32, {2 * d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}, fuse_bias, split_state));
+                    test_cases.emplace_back(new test_ssm_conv_bias_silu(
+                        GGML_TYPE_F32, {d_conv, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, fuse_bias, split_state));
+                    // long token path (n_t > 32)
+                    test_cases.emplace_back(new test_ssm_conv_bias_silu(
+                        GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}, fuse_bias, split_state));
+                    test_cases.emplace_back(new test_ssm_conv_bias_silu(
+                        GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, fuse_bias, split_state));
+                }
             }
         }
     }
@@ -11065,6 +11094,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // qwen4exp hyper-connection norm of the wide residual: RMS_NORM + MUL by the per-stream gamma [2560, 4]
     test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, {2560, 4, 2048, 1}, {2560, 4, 1, 1}, 1e-6f));
+
+    // qwen4exp GDN conv fused with its silu (36 layers, 10240 channels, d_conv 4, ubatch 2048): the padded
+    // operand and the history + tokens form
+    for (bool split_state : {false, true}) {
+        test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {3 + 2048, 10240, 1, 1}, {4, 10240, 1, 1}, false, split_state));
+    }
 
     // decode mat-vec with a few columns (MTP verification batches): the qwen4exp f32 router [2560 x 512]
     // and the same shape in f16 / q8_0, 1 to 4 columns

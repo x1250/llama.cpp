@@ -2528,6 +2528,17 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // the same convolution with the history given separately, so that concat(state, transpose(x)) is never materialized:
+    //   state: [d_conv - 1, d_inner, n_s] the previous columns of every channel
+    //   x:     [d_inner, n_t, n_s]        the new columns, channels contiguous (as a projection writes them)
+    //   c:     [d_conv, d_inner]
+    // result:  [d_inner, n_t, n_s], identical to ggml_ssm_conv over the concatenated operand
+    GGML_API struct ggml_tensor * ggml_ssm_conv_state(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,

@@ -2691,7 +2691,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 return true;
             }
         case GGML_OP_SSM_CONV:
-            return true;
+            return op->src[2] == nullptr; // no ggml_ssm_conv_state
         case GGML_OP_CUMSUM:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_TRI:

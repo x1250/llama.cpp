@@ -1406,14 +1406,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // the channels must match how load_arch_tensors sizes wqkv, not ssm_d_inner
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
-    ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, il);
+    // LLAMA_GDN_CONV_CONCAT=1: the padded operand concat(history, transpose(x)) of ggml_ssm_conv, 84 MB per
+    // layer per ubatch of 2048 written and read back for the layout alone; by default the conv reads the
+    // history and qkv_mixed as they are
+    static const bool conv_concat = getenv("LLAMA_GDN_CONV_CONCAT") != nullptr;
+
+    ggml_tensor * conv_joined = nullptr;
+    ggml_tensor * conv_state  = build_conv_state_at(inp, conv_states_all, qkv_mixed,
+            conv_kernel_size - 1, conv_channels, il, conv_concat ? &conv_joined : nullptr);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    ggml_tensor * conv_output_proper = conv_concat
+        ? ggml_ssm_conv(ctx0, conv_joined, conv_kernel)
+        : ggml_ssm_conv_state(ctx0, conv_state, qkv_mixed, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
@@ -1727,22 +1735,28 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 
 // Read a conv history out of its own recurrent row and write the new tail back.
 // The shared build_conv_state cannot do this: qwen4exp has two such rows per layer.
+// Returns the history [state_cols, channels, n_seqs]; joined, when asked for, is concat(history, transpose(x))
+// [state_cols + n_seq_tokens, channels, n_seqs], the padded operand of ggml_ssm_conv. Nothing else needs it:
+// the tails come straight from x, and from the concat only when one reaches into the history (short ubatches).
 ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         llm_graph_input_rs * inp,
         ggml_tensor *        conv_states_all,
         ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
-        int                  il) {
+        int                  il,
+        ggml_tensor **       joined) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
 
     const int64_t n_seqs    = ubatch.n_seqs;
+    const int64_t n_t       = x->ne[1];
     const int64_t row_total = conv_states_all->ne[0];
 
     // the row is exactly this convolution's state, so the gather is reused as a whole
     GGML_ASSERT(state_cols * channels == row_total);
+    GGML_ASSERT(x->ne[0] == channels && x->ne[2] == n_seqs);
 
     auto it = rs_rows.find(conv_states_all);
     if (it == rs_rows.end()) {
@@ -1753,7 +1767,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
+    ggml_tensor * conv_input = nullptr;
+    auto get_joined = [&]() {
+        if (conv_input == nullptr) {
+            conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
+        }
+        return conv_input;
+    };
 
     // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
     // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
@@ -1763,12 +1783,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
 
     for (int64_t slot = 0; slot < n_slots; ++slot) {
-        const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
+        // first column of the tail in x; negative when it reaches into the history
+        const int64_t x_beg = n_t - slot - state_cols;
 
-        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-                state_cols, channels, n_seqs,
-                conv_input->nb[1], conv_input->nb[2],
-                ggml_row_size(conv_input->type, s_idx));
+        ggml_tensor * tail = nullptr;
+        if (x_beg >= 0) {
+            tail = ggml_transpose(ctx0, ggml_view_3d(ctx0, x,
+                    channels, state_cols, n_seqs,
+                    x->nb[1], x->nb[2],
+                    x_beg * x->nb[1]));
+        } else {
+            ggml_tensor * j = get_joined();
+            const int64_t s_idx = std::max<int64_t>(0, x_beg + state_cols);
+
+            tail = ggml_view_3d(ctx0, j,
+                    state_cols, channels, n_seqs,
+                    j->nb[1], j->nb[2],
+                    ggml_row_size(j->type, s_idx));
+        }
 
         ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
                 state_cols * channels, n_seqs,
@@ -1778,7 +1810,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
     }
 
-    return conv_input;
+    if (joined != nullptr) {
+        *joined = get_joined();
+    }
+
+    return state;
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
@@ -1858,9 +1894,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     // [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
-    ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_p_l(il),
+    ggml_tensor * padded = nullptr;
+    build_conv_state_at(inp, inp->mctx->get_p_l(il),
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
-            hist, hc_dim, il);
+            hist, hc_dim, il, &padded);
 
     ggml_tensor * conv_out = nullptr;
     for (int64_t k = 0; k < kern; ++k) {

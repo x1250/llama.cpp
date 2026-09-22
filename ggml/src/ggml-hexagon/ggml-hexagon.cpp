@@ -4783,6 +4783,11 @@ static bool ggml_hexagon_supported_ssm_conv(const struct ggml_hexagon_session * 
         return false;
     }
 
+    // no ggml_ssm_conv_state
+    if (op->src[2] != nullptr) {
+        return false;
+    }
+
     // Check IO tensor shapes and dims
     if (src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[3] != 1) {
         return false; // src0 should be effectively 3D

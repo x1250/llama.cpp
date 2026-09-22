@@ -5686,6 +5686,35 @@ struct ggml_tensor * ggml_ssm_conv(
     return result;
 }
 
+struct ggml_tensor * ggml_ssm_conv_state(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(ggml_is_3d(state));
+    GGML_ASSERT(ggml_is_3d(x));
+    GGML_ASSERT(ggml_is_matrix(c));
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = x->ne[1]; // tokens per sequence
+    const int64_t n_s     = x->ne[2];
+
+    GGML_ASSERT(state->ne[0] == d_conv - 1);
+    GGML_ASSERT(state->ne[1] == d_inner);
+    GGML_ASSERT(state->ne[2] == n_s);
+    GGML_ASSERT(x->ne[0] == d_inner);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = state;
+    result->src[1] = c;
+    result->src[2] = x;
+
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(

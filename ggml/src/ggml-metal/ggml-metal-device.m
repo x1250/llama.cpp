@@ -1812,7 +1812,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
         case GGML_OP_SSM_CONV:
-            return has_simdgroup_reduction;
+            return has_simdgroup_reduction && op->src[2] == nullptr; // no ggml_ssm_conv_state
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true;

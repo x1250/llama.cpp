@@ -9703,14 +9703,15 @@ void ggml_compute_forward_flash_attn_back(
 static void ggml_compute_forward_ssm_conv_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0]; // conv_x
+    const ggml_tensor * src0 = dst->src[0]; // conv_x, or the history {d_conv - 1, d_inner, n_s} with src2
     const ggml_tensor * src1 = dst->src[1]; // conv1d.weight
+    const ggml_tensor * src2 = dst->src[2]; // x {d_inner, n_t, n_s} when the history comes separately
 
     const int ith = params->ith;
     const int nth = params->nth;
 
     const int nc  = src1->ne[0]; // d_conv
-    const int ncs = src0->ne[0]; // d_conv - 1 + n_t
+    const int ncs = src0->ne[0]; // d_conv - 1 + n_t, or d_conv - 1 with src2
     const int nr  = src0->ne[1]; // d_inner
     const int n_t =  dst->ne[1]; // tokens per sequence
     const int n_s =  dst->ne[2]; // number of sequences in the batch
@@ -9727,6 +9728,35 @@ static void ggml_compute_forward_ssm_conv_f32(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
     const int ir  = ir1 - ir0;
+
+    if (src2) {
+        GGML_ASSERT(ncs == nc - 1);
+        GGML_ASSERT(src2->nb[0] == sizeof(float));
+
+        for (int i3 = 0; i3 < n_s; ++i3) {
+            for (int i2 = 0; i2 < n_t; ++i2) {
+                const float * c = (const float *) ((const char *) src1->data + ir0*(src1->nb[1])); // {d_conv, d_inner}
+                float * x = (float *) ((char *) dst->data + ir0*(dst->nb[0]) + i2*(dst->nb[1]) + i3*(dst->nb[2])); // {d_inner, n_t, n_s}
+
+                for (int i1 = 0; i1 < ir; ++i1) {
+                    // the taps read the positions i2 - (d_conv - 1) .. i2: the negative ones from the history
+                    const float * s  = (const float *) ((const char *) src0->data + (ir0 + i1)*(src0->nb[1]) + i3*(src0->nb[2]));
+                    const char  * xc = (const char *)  src2->data + (ir0 + i1)*(src2->nb[0]) + i3*(src2->nb[2]);
+
+                    // same order of accumulation as the padded operand
+                    float sumf = 0.0f;
+
+                    for (int i0 = 0; i0 < nc; ++i0) {
+                        const int t = i2 + i0 - (nc - 1);
+                        const float v = t < 0 ? s[t + nc - 1] : *(const float *) (xc + t*(src2->nb[1]));
+                        sumf += v * c[i0 + i1*nc];
+                    }
+                    x[i1] = sumf;
+                }
+            }
+        }
+        return;
+    }
 
     for (int i3 = 0; i3 < n_s; ++i3) {
         for (int i2 = 0; i2 < n_t; ++i2) {

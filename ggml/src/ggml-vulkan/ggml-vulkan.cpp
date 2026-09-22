@@ -2099,6 +2099,8 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
+    // split: src0 is the history and the tokens come from x (ggml_ssm_conv_state), strides nb21, nb22
+    uint32_t nb21, nb22, split;
 };
 
 // strides in elements; the rows (ne0) are contiguous
@@ -6654,9 +6656,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size, 16}, 1, true, true);
     }
 
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 5, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 5, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 5, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_hc_gated_mean_f32, "hc_gated_mean_f32", hc_gated_mean_f32_len, hc_gated_mean_f32_data, "main", 3, sizeof(vk_op_hc_gated_mean_push_constants), {256, 1, 1}, {256}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_hc_inject_f32,     "hc_inject_f32",     hc_inject_f32_len,     hc_inject_f32_data,     "main", 4, sizeof(vk_op_hc_inject_push_constants),     {256, 1, 1}, {256}, 1);
@@ -14212,10 +14214,14 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
         dst = cgraph->nodes[node_idx + 2]; // silu
     }
 
-    // The shader always declares 4 bindings; bind src0 as a dummy when bias isn't fused.
-    const ggml_tensor * src2 = bias ? bias : src0;
+    // ggml_ssm_conv_state: src0 is the history and the tokens come from x
+    const ggml_tensor * x = conv->src[2];
 
-    ggml_vk_op_f32<vk_op_ssm_conv_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_SSM_CONV, {
+    // The shader always declares 5 bindings; bind src0 as a dummy for the bias and x when absent.
+    const ggml_tensor * src2 = bias ? bias : src0;
+    const ggml_tensor * src3 = x    ? x    : src0;
+
+    ggml_vk_op_f32<vk_op_ssm_conv_push_constants>(ctx, subctx, src0, src1, src2, src3, dst, GGML_OP_SSM_CONV, {
         (uint32_t)src0->nb[1], (uint32_t)src0->nb[2],
         (uint32_t)src1->nb[1],
         (uint32_t)dst->nb[0], (uint32_t)dst->nb[1], (uint32_t)dst->nb[2],
@@ -14224,6 +14230,7 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
         (uint32_t)src0->ne[1],
         (uint32_t)dst->ne[1],
         (uint32_t)dst->ne[2],
+        x ? (uint32_t)x->nb[1] : 0, x ? (uint32_t)x->nb[2] : 0, x ? 1u : 0u,
     });
 }
 
@@ -20653,7 +20660,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 return true;
             }
         case GGML_OP_SSM_CONV:
-            return op->src[0]->type == GGML_TYPE_F32;
+            return op->src[0]->type == GGML_TYPE_F32 && (op->src[2] == nullptr || op->src[2]->type == GGML_TYPE_F32);
         case GGML_OP_HC_GATED_MEAN:
         case GGML_OP_HC_INJECT:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -21642,7 +21649,11 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_ssm_scan(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
                                          src_clone[3], src_clone[4], src_clone[5], src_clone[6], K);
         } else if (tensor->op == GGML_OP_SSM_CONV) {
-            tensor_clone = ggml_ssm_conv(ggml_ctx, src_clone[0], src_clone[1]);
+            if (src_clone[2] != nullptr) {
+                tensor_clone = ggml_ssm_conv_state(ggml_ctx, src_clone[0], src_clone[2], src_clone[1]);
+            } else {
+                tensor_clone = ggml_ssm_conv(ggml_ctx, src_clone[0], src_clone[1]);
+            }
         } else if (tensor->op == GGML_OP_HC_GATED_MEAN) {
             tensor_clone = ggml_hc_gated_mean(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_HC_INJECT) {

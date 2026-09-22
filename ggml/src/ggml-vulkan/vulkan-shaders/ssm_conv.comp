@@ -14,13 +14,16 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
 layout(binding = 0) readonly buffer Src0 { float src0[]; };
 layout(binding = 1) readonly buffer Src1 { float src1[]; };
 layout(binding = 2) readonly buffer Bias { float bias[]; };
-layout(binding = 3) buffer Dst { float dst[]; };
+layout(binding = 3) readonly buffer X { float x[]; };
+layout(binding = 4) buffer Dst { float dst[]; };
 
 layout(push_constant) uniform PushConstants {
     uint nb01; uint nb02;
     uint nb11;
     uint dst_nb0; uint dst_nb1; uint dst_nb2;
     uint nc; uint ncs; uint nr; uint n_t; uint n_s;
+    // split != 0: src0 is the history [nc - 1, nr, n_s] and the tokens come from x [nr, n_t, n_s] (nb21, nb22)
+    uint nb21; uint nb22; uint split;
 };
 
 void main() {
@@ -37,7 +40,27 @@ void main() {
 
     float sum = 0.0;
 
-    if (nc == 4) {
+    if (split != 0) {
+        // tap i0 reads the position i2 - (nc - 1) + i0: the negative ones from the history
+        const uint s_base = i3 * (nb02 / 4) + i1 * (nb01 / 4);
+        const uint x_base = i3 * (nb22 / 4) + i1;
+        const uint x_step = nb21 / 4;
+
+        if (nc == 4) {
+            vec4 v;
+            [[unroll]] for (uint i0 = 0; i0 < 4; i0++) {
+                const int t = int(i2) + int(i0) - 3;
+                v[i0] = t < 0 ? src0[s_base + uint(t + 3)] : x[x_base + uint(t) * x_step];
+            }
+            sum = dot(v, vec4(src1[src1_base], src1[src1_base + 1], src1[src1_base + 2], src1[src1_base + 3]));
+        } else {
+            [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
+                const int t = int(i2) + int(i0) - int(nc - 1);
+                const float v = t < 0 ? src0[s_base + uint(t + int(nc) - 1)] : x[x_base + uint(t) * x_step];
+                sum += v * src1[src1_base + i0];
+            }
+        }
+    } else if (nc == 4) {
         sum = dot(
             vec4(src0[src0_base], src0[src0_base + 1], src0[src0_base + 2], src0[src0_base + 3]),
             vec4(src1[src1_base], src1[src1_base + 1], src1[src1_base + 2], src1[src1_base + 3])
