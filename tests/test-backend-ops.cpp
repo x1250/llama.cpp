@@ -3683,6 +3683,52 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+// RMS_NORM + MUL by a broadcast weight, the pair the backends fuse into one kernel
+struct test_rms_norm_mul : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const std::array<int64_t, 4> ne_w;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, ne, ne_w, eps);
+    }
+
+    test_rms_norm_mul(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {64, 5, 4, 3},
+            std::array<int64_t, 4> ne_w = {64, 1, 1, 1},
+            float eps = 1e-6f)
+        : type(type), ne(ne), ne_w(ne_w), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * w = ggml_new_tensor(ctx, type, 4, ne_w.data());
+        ggml_set_param(w);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), w);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -9666,6 +9712,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
             }
         }
+        // rows of 256 and 2560 columns (the qwen4exp hyper-connection norm of the wide residual), contiguous and
+        // as a view, and the RMS_NORM + MUL pair the backends fuse, with the per-stream gamma [n, 4] and a flat one
+        for (uint32_t n : { 256, 2560 }) {
+            for (bool v : { false, true }) {
+                test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
+            }
+            test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { n, 4, 6, 1 }, { n, 4, 1, 1 }, eps));
+            test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { n, 5, 4, 3 }, { n, 1, 1, 1 }, eps));
+        }
     }
 
     // in-place tests
@@ -10997,8 +11052,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // qwen4exp dense prefill nodes (n = 2048) with their weight types and as f16 (the bound of a per-node f16
-    // shadow): the hyper-connection mixers (m=320 k=10240, m=10240 k=320, m=4 k=10240) and the large projections
-    for (const auto & c : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{{GGML_TYPE_IQ4_NL, 320, 10240}, {GGML_TYPE_IQ4_NL, 10240, 320},
+    // shadow): the hyper-connection mixers (m=324 k=10240 with the inject rows merged, m=10240 k=320, m=4 k=10240)
+    // and the large projections
+    for (const auto & c : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{{GGML_TYPE_IQ4_NL, 324, 10240}, {GGML_TYPE_IQ4_NL, 10240, 320},
                                                                              {GGML_TYPE_IQ4_NL, 4, 10240}, {GGML_TYPE_IQ4_NL, 2560, 6144},
                                                                              {GGML_TYPE_IQ4_NL, 6144, 2560}, {GGML_TYPE_IQ4_NL, 12288, 2560},
                                                                              {GGML_TYPE_Q5_K, 10240, 2560}, {GGML_TYPE_Q8_0, 2560, 6144}}) {
@@ -11006,6 +11062,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, std::get<1>(c), 2048, std::get<2>(c), {1, 1}, {1, 1}));
         }
     }
+
+    // qwen4exp hyper-connection norm of the wide residual: RMS_NORM + MUL by the per-stream gamma [2560, 4]
+    test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, {2560, 4, 2048, 1}, {2560, 4, 1, 1}, 1e-6f));
 
     // decode mat-vec with a few columns (MTP verification batches): the qwen4exp f32 router [2560 x 512]
     // and the same shape in f16 / q8_0, 1 to 4 columns
