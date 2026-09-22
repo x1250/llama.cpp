@@ -2,7 +2,7 @@
 
 ## Estado actual (2026-09-22)
 
-- Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410).
+- Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410) y las listas de la FA sparse desde la selección QSA (sección 21, build 413).
   Producción: `strix load qwen38flash`
   (NP=2, `-c 524288` = 262144 × 2 slots, batch = ubatch 2048, KV q8_0, lazy mode auto, draft MTP IQ4_NL
   n-max 2, mmproj, `--ctx-checkpoints 8`), archivo `NL3S/qwen4exp-nl3s-hcdi-gu-oproj8.gguf`
@@ -32,6 +32,7 @@ Cronología del prefill de 39.5k a 40k (misma máquina, mismo rig):
 | lote de riesgo bajo (2026-09-22, sección 18) | 80.4-80.5 s | 491 | sin cambio |
 | draft MTP recortado a las filas de salida (2026-09-22, sección 19) | **76.8 s** | **515** | −4.6 %, re-prefill −6.8 % |
 | hint del server para el PLE + conv sin concat + guard y BK_STEP 2 del MMQ (2026-09-22, sección 20) | **73.3 s** | **539** | −5.0 %: el hint −3.3 s, las otras ~−0.6 s |
+| listas de la FA sparse desde la selección QSA, vía 2 bis (2026-09-22, sección 21) | 73.2 s | 539 | −0.2 s (−0.3 %); −9 % del nodo FA a 131k |
 
 Lo que sigue es el documento original del 2026-09-09 con sus secciones anotadas; el desglose de
 la sección 2 está reemplazado por el perfil del build actual.
@@ -541,7 +542,7 @@ cadena de medición completa (base primero y último, MTP on, determinismo).
 | # | Palanca | Ganancia estimada | Riesgo / coste | Comprobación previa |
 |---|---|---|---|---|
 | 1 | Vía 18: gate y up de expertos en un solo tensor `ffn_gate_up_exps`. **Hecha (2026-09-18, sección 15): −0.6 s de prefill, −2.8 % de re-prefill, PPL idéntica; archivo `nl3s-hcdi-gu-oproj8` en producción** | −1 a −2 s | bajo | ninguno |
-| 2 | Vía 2 bis: lista por token de la FA sparse construida desde los índices del selector QSA (hoy el prepass barre la fila de máscara entera, 40k columnas por token) y las 4 filas coopmat vacías | −2 a −3 s a 40k, más a mayor profundidad | medio: los índices deben llegar al nodo FA (grafo) y el prepass cambia | diseño del paso índices → listas; perf logger del nodo FA por profundidad |
+| 2 | Vía 2 bis: lista por token de la FA sparse construida desde los índices del selector QSA (hoy el prepass barre la fila de máscara entera, 40k columnas por token) y las 4 filas coopmat vacías. **Hecha la lista desde los índices (2026-09-22, sección 21): −0.4 s a 40k, −0.2 s a 55k, −9 % del nodo a 131k; el barrido era ~1 % del nodo, no el 40 % que suponía la sección 9: lo que queda de la FA sparse son los gathers de K/V por token. Las 4 filas vacías no cambian ese tráfico** | — | — | — |
 | 3 | Desquantizado IQ3_S en el kernel coopmat de MUL_MAT_ID (recuento de instrucciones, cargas de 16 bits, tabla en shmem) | −2 a −3 s | medio-alto: días; el loader integer-dot de hoy fue correcto pero −2.1 % | microbench por variante (sección 12 como base: 9.0-9.2 ms) |
 | 4 | Vía 12: host (`prefetch_ple_rows`, 20k llamadas síncronas por ubatch; huecos entre submisiones, 204 ms por ciclo). **Cerrada (2026-09-18, sección 16): el input PLE son 130-190 ms de E/S aleatoria por ubatch; agrupar o repartir el encolado no cambia el total, batch 8192 pierde decode. El read-ahead entre decodes por hint del server está hecho (2026-09-22, sección 20): −3.3 s, set_inputs 157 → 27 ms por ubatch** | — | — | — |
 | 5 | Vía 16: el draft reutiliza la selección QSA del target (sin indexador en el draft) | −2 s a 40k, crece con la profundidad | medio-alto: flujo del MTP | diseño |
@@ -991,3 +992,61 @@ Rig de 40k con MTP, mismo día y misma base: 73.65 s (las tres palancas, BK_STEP
 BK_STEP 2, re-prefill 4.16 s, decode igual. Textos greedy de los turnos 1-5 idénticos a los de la corrida sin
 BK_STEP 2 y depth_repeat con los mismos logprobs (`'El' −0.2154`): el cambio no mueve ningún bit (misma
 acumulación por columna, solo cambia cuántos bloques de k entran por barrera). Adoptado.
+
+## 21. Vía 2 bis medida: las listas de la FA sparse desde la selección QSA (2026-09-22, build 412)
+
+`ggml_flash_attn_ext_set_kv_idx(a, idx)`: el nodo FA recibe en `src[5]` las columnas candidatas de cada fila de
+la máscara (I32 [n_idx, filas], distintas por fila; `n_idx` acota `n_kv_max`). qwen4exp pasa el `top_k` del
+selector, que ya tiene el layout de las filas de la máscara (`build_attn_mha` gana el parámetro `kv_idx`; los otros
+callers pasan `nullptr`). Los backends sin FA sparse lo ignoran. En Vulkan, el prepass del modo sparse construye
+la lista de un tile desde las candidatas en vez de barrer las `nem0` columnas de sus filas: un workgroup por
+(tile, batch) marca en un bitmap compartido de la fila (`WORDS` = potencia de dos ≥ nem0/32, hasta 64 KB =
+524288 celdas) las candidatas cuya entrada de máscara es finita y compacta los bits en orden de columna
+(exclusive scan por subgrupo): la misma lista ascendente que el barrido, así que la atención acumula las mismas
+celdas en el mismo orden; los repetidos colapsan y las candidatas enmascaradas se saltan. Vale para el modo
+índice (una lista por token, prefill) y para el compacto (una lista por tile de `Br` filas, decode), y elimina
+el barrido en dos pasadas por chunks del decode. `GGML_VK_DISABLE_SPARSE_FA_KV_IDX=1` mantiene el barrido.
+
+Primera versión (bitonic de 4096 claves en memoria compartida, 78 barreras): correcta pero cara: microbench
+(512 filas × 12 cabezas, q8_0, 2051 celdas) 6.95 → 7.07 ms a 32k y 9.86 → 9.31 a 131k; rigs 73.85 (barrido) →
+73.33 s (bitonic) a 40k y 100.88 → 100.98 a 55k. La versión bitmap (3 barreras):
+
+| | barrido | bitmap |
+|---|---|---|
+| microbench 32k, 512 filas | 6.90 ms | 6.78 ms (−1.8 %) |
+| microbench 131k, 512 filas | 9.86 ms | 8.98 ms (−8.9 %) |
+| rig 40k (base 410: 73.69 / 73.40 s) | — | **73.16 s (540.1 t/s, −0.4 s)** |
+| rig 55k (base 100.88 s) | — | **100.66 s (−0.2 s)** |
+| re-prefill 2k a 40k | 4.26 s | 4.16 s |
+
+Lo que enseña: el barrido por token costaba ~1 % del nodo FA sparse a 40k (la sección 9 le atribuía, con las 4
+filas vacías, el 40 %). El resto del nodo son los gathers de K/V por token (571 MB por 512 filas a 84 GB/s
+efectivos: latencia de gather, no MMA ni prepass), y crecen con la profundidad por la localidad del caché,
+no por el barrido. Las 4 filas coopmat vacías no cambian ese tráfico. Ganancia real: ~0.5 % del prefill a
+cualquier profundidad medible, más el decode sin barrido a profundidad (sección 21.1).
+
+Exactitud: el rig con la misma build y el barrido (`GGML_VK_DISABLE_SPARSE_FA_KV_IDX=1`) da textos greedy
+idénticos a los del bitmap y a los del bitonic (turnos 1-5), es decir, las listas son las mismas; frente a la
+build 410 los textos difieren por el src extra del nodo FA (otro orden de grafo, sección 20.4), con
+depth_repeat 5/5 idéntico y probe igual a la 405. Tests: FLASH_ATTN_EXT 5221/5221 con 24 casos nuevos con
+`kv_idx` (12 formas × f16/q8_0: las candidatas en orden barajado, con enmascaradas después de las finitas).
+graph_diff4: los 72 SET_ROWS de siempre. Conversaciones con imagen: respuestas idénticas a las referencias.
+
+### 21.1 Modo compacto (decode) con el mismo prepass (build 413)
+
+El mismo shader con `list_rows` filas por lista: en el modo compacto (lotes ≤ 64 filas, decode y verificación
+MTP) el workgroup del tile marca en el bitmap las candidatas finitas de sus `Br` filas y compacta la unión, en
+lugar del barrido en dos pasadas por chunks de 2048 columnas (una pasada de conteo y otra de colocación por
+chunk, sección 6). Rigs: 40k base 73.20 / 73.44 s, nuevo 73.32 s; 55k 100.78 s (base 100.88); decode 36-41 t/s
+en ambos, sin diferencia atribuible (a 40k el barrido por chunks cuesta microsegundos por token; el ahorro crece
+con la profundidad, a 262k son 128 chunks × 2 pasadas por token y capa). Textos greedy del decode idénticos a
+los de la build con el modo índice solo (v17b) a 40k y 55k: la unión por tile reproduce la lista del barrido.
+FLASH_ATTN_EXT 5221/5221 (los casos de 1-64 filas con `kv_idx` toman ahora este camino), depth_repeat 5/5,
+graph_diff4 con los 72 SET_ROWS, probe igual a la 405, conversaciones con imagen idénticas a las referencias.
+
+Balance de la vía 2 bis sobre las tres ventanas: bases 73.69 / 73.40 / 73.20 / 73.44 s (media 73.43), nuevo
+73.16 / 73.32 s (media 73.24): **−0.2 s a 40k (−0.3 %)**, −0.1 a −0.2 s a 55k, −9 % del nodo FA sparse a 131k
+en el microbench. Adoptada: exacta, contenida (un op opcional, un shader, un parámetro) y elimina de prefill y
+decode el único trabajo que crecía linealmente con la profundidad del caché por token; la estimación de
+−2 a −3 s de la sección 13 estaba equivocada en un orden de magnitud porque atribuía al prepass lo que son
+los gathers de K/V.
