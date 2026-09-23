@@ -218,6 +218,15 @@ void main() {
         sums[i] = ACC_TYPE(0.0f);
     }
 
+#ifdef MUL_MAT_ID
+    // the columns past the expert's rows hold zeros and the store drops them: the warp runs only the
+    // column iterations that reach a row (uniform per warp: warp_c and wsic are the same for its threads)
+    const uint cols_left   = _ne1 - ic * BN;   // > 0: the workgroups without rows returned
+    const uint wniter_used = warp_c * WN >= cols_left ? 0 : min(WNITER, (cols_left - warp_c * WN + WSUBN - 1) / WSUBN);
+#else
+    const uint wniter_used = WNITER;
+#endif
+
     for (uint block = start_k; block < end_k; block += BK * BK_STEP) {
         [[unroll]] for (uint l = 0; loadc_a + l < BM; l += loadstride_a) {
             const uint buf_ib = loadc_a + l;
@@ -270,16 +279,20 @@ void main() {
             }
 
             [[unroll]] for (uint wsic = 0; wsic < WNITER; wsic++) {
-                [[unroll]] for (uint cc = 0; cc < TN; cc++) {
-                    const uint ib = k_step * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc;
-                    block_b_to_registers(ib);
+                // a uniform branch inside the unrolled loop (the switch of unrolled copies that helps the
+                // coopmat shader is slower here: 7.62 vs 7.43 ms on the down node)
+                if (wsic < wniter_used) {
+                    [[unroll]] for (uint cc = 0; cc < TN; cc++) {
+                        const uint ib = k_step * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc;
+                        block_b_to_registers(ib);
 
-                    [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
-                        [[unroll]] for (uint cr = 0; cr < TM; cr++) {
-                            const uint cache_a_idx = wsir * TM + cr;
-                            const uint sums_idx = (wsic * TN + cc) * (WMITER * TM) + wsir * TM + cr;
+                        [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
+                            [[unroll]] for (uint cr = 0; cr < TM; cr++) {
+                                const uint cache_a_idx = wsir * TM + cr;
+                                const uint sums_idx = (wsic * TN + cc) * (WMITER * TM) + wsir * TM + cr;
 
-                            sums[sums_idx] += mmq_dot_product(cache_a_idx);
+                                sums[sums_idx] += mmq_dot_product(cache_a_idx);
+                            }
                         }
                     }
                 }

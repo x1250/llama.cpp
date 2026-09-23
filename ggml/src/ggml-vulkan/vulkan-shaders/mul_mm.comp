@@ -274,6 +274,16 @@ void main() {
     coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b;
     coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums[cms_per_row * cms_per_col];
 
+#ifdef MUL_MAT_ID
+    // the columns past the expert's rows hold zeros and the store drops them: the warp multiplies only
+    // the column sub-tiles that reach a row (an expert with few rows leaves most of the tile empty)
+    const uint cols_left        = _ne1 - ic * BN;   // > 0: the workgroups without rows returned
+    const uint warp_col0        = warp_c * WN;
+    const uint cms_per_col_used = warp_col0 >= cols_left ? 0 : min(cms_per_col, (cols_left - warp_col0 + TN - 1) / TN);
+#else
+    const uint cms_per_col_used = cms_per_col;
+#endif
+
     [[unroll]] for (uint i = 0; i < cms_per_row * cms_per_col; i++) {
         sums[i] = coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
     }
@@ -310,18 +320,30 @@ void main() {
         pos_b += BK / LOAD_VEC_B_EFF;
 
 #ifdef COOPMAT
-        [[unroll]] for (uint i = 0; i < BK; i += TK) {
-            [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
-                // Load from shared into cache
-                coopMatLoad(cache_a, buf_a, a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
-
-                [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
-                    coopMatLoad(cache_b, buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
-
-                    sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b, sums[cm_col * cms_per_row + cm_row]);
-                }
-            }
+// the tile's multiply for NCOLS column sub-tiles per warp, fully unrolled: the accumulators stay statically indexed
+#define MMA_COLS(NCOLS)                                                                                                                              \
+        [[unroll]] for (uint i = 0; i < BK; i += TK) {                                                                                               \
+            [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {                                                                       \
+                coopMatLoad(cache_a, buf_a, a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor); \
+                [[unroll]] for (uint cm_col = 0; cm_col < (NCOLS); cm_col++) {                                                                        \
+                    coopMatLoad(cache_b, buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor); \
+                    sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b, sums[cm_col * cms_per_row + cm_row]);                      \
+                }                                                                                                                                    \
+            }                                                                                                                                        \
         }
+#ifdef MUL_MAT_ID
+        // one copy per count of column sub-tiles in use, chosen once per warp: no branch inside the loops
+        switch (cms_per_col_used) {
+            case 0: break;
+            case 1: MMA_COLS(min(1u, cms_per_col)) break;
+            case 2: MMA_COLS(min(2u, cms_per_col)) break;
+            case 3: MMA_COLS(min(3u, cms_per_col)) break;
+            default: MMA_COLS(cms_per_col) break;
+        }
+#else
+        MMA_COLS(cms_per_col)
+#endif
+#undef MMA_COLS
 #else
         [[unroll]] for (uint i = 0; i < BK / BK_STEP; i++) {
             // Load from shared into cache
