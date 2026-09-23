@@ -395,14 +395,29 @@ void llama_memory_hybrid_idx::pooled_rm(llama_seq_id seq_id, llama_pos p0, llama
         return;
     }
 
-    // blocks from the first removed position on lose members or change content; earlier rows keep theirs
+    // blocks from the first removed index on lose members or change content; earlier rows keep theirs.
+    // The index is the position, or the rank of the first removed cell when the blocks are in rank order:
+    // the cells ranked before it are the ones below p0, since the rank orders by position first
+    int64_t first = std::max<llama_pos>(p0, 0);
+
+    if (pooled_ranked[seq_id]) {
+        const auto & cells = mem_idx->get_cells(seq_id);
+
+        first = 0;
+        for (uint32_t j = 0; j < cells.used_max_p1(); ++j) {
+            if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) < p0) {
+                first++;
+            }
+        }
+    }
+
     for (auto & [ratio, w] : pooled_w) {
         if (w.empty()) {
             continue;
         }
 
         auto & wv = w[seq_id];
-        wv = std::min(wv, (int64_t) std::max<llama_pos>(p0, 0)/ratio);
+        wv = std::min(wv, first/ratio);
     }
 }
 
@@ -414,6 +429,12 @@ void llama_memory_hybrid_idx::pooled_reset(llama_seq_id seq_id) {
         } else if (seq_id < (llama_seq_id) w.size()) {
             w[seq_id] = 0;
         }
+    }
+
+    if (seq_id < 0) {
+        pooled_ranked.fill(false);
+    } else if (seq_id < LLAMA_MAX_SEQ) {
+        pooled_ranked[seq_id] = false;
     }
 }
 
@@ -700,6 +721,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
             int64_t * cur_d_rows  = (int64_t *) dirty_rows->data + s*n_dirty_max;
 
             int64_t & w = pooled_valid(ratio, seq_of_stream);
+
+            pooled_ranked[seq_of_stream] = ranked;
 
             int64_t n_dirty = 0;
 

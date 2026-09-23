@@ -2,6 +2,7 @@
 
 #include "llama-memory-hybrid.h"
 
+#include <array>
 #include <map>
 #include <memory>
 #include <vector>
@@ -100,8 +101,9 @@ public:
     // (sequence, position block) per QSA layer, written by the graph with set_rows. Only complete
     // blocks are scored and a complete block's members never change, so a row stays valid until a
     // removal or a position change touches its block. Validity is a per-(ratio, sequence) watermark
-    // in position blocks: rows below it hold the current content. seq_rm clamps it to the first
-    // removed block; seq_cp, seq_add, seq_div, clear and a full state load reset it, and the next
+    // in blocks of the fill's order (position blocks, or rank blocks when an image repeats mrope
+    // positions): rows below it hold the current content. seq_rm clamps it to the block of the first
+    // removed cell; seq_cp, seq_add, seq_div, clear and a full state load reset it, and the next
     // ubatch repools the range. Rows at or beyond the watermark are finite but stale, and the
     // fill never lets a scored block read one.
 
@@ -112,7 +114,7 @@ public:
     int64_t pooled_row(uint32_t ratio, llama_seq_id seq_id, int64_t blk) const;
     int64_t pooled_row_dustbin(uint32_t ratio) const;
 
-    // position blocks of seq_id (at this ratio) whose rows are valid; mutable through a const context, like the cells
+    // blocks of seq_id (at this ratio, in the fill's order) whose rows are valid; mutable through a const context, like the cells
     int64_t & pooled_valid(uint32_t ratio, llama_seq_id seq_id) const;
 
 private:
@@ -135,6 +137,10 @@ private:
     uint32_t pooled_kv_size = 0;
 
     mutable std::map<uint32_t, std::vector<int64_t>> pooled_w;   // ratio -> watermark per seq_id
+
+    // per seq_id: the watermarks count blocks of cells in rank order, not position blocks (set_input_qsa
+    // ranks the cells when mrope repeats one position across an image)
+    mutable std::array<bool, LLAMA_MAX_SEQ> pooled_ranked = {};
 
     void pooled_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void pooled_reset(llama_seq_id seq_id);   // seq_id < 0 resets every sequence
