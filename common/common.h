@@ -697,6 +697,9 @@ struct common_params {
 
     float slot_prompt_similarity = 0.1f;
 
+    // share of the GPU time the generating slots get while other slots process a prompt (0 = a prompt chunk on every step)
+    float decode_share = 0.0f;
+
     // batched-bench params
     bool is_pp_shared   = false;
     bool is_tg_separate = false;

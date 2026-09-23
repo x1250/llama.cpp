@@ -262,6 +262,53 @@ struct server_batch {
     }
 };
 
+// --decode-share: while generating slots and pending prompts coexist, every step is a prompt step (a prompt chunk or an
+// image is processed; the generating slots ride along) or a decode step (only the generating slots). The time of both
+// kinds is accounted while they coexist, and a step may take a prompt chunk only once the decode steps have had their
+// share of that time. The account restarts whenever one of the two kinds of work runs out.
+struct server_decode_share {
+    float share = 0.0f;
+
+    int64_t t_prompt_us = 0;
+    int64_t t_decode_us = 0;
+
+    bool    contended   = false; // this step has generating slots and pending prompts
+    bool    prompt_work = false; // this step processed an image chunk
+    int64_t t_step      = 0;
+
+    void step_start() {
+        t_step      = ggml_time_us();
+        contended   = false;
+        prompt_work = false;
+    }
+
+    // whether this step may batch prompts; generating: the generating slots have tokens in the batch
+    bool prompts_turn(bool generating, bool prompt_pending) {
+        contended = share > 0.0f && generating && prompt_pending;
+        if (!contended) {
+            t_prompt_us = 0;
+            t_decode_us = 0;
+            return true;
+        }
+
+        return t_decode_us >= share*(t_prompt_us + t_decode_us);
+    }
+
+    // the step's work is accounted as prompt time if it processed any prompt token or image
+    void step_end(bool prompt_tokens) {
+        if (!contended) {
+            return;
+        }
+
+        const int64_t dt = ggml_time_us() - t_step;
+        if (prompt_tokens || prompt_work) {
+            t_prompt_us += dt;
+        } else {
+            t_decode_us += dt;
+        }
+    }
+};
+
 struct server_slot {
     int id;
 
@@ -911,6 +958,8 @@ private:
 
     server_batch batch;
 
+    server_decode_share decode_share;
+
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
@@ -1435,6 +1484,11 @@ private:
         });
 
         metrics.init();
+
+        decode_share.share = params_base.decode_share;
+        if (decode_share.share > 0.0f) {
+            SRV_INF("generating slots get %.0f%% of the GPU time while other slots process a prompt\n", 100.0f*decode_share.share);
+        }
 
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
@@ -2851,6 +2905,8 @@ private:
             }
         }
 
+        decode_share.step_start();
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -2926,6 +2982,9 @@ private:
                 break; // stop any further processing
             }
         }
+
+        decode_share.step_end(std::any_of(batch.tokens.begin(), batch.tokens.end(),
+                                          [](const server_batch::token & t) { return t.is_prompt; }));
     }
 
     void pre_decode() {
@@ -3135,8 +3194,15 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // a step that serves generating slots may leave the pending prompts for a later one (--decode-share)
+        bool prompt_pending = false;
+        for (const auto & slot : slots) {
+            prompt_pending |= slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;
+        }
+        const bool prompts_turn = decode_share.prompts_turn(batch.size() > 0, prompt_pending);
+
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        if ((params_base.cont_batching || batch.size() == 0) && prompts_turn) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
@@ -3539,6 +3605,7 @@ private:
                         }
 
                         has_mtmd = true;
+                        decode_share.prompt_work = true;
                     }
 
                     const auto & spans = slot.task->params.message_spans;

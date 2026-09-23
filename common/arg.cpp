@@ -3824,6 +3824,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--decode-share"}, "SHARE",
+        string_format("share of the GPU time the generating slots get while other slots process a prompt: a prompt chunk is "
+                      "batched only once the decode-only steps have had this share of the time since both kinds of work "
+                      "started waiting (default: %.2f, 0.0 = a prompt chunk on every step)", params.decode_share),
+        [](common_params & params, const std::string & value) {
+            params.decode_share = std::stof(value);
+            if (params.decode_share < 0.0f || params.decode_share >= 1.0f) {
+                throw std::invalid_argument("--decode-share must be in [0, 1)");
+            }
+        }
+    ).set_env("LLAMA_ARG_DECODE_SHARE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lora-init-without-apply"},
         string_format("load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: %s)", params.lora_init_without_apply ? "enabled" : "disabled"),
         [](common_params & params) {
