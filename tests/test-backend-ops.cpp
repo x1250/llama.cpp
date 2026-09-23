@@ -11149,6 +11149,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // qwen4exp decode verify batch (3 tokens, the mat-vec path): the router (f32), the hyper-connection mixers, the
+    // alpha/beta and large projections, the head, and the gate/up experts merged in one tensor
+    for (const auto & c : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{{GGML_TYPE_F32, 512, 2560}, {GGML_TYPE_IQ4_NL, 324, 10240},
+                                                                             {GGML_TYPE_IQ4_NL, 10240, 320}, {GGML_TYPE_IQ4_NL, 48, 2560},
+                                                                             {GGML_TYPE_IQ4_NL, 2560, 6144}, {GGML_TYPE_IQ4_NL, 6144, 2560},
+                                                                             {GGML_TYPE_Q5_K, 10240, 2560}, {GGML_TYPE_Q8_0, 2560, 6144},
+                                                                             {GGML_TYPE_Q6_K, 248320, 2560}}) {
+        test_cases.emplace_back(new test_mul_mat(std::get<0>(c), GGML_TYPE_F32, std::get<1>(c), 3, std::get<2>(c), {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 512, 10, false, 1280, 3, 2560));
+
     // qwen4exp hyper-connection norm of the wide residual: RMS_NORM + MUL by the per-stream gamma [2560, 4]
     test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, {2560, 4, 2048, 1}, {2560, 4, 1, 1}, 1e-6f));
 
