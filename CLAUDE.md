@@ -1,5 +1,9 @@
 IMPORTANT: Ensure you’ve thoroughly reviewed the [AGENTS.md](AGENTS.md) file before beginning any work.
 
+# Standing instructions from the Director (2026-09-23)
+
+- Documenting findings in `docs/strix-halo/`, running the investigation they call for (measurement windows on the GPU included) and correcting documented errors are done without asking. The GPU may be used for that; the only constraint is the resource safety below (never freeze the machine).
+
 # Resource safety on the Strix Halo desktop (mandatory)
 
 - Before ANY model load or GPU-heavy run: compute the footprint (weights + KV + compute buffers) and require `MemAvailable - footprint >= 40 GiB`. Abort otherwise.
