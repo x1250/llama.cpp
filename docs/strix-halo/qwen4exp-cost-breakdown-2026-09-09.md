@@ -1496,3 +1496,45 @@ el microbench no reproduce el costo de DRAM de esos nodos: lo que cuestan en el 
 del grafo, no la forma del workgroup. Las vías 3, 10 y 13 quedan cerradas como afinación; lo que sigue en decode
 exige menos bytes (router q8_0 en el GGUF, vía 13 alternativa; cabeza del draft recortada, vía 9) o menos trabajo
 (vía 16), no otra forma del kernel.
+
+## 27. Router en Q8_0 adoptado; la cabeza recortada del draft descartada (2026-09-23, cadenas v25 y v26)
+
+De la lista de la sección 26.1, el Director autorizó las dos palancas de decode que exigían transformar archivos:
+el router en Q8_0 (vía 13) y la cabeza del draft recortada a un subconjunto de vocabulario (vía 9).
+
+### 27.1 Router en Q8_0 (vía 13): adoptado
+
+`scripts/qwen4exp-requant-router.py` cuantiza a Q8_0 los 48 routers (`ffn_gate_inp`, F32 [2560, 512]) y copia todo lo
+demás sin cambios, sobre `scripts/gguf_stream_copy.py` (copia dentro del kernel y page cache soltada cada 2 GiB, reglas
+del freeze #10). Archivo `NL3S/qwen4exp-nl3s-hcdi-gu-rq8-oproj8.gguf`; el nombre no contiene el quant anterior, porque
+el launcher elige el archivo por subcadena. `build_moe_ffn` acepta cualquier tipo de peso, y la fusión TOPK_MOE de
+Vulkan empieza en el SOFT_MAX posterior al router, así que el tipo del router no afecta ninguna fusión.
+
+| Medida (cadena v25, mismo binario) | Router F32 | Router Q8_0 |
+|---|---|---|
+| PPL holdout, 12 chunks c=4096 | 1.5928 ± 0.0158 | 1.5919 ± 0.0158 |
+| Paso de verificación a 40k (mediana, `LLAMA_INPUT_TIMING`) | 53.36 / 52.74 ms (base primero y último) | 51.83 ms |
+| Prefill de 39.5k | 74.0 s | 73.8 s |
+| Prompts de agente (10, código y tool calls), t/s medio | 47.7 | 48.4 |
+| `graph_diff4` | — | 72 nodos (los SET_ROWS conocidos) |
+
+−1.2 ms por paso de verificación (−2.3 %). El t/s de un turno aislado se mueve además con la aceptación del draft,
+porque el texto generado cambia con los logits (el turno de 40k aceptó 135/239 frente a 140/228). Adoptado en
+`strix-halo/config.ini` (`quant = nl3s-hcdi-gu-rq8-oproj8`); la distribución de referencia del probe pasa a ser
+`probe-v26.out`, porque el router cambia los logits por diseño.
+
+### 27.2 Cabeza del draft recortada (vía 9): descartada por el Director
+
+La cabeza del draft MTP (iq4_nl, 2560 × 248320, 341 MiB) cuesta 1.58 ms por paso de draft. La vía la recortaba a un
+subconjunto de K tokens: en el archivo del draft, las filas de esos tokens (`output_sub`) y sus ids, y en el grafo
+del draft los K logits esparcidos con -inf sobre el vocabulario. La salida del target no cambia, porque el decode
+especulativo verifica cada token; lo que cae es la aceptación cuando el token correcto queda fuera del subconjunto.
+El subconjunto se construyó con las salidas del propio modelo (26 respuestas de trabajo de agente en español), 12.5
+millones de tokens de código y documentos locales, y el relleno por orden de merges del BPE: 99.81 % de cobertura
+con K = 98304 y 99.44 % con K = 65536 sobre las respuestas reservadas, sin medir el inglés.
+
+La primera carga falló por el nombre de la tabla de ids (el loader pedía `output_sub_ids.weight`), y el Director
+descartó la vía antes de medirla: no quiere recortar la eficacia de la cabeza del draft. El código se retiró del
+árbol sin commit y los archivos de draft se borraron. Queda documentado aquí qué implicaba: un cambio de loader y
+grafo del draft, una tabla de ids por archivo y un subconjunto que tendría que cubrir al menos español e inglés, con
+un corpus de construcción y de evaluación bastante más grande que 26 respuestas.
