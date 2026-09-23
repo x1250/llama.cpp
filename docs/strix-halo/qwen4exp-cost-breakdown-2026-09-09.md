@@ -1,11 +1,12 @@
 # qwen4exp en Strix Halo: dónde va el tiempo y vías de optimización (2026-09-09, actualizado 2026-09-16)
 
-## Estado actual (2026-09-22)
+## Estado actual (2026-09-23)
 
-- Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410), las listas de la FA sparse desde la selección QSA (sección 21, build 413), la carga IQ3_S de 16 valores por hilo (sección 22, build 415) y los tiles de expertos que saltan las columnas vacías (sección 23, build 416).
+- Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410), las listas de la FA sparse desde la selección QSA (sección 21, build 413), la carga IQ3_S de 16 valores por hilo (sección 22, build 415), los tiles de expertos que saltan las columnas vacías (sección 23, build 416) y los quick wins de la sección 26: la marca del caché QSA agrupado por rango y el orden por counting sort (decode tras una imagen +12 %), y `--decode-share 0.4` con `--no-cache-idle-slots` para varios agentes a la vez.
   Producción: `strix load qwen38flash`
   (NP=2, `-c 524288` = 262144 × 2 slots, batch = ubatch 2048, KV q8_0, lazy mode auto, draft MTP IQ4_NL
-  n-max 2, mmproj con el encoder de visión en la GPU desde el 2026-09-22 (sección 24), `--ctx-checkpoints 8`),
+  n-max 2, mmproj con el encoder de visión en la GPU desde el 2026-09-22 (sección 24), `--ctx-checkpoints 8`,
+  `--decode-share 0.4`, `--no-cache-idle-slots`),
   archivo `NL3S/qwen4exp-nl3s-hcdi-gu-oproj8.gguf` (`quant = nl3s-hcdi-gu-oproj8`).
 - Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **70.4 s (561 t/s)**,
   re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s (64 ms por paso de 2.46 tokens, sección 24). Turno con una
@@ -1311,7 +1312,7 @@ imagen no cuadrada) activa los chequeos de límite en todos los bloques y cuesta
 
 | # | Palanca | Ganancia | Base | Riesgo |
 |---|---|---|---|---|
-| E1 | Cabeza de la ViT rellenada a 80 con ceros (Q, K y V; la salida se recorta a 72). Los MMA son los mismos que hoy (72 ya se rellena a 80 dentro del kernel), así que se espera bit-idéntico | −0.72 s al tope, −0.16 s a 8192, −0.03 s en 448×448 | medido: 141.9 frente a 168.6 ms por capa × 27 | bajo si se hace en el grafo de clip; el costo del relleno (~1 ms por capa) está por medir |
+| E1 | **Probada la variante en el kernel (sección 26): más lenta, revertida; queda el relleno en el grafo de clip, decisión del Director.** Cabeza de la ViT rellenada a 80 con ceros (Q, K y V; la salida se recorta a 72). Los MMA son los mismos que hoy (72 ya se rellena a 80 dentro del kernel), así que se espera bit-idéntico | −0.72 s al tope, −0.16 s a 8192, −0.03 s en 448×448 | medido: 141.9 frente a 168.6 ms por capa × 27 | bajo si se hace en el grafo de clip; el costo del relleno (~1 ms por capa) está por medir |
 | E2 | FA sin `Clamp` en los bloques completos: solo el último bloque con chequeo de límite | −0.37 s en 1920×1080 (55.0 → 41.2 ms por capa) | medido | medio: shader compartido con el LLM, compuertas de determinismo |
 | E3 | Caché de embeddings por id de imagen (sha256 + tamaño, LRU acotado): hoy no existe (`mtmd.cpp:2150-2167`, el lote se resetea por tarea en `server-context.cpp:432`) | −0.7 / −2.4 / −6.0 s por imagen que se reprocesa (volver a un checkpoint anterior a la imagen, cambio de slot, fallo del prompt cache); 0 en un multi-turno normal | código | bajo; 10-40 MiB por imagen |
 | E4 | `ffn_down` con K=4304, que no es múltiplo de 32 (la alineación mínima de los tiles, `ggml-vulkan.cpp:4712-4714`), va por el kernel no alineado: 10.2 TFLOPS, frente a 20.1 de `ffn_up` (mismos FLOPs) y 19.3 de la proyección de salida de la atención (misma m=1152, K=1152 alineado) | −0.21 s al tope, −0.11 s en 1080p, −0.06 s en 448 | medido (429 frente a 218 ms al tope, serializado) | bajo: relleno con ceros a 4352 de las filas de `ffn_up` y su bias y de las columnas de `ffn_down` al cargar el mmproj (GELU(0) = 0) |
@@ -1350,8 +1351,8 @@ adicional suma su diferencia entre celdas y posiciones.
 
 | # | Palanca | Ganancia | Base | Riesgo |
 |---|---|---|---|---|
-| I1 | `pooled_rm` con el rango de la primera celda borrada cuando la secuencia está ordenada por rango (el mismo orden que usa `set_input_qsa`) | −13.3 ms por paso de verificación a 40k con una imagen: el turno medido pasa de 26.1 a ~31.7 t/s (+21 %); más con más imágenes | medido el síntoma, causa en código | bajo: exacto (los bloques anteriores no cambian); gates de determinismo y la conversación texto → imagen → texto |
-| I2 | Orden por rango incremental por secuencia (hoy un `std::sort` de todas las celdas por ubatch con la GPU parada) | ≤ −1.6 ms por paso a 40k con imagen, crece con n_kv; esos 1.6 ms incluyen escribir las ~250 filas sucias que I1 quita, así que el reparto se conoce después de I1 | medido (set_inputs 3.45 frente a 1.86) | bajo, exacto |
+| I1 | `pooled_rm` con el rango de la primera celda borrada cuando la secuencia está ordenada por rango (el mismo orden que usa `set_input_qsa`) | −13.3 ms por paso de verificación a 40k con una imagen. **Medido (sección 26): 26.2 → 29.1 t/s (+11 %); la estimación de +21 % suponía otra reducción del paso de pared** | medido el síntoma, causa en código | bajo: exacto (los bloques anteriores no cambian); gates de determinismo y la conversación texto → imagen → texto |
+| I2 | Orden por rango incremental por secuencia (hoy un `std::sort` de todas las celdas por ubatch con la GPU parada) | ≤ −1.6 ms por paso a 40k con imagen, crece con n_kv. **Hecho como counting sort (sección 26): set_inputs 3.50 → 2.83 ms, +1 %** | medido (set_inputs 3.45 frente a 1.86) | bajo, exacto |
 | I3 | = E3 (caché de embeddings) | | | |
 | I4 | Texto y tokens de imagen en un mismo ubatch (hoy texto previo, cada trozo de imagen y la cola van en `llama_decode` separados) | −0.2 a −0.5 s por turno con imagen | código; la cola cuesta ≤ 0.35 s | alto: el grafo elige token o embd por ubatch, el PLE y el grafo MTP exigen tokens |
 | I5 | Presupuesto de tokens de imagen (hoy mínimo 1024, tope 4096) | el mínimo cuesta ~1.5 s por imagen chica; un tope de 2048 ahorra ~3 s de LLM y ~4 s de ViT al tope | código | calidad: decide el Director |
@@ -1388,9 +1389,9 @@ lo que predice el código: cada paso suyo espera un trozo de 2048 tokens del otr
 
 | # | Palanca | Ganancia | Base | Riesgo |
 |---|---|---|---|---|
-| C1 | Reparto del paso cuando un slot genera y otro procesa un prompt: k pasos de decode por trozo de prompt, o un tope de tokens de prompt por paso | el que genera: de 0.6 a ~7 t/s con el 20 % de la GPU, ~17 con el 50 % (solo va a 33.7); el prefill del otro se alarga en la misma proporción | medido el problema, reparto inferido | medio: planificador del server; el reparto es una decisión del Director |
+| C1 | Reparto del paso cuando un slot genera y otro procesa un prompt: k pasos de decode por trozo de prompt, o un tope de tokens de prompt por paso. **Hecho (sección 26): `--decode-share 0.4`, 0.56 → 13.7 t/s** | el que genera: de 0.6 a ~7 t/s con el 20 % de la GPU, ~17 con el 50 % (solo va a 33.7); el prefill del otro se alarga en la misma proporción | medido el problema, reparto inferido | medio: planificador del server; el reparto es una decisión del Director |
 | C2 | n-max según los slots que generan. **Cerrada por la medición: con dos generando, n-max 1 da +1 % (ruido) y sin MTP −4 %** | — | medido | — |
-| C3 | `--no-cache-idle-slots`: hoy cada tarea nueva copia el estado entero del slot idle al prompt cache (`:2455-2468`), aunque al reasignar el slot se guarda igual (`:1654-1668`) | decenas a cientos de ms por turno según la profundidad | código, costo inferido | bajo |
+| C3 | `--no-cache-idle-slots` (**hecho, sección 26: ~0.1 s por turno**): hoy cada tarea nueva copia el estado entero del slot idle al prompt cache (`:2455-2468`), aunque al reasignar el slot se guarda igual (`:1654-1668`) | decenas a cientos de ms por turno según la profundidad | código, costo inferido | bajo |
 | C4 | n_kv por stream: hoy el slot corto paga la profundidad del largo | hasta ~8 ms por paso a 40k de diferencia | inferido | alto: estructural |
 | C5 | `-ub 1024`: la mitad de espera por paso ajeno y de re-prefill por checkpoint | a medir: ub512 era −23 % de prefill a 4.7k | inferido | bajo, medir a profundidad |
 | C6 | Recorte del draft cuando dos prompts comparten ubatch (`qwen4exp.cpp:553-555` exige un stream) | ~170 ms por ubatch cuando ocurre | inferido | bajo |
@@ -1423,3 +1424,45 @@ palanca de decode (FA densa del draft, ~1.3 ms por paso a 40k).
 3. E1, E4: la ViT al tope −0.9 s con cambios en el grafo de clip y en la carga del mmproj.
 4. E3: caché de embeddings, para los re-procesos de imagen.
 5. E2, E5: kernels compartidos con el LLM, con las compuertas completas.
+
+## 26. Quick wins de la sección 25 medidos (2026-09-23, cadenas v22, v23 y v23b)
+
+Cada cambio se midió contra la build de producción en la misma cadena (base primero y último, binario base copiado y
+cargado con `LD_LIBRARY_PATH`), con las compuertas de exactitud: conversación texto → imagen → texto, turnos de 40k
+con y sin imagen idénticos a la base en texto, logprob del primer token y aceptación del draft, el turno con imagen
+repetido sobre el prefijo en caché idéntico, `graph_diff4` con solo los 72 SET_ROWS, `repeat_probe` y cero timeouts de
+anillo.
+
+| Palanca | Resultado | Estado |
+|---|---|---|
+| I1: marca del caché QSA agrupado por rango (68fc7b3bc) | paso de verificación a 40k con imagen 64.3 → 54.3 ms (build + alloc 12.1 ms → 0); decode 26.2 → 29.1 t/s (+11 %), exacto | en producción |
+| I2: orden por rango con counting sort por posición | set_inputs del paso con imagen 3.50 → 2.83 ms; decode 29.2 → 29.5 t/s (+1 %), exacto | en producción |
+| C1: `--decode-share` al 40 % (decisión del Director) | agente que genera durante un prefill ajeno de 15k: 0.56 → 13.7 t/s; el prefill ajeno 28.6 → 48.0 s (×1.65); dos agentes generando sin cambio | en producción, launcher `DECODE_SHARE=0.4` |
+| C3: `--no-cache-idle-slots` | hueco entre lanzamientos de dos tareas: 0.1 / 135 ms sin la copia del slot idle, 138 / 244 ms con ella (~0.1 s por turno) | en producción, launcher |
+| E1: el trozo parcial de K de la cabeza 72 preparado por subgrupo | todas las variantes de la FA 4-16 % más lentas, también las que no toman la rama (la 80 139 → 161 ms): la rama nueva en el bucle desenrollado cambia la compilación del kernel entero, como en la sección 23 | revertido |
+
+Lecturas:
+
+- **I1 no llega al +21 % estimado en la sección 25.2**: el paso con imagen ya cuesta lo mismo que con texto (67.6
+  frente a 66.0 ms por paso de pared); lo que queda de diferencia en t/s es la aceptación del draft, propia de la
+  respuesta (1.97 frente a 2.25 tokens por paso). Con varias imágenes el ahorro por paso crece: cada imagen sumaba su
+  diferencia entre celdas y posiciones a los bloques que se volvían a agrupar.
+- **I2** deja ~1 ms por paso sobre el texto: la segunda pasada de agrupación por rango.
+- **C1** reparte el tiempo por déficit: cada paso con generación y prompts pendientes a la vez es de prompt (un trozo
+  de 2048 o una imagen; los que generan van incluidos) o de decode (solo los que generan); un paso toma un trozo de
+  prompt solo cuando los pasos de decode ya tuvieron el 40 % del tiempo desde que empezó la contención, y la cuenta
+  se reinicia cuando uno de los dos trabajos se acaba. Sin contención el server se comporta como upstream. El agente
+  que genera recibe su 40 % en ráfagas: huecos de hasta ~4.4 s (un trozo de 2048 a 40k) seguidos de ~2.3 s de decode.
+- **C3**: la copia del slot idle explicaba ~0.1 s por turno, no los 0.25 s que se le atribuían; los otros ~135 ms del
+  hueco entre lanzamientos están en el camino HTTP (tokenización o plantilla de un prompt de 39k) y no se tocaron.
+- **E1** queda solo como relleno de la cabeza a 80 en el grafo de clip (medido: 141.9 frente a 168.6 ms por capa al
+  tope, −0.7 s por imagen de 2048×2048); es un rodeo en el grafo para un límite del kernel y lo decide el Director.
+- `graph_diff4` se recompiló contra los headers actuales (el binario del 2026-09-09 se caía con rc 139 al cambiar
+  `common_params`); una herramienta fuera del árbol que usa `common.h` se recompila con cada cambio de esa estructura.
+  Compilación (en `~/dbg/merge`, con `L` = el fork y producción descargada): `g++ -O2 -std=c++17 -I $L/include
+  -I $L/common -I $L/ggml/include graph_diff4.cpp -L $L/build/bin -lllama-common -lllama -lggml -lggml-base
+  -Wl,-rpath,$L/build/bin -o graph_diff4`.
+
+Pendientes de la sección 25 fuera de esta ronda: E2 y E5 (kernels compartidos con el LLM), E3 (caché de embeddings,
+un componente nuevo), E4 (exige transformar el mmproj, decisión del Director), C4 a C6 y las palancas de prefill de
+texto (25.4).
