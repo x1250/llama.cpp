@@ -3,6 +3,7 @@ IMPORTANT: Ensure you’ve thoroughly reviewed the [AGENTS.md](AGENTS.md) file b
 # Standing instructions from the Director (2026-09-23)
 
 - Documenting findings in `docs/strix-halo/`, running the investigation they call for (measurement windows on the GPU included) and correcting documented errors are done without asking. The GPU may be used for that; the only constraint is the resource safety below (never freeze the machine).
+- A successful optimization (every gate passed, adopted in production) is committed and pushed to both repos (fork and strix-halo) without asking; each push stays a separate command.
 
 # Resource safety on the Strix Halo desktop (mandatory)
 
