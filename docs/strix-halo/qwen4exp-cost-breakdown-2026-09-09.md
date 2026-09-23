@@ -1162,11 +1162,16 @@ Verificación por familia (perf logger serializado, cotas superiores; build 404,
 | Familia | ms | Detalle |
 |---|---|---|
 | Mat-vec densos | 18.6 | wqkv q5_K 3.0 (216 GB/s), router f32 2.55 (99 GB/s; el bf16 de igual forma del mismo grafo va a 165), cabeza q6_K 2.3 (227), ssm_out 1.7 (184), hc down m=324 1.7 (104), z 1.6 (194), hc up k=320 1.45 (124), wq 1.0, wo 0.96 |
-| Expertos gate/up IQ3_S (`batch=3`, camino de matmul) | 10.8 | ~26-28 expertos distintos por capa para 3 tokens: ~172 GB/s |
+| Expertos gate/up IQ3_S (`batch=3`, camino mat-vec-id) | 10.8 | ~26-28 expertos distintos por capa para 3 tokens: ~172 GB/s |
 | Expertos down IQ4_NL | 5.5 | ~224 GB/s |
 | FA sparse (12 capas) | 3.8 | modo compacto |
 | GET_ROWS + CPY (estado GDN) | 2.5 | 145 + 151 dispatches |
 | TOPK_QSA, RMS_NORM_MUL, GDN y el resto | ~8 | ~2500 dispatches pequeños |
+
+Los expertos del lote de verificación van por el mat-vec-id: el dispatch lo usa hasta 8 filas
+(`ggml_vk_use_mul_mat_vec_id`), y el perf logger añade `_VEC` al nombre solo con 1 fila, así que sus nodos de 3
+filas aparecen como `MUL_MAT_ID ... batch=3` sin serlo. (Corregido el 2026-09-23: esta tabla decía "camino de
+matmul".)
 
 Grafos del draft: el paso de 1 token suma 2.97 ms, de los que 1.58 son la cabeza iq4_nl de 248k filas y 0.53 la FA
 densa a 40k; el hook suma 1.5 ms, con 0.75 de FA densa.
@@ -1207,11 +1212,24 @@ MTP, CPU / GPU / CPU, cada uno con la conversación de referencia dos veces y, e
   MemAvailable 35 GiB tras cargar y 34 tras la imagen.
 
 Solo se midió qwen38flash; el default cambia para todas las familias con mmproj del launcher, y el gate de
-memoria del launcher suma ahora el mmproj en todos los modelos. El encoder ya es una parte chica del turno: para la
-imagen de 448×448, 3.4 s totales menos ~2 s del LLM al ritmo de texto y ~0.5 s de decode dejan ~1 s para el ViT.
-Hipótesis, sin separar todavía: el resto es el prefill del LLM sobre los tokens de imagen, más lento que en texto
-por los ubatches partidos en los cortes de imagen y la agrupación QSA por rango. `--image-min-tokens 1024` es un
-requisito de grounding de Qwen-VL, no una perilla de rendimiento.
+memoria del launcher suma ahora el mmproj en todos los modelos. `--image-min-tokens 1024` es un requisito de
+grounding de Qwen-VL, no una perilla de rendimiento.
+
+Reparto del turno con el encoder en la GPU, de las marcas de tiempo del log del rig (el lanzamiento de la tarea, el
+envío de cada ubatch de imagen, que `find_slot` marca por sus posiciones no consecutivas, y el fin del prompt;
+`llama_decode` es asíncrono, así que cada marca es un envío y el tiempo de GPU de un ubatch se lee hasta la marca
+siguiente):
+
+| Imagen | Tokens de imagen | ViT + preproceso + texto previo | Prefill de los tokens de imagen | Cola de texto + últimos 4 |
+|---|---|---|---|---|
+| 448×448 | 1024 | 0.78 s | 1.71 s (~600 t/s) | ≤ 0.35 s |
+| 1920×1080 | 2040 | 2.43 s | ~3.0 s (~680 t/s) | ~0.44 s |
+| 2048×2048 | 4096 | 5.99 s | ~5.6-5.9 s en 2 ubatches | ~0.35 s |
+
+Los tokens de imagen se procesan al ritmo del texto; el encoder es el 27-47 % del prompt y crece más rápido que los
+parches. (Corregido el 2026-09-23: esta sección decía que el resto del turno era un prefill de imagen más lento que
+el de texto, y el reparto del 2026-09-22 atribuía 0.8 s a la cola de texto, que incluían 447 ms de generación.) El
+inventario de palancas del encoder, de las imágenes y de la ejecución paralela está en la sección 25.
 
 El log del kernel es legible para este usuario (122 líneas de amdgpu en el arranque), así que el cero de timeouts
 de la ventana es una medida y no una ausencia de acceso. El mismo log muestra tres resets de la cola de cómputo del
