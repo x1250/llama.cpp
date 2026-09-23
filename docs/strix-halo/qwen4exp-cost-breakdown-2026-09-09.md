@@ -7,14 +7,16 @@
   (NP=2, `-c 524288` = 262144 × 2 slots, batch = ubatch 2048, KV q8_0, lazy mode auto, draft MTP IQ4_NL
   n-max 2, mmproj con el encoder de visión en la GPU desde el 2026-09-22 (sección 24), `--ctx-checkpoints 8`,
   `--decode-share 0.4`, `--no-cache-idle-slots`),
-  archivo `NL3S/qwen4exp-nl3s-hcdi-gu-oproj8.gguf` (`quant = nl3s-hcdi-gu-oproj8`).
+  archivo `NL3S/qwen4exp-nl3s-hcdi-gu-rq8-oproj8.gguf` (`quant = nl3s-hcdi-gu-rq8-oproj8`, router en Q8_0,
+  sección 27).
 - Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **70.4 s (561 t/s)**,
-  re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s (64 ms por paso de 2.46 tokens, sección 24). Turno con una
+  re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s (63.9 ms por paso sin instrumentar, sección 28; los tokens por
+  paso dependen del texto). Turno con una
   imagen de 448×448 en producción 4.1 s (antes 30.9). Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
-- Lista de trabajo vigente: sección 13 (prefill) y sección 25 (encoder, imágenes, ejecución paralela, con la
-  ventana v21 del 2026-09-23). Desglose por nodo vigente: sección 2. Las secciones 5-12 son el
-  registro de cada ventana de medición, en orden cronológico.
+- Lista de trabajo vigente: sección 13 (prefill), sección 25 (encoder, imágenes, ejecución paralela, con la
+  ventana v21 del 2026-09-23) y sección 28 (presupuesto del decode). Desglose por nodo vigente: sección 2. Las
+  secciones 5-12 son el registro de cada ventana de medición, en orden cronológico.
 
 Cronología del prefill de 39.5k a 40k (misma máquina, mismo rig):
 
@@ -1538,3 +1540,122 @@ descartó la vía antes de medirla: no quiere recortar la eficacia de la cabeza 
 árbol sin commit y los archivos de draft se borraron. Queda documentado aquí qué implicaba: un cambio de loader y
 grafo del draft, una tabla de ids por archivo y un subconjunto que tendría que cubrir al menos español e inglés, con
 un corpus de construcción y de evaluación bastante más grande que 26 respuestas.
+
+## 28. Presupuesto del paso de decode a 40k (2026-09-23, cadena v27)
+
+Ventana sin cambios de código (binario 7aefa3489, archivo rq8, draft IQ4_NL). Cinco cargas NP=1 (ctx 57344, MTP
+n-max 2), una a la vez: sin instrumentar, timing de host (`LLAMA_INPUT_TIMING` + `LLAMA_SPEC_TIMING`), perf logger
+concurrente, perf logger serial y otra vez sin instrumentar. Cada carga hace el prefill de 39.5k una vez y dos turnos
+de 1024 tokens sobre ese prefijo (384 con el logger): greedy y el muestreo de producción (temp 0.7, top_k 20, top_p
+0.95), con `ignore_eos` para que cada carga decodifique los mismos tokens. Relojes, actividad y potencia de la GPU
+muestreados cada segundo con `amdgpu_top -gm`. Cero timeouts de anillo; producción recargada con el probe idéntico al
+de v26. Herramientas en `~/dbg/merge`: `decode_budget.py` (rig), `budget_parse.py` (línea de tiempo de host),
+`vk_budget_parse.py` (bloques del perf logger por ubatch), `vk_family.py` (familias), `power_sampler.py`.
+
+### 28.1 El paso
+
+| Carga | Greedy, ms por paso | Producción, ms por paso |
+|---|---|---|
+| Sin instrumentar (primera) | 64.29 | 63.56 |
+| Timing de host | 66.06 | 65.75 |
+| Perf logger concurrente | 79.38 | 79.32 |
+| Perf logger serial | 79.80 | 79.23 |
+| Sin instrumentar (última) | 63.76 | 63.78 |
+
+Un paso de verificación sin instrumentar dura **63.9 ms** y, en este texto, entrega 2.19 tokens (1024 tokens en 467
+pasos, 34 t/s). El muestreo de producción cuesta lo mismo que greedy: el pedido greedy también pasa por el top_k 20
+del server en la CPU. La carga con timing es 2.1 ms (3 %) más lenta, así que las partes de host de 28.2 vienen de un
+régimen algo perturbado; las cifras de GPU no dependen de eso.
+
+### 28.2 Reparto del paso (carga con timing, turno greedy, 465 pasos)
+
+| Tramo | Pared, ms | GPU ocupada, ms | Detalle |
+|---|---|---|---|
+| Verificación del target, 3 tokens | 53.49 | ≤ 47.6 | set_inputs 1.80 con la GPU parada; grabación en host 15.6 solapada con la GPU; espera 35.9 |
+| Hook del draft, 3 tokens | 1.78 | 0.38 | build 0.14 + alloc 0.59 en cada paso: el grafo nunca se reutiliza (0 de 482) |
+| Dos pasos del draft, 1 token | 7.71 | 2 × 2.96 | cabeza del draft 1.61 por paso; el primer paso tras el hook se reconstruye (build 0.09 + alloc 0.53) |
+| Huecos de host | 3.08 | 0 | muestreo del target en CPU 1.27 (3 posiciones), clon del sampler 0.21, post 0.22, resto 1.4 |
+| **Total** | **66.06** | **≤ 54.0** | |
+
+La GPU trabaja ≤ 54 ms de 66 (gfx_activity medio 84-86 %). Unos 12 ms del paso son host en serie con la GPU:
+set_inputs de la verificación 1.8, GPU esperando dentro de la verificación ≤ ~4 (51.4 ms de compute + espera frente a
+≤ 47.6 de trabajo, en la carga perturbada), hook 1.4, pasos del draft 1.7 y huecos 3.1. Dónde se va el tiempo de
+host del hook y del draft: `llama_context` guarda un solo grafo previo (`gf_res_prev`), y el hook (3 tokens) y el
+paso del draft (1 token) se alternan en el mismo contexto, así que cada paso reconstruye y reasigna dos grafos.
+
+### 28.3 La GPU de la verificación por familia
+
+Método: el perf logger concurrente pone un timestamp en cada sincronización que el grafo ya tiene y mide cada grupo de
+nodos entre dos barreras con su concurrencia real. El último grupo (la cabeza del target) queda sin timestamp y se
+toma del serial; dentro de un grupo, el tiempo se reparte en proporción a los tiempos del serial. Son cotas
+superiores, porque el logger agrega una barrera y un timestamp por sincronización. Las familias salen de los tipos y
+formas del header del GGUF.
+
+El grafo de verificación tiene **2327 sincronizaciones para 3269 nodos**, y el serial (48.0 ms) es casi igual al
+concurrente más la cabeza (47.6): casi no hay concurrencia, así que el número de barreras es un blanco medido.
+
+| Familia | ms | Bytes por paso | GB/s |
+|---|---|---|---|
+| Expertos gate/up (IQ3_S, 47 capas) | 11.18 | ~1.79 GB con ~27 expertos por capa | ~160 |
+| Expertos down (IQ4_NL) | 5.61 | ~1.19 GB con ~27 | ~213 |
+| FA sparse (12 capas QSA) | 3.78 | crece con la profundidad | — |
+| Mezcladores hc (96 + 96 mat-vec: 324 × k 10240 y 10240 × k 320) | 3.37 | 360 MB | **107** |
+| Copias y filas (CPY, CONT, GET/SET_ROWS, CONCAT) | 3.20 | — | — |
+| GDN attn_qkv (q5_K) | 3.04 | 649 MB | 213 |
+| Elementwise y otros ops chicos | 2.82 | — | — |
+| Cabeza del target (q6_K) | 2.30 | 521 MB | 226 |
+| GDN ssm_out / attn_gate (IQ4_NL) | 1.75 / 1.60 | 318 / 318 MB | 182 / 199 |
+| Normas | 1.11 | — | — |
+| QSA attn_q/k/v | 1.09 | 232 MB | 212 |
+| Experto compartido | 1.05 | 133 MB | 127 |
+| QSA attn_output (q8_0) / QSA top-k | 0.98 / 0.98 | 200 MB / — | 204 / — |
+| Router (q8_0) / recurrencia y conv GDN | 0.74 / 0.74 | 67 MB / — | 91 / — |
+| hc ops, ruteo MoE, indexer bf16, alfa/beta, otros mat-vec | 2.28 | — | — |
+| **Total** | **47.6** | | |
+
+Agrupado: pesos (mat-vec y expertos) 33.9 ms para ~5.9 GB (~174 GB/s de media), atención (FA y top-k QSA) 4.8 ms y
+ops chicos 8.9 ms (copias, elementwise, normas, recurrencia, hc ops, ruteo), casi uno por barrera. El número de
+expertos distintos por capa con 3 tokens no se midió en esta ventana (~27 según la sección 24.1), así que los GB/s de
+los expertos son estimados; los de los pesos densos salen de bytes exactos. Grafos del draft: el paso de 1 token
+suma 2.96 ms (cabeza 1.61, FA densa a 40k 0.50) y el hook 0.38 ms (22 nodos tras el recorte de la sección 19).
+
+### 28.4 La máquina está limitada por potencia
+
+Muestras de `amdgpu_top -gm` durante el decode de las cargas sin instrumentar (turno de producción, ~30 s):
+
+| Medida | Decode | Prefill |
+|---|---|---|
+| Potencia del paquete | 85.0 W, plana | ~85 W (picos de 94-107 W al arrancar) |
+| GPU / núcleos de CPU | 35-36 W / 1-1.5 W | 27-32 W / 1-5 W |
+| Resto (SoC, memoria, fabric) | ~48 W | ~50 W |
+| gfxclk | ~2.48 GHz (máximo 2.9) | 2.1-2.4 GHz |
+| fclk / uclk | ~1.67 GHz (máximo 2.0) / 1.0 GHz (máximo) | ~1.65-1.75 / 1.0 |
+| gfx_activity | 84-86 % | 94-99 % |
+
+El contador `throttle_residency_sppt` avanza sin pausa mientras la GPU trabaja (unas 30000 unidades por turno de
+30 s) y queda quieto en reposo; `spl` y `prochot` no se mueven, `fppt` y `thm_core` poco. Placa AXB35-03, BIOS 1.08,
+`powerprofilesctl` en performance. No se sabe la unidad del contador ni los modos de potencia que expone esta BIOS.
+El límite afecta al prefill además del decode: el prefill corre a 99 % de actividad con la GPU a 2.1-2.4 GHz.
+
+Consecuencia para las palancas: con el paquete en su tope, quitar tiempo ocioso de la GPU sube la potencia media y
+el SMU responde bajando relojes, así que las palancas de host recuperan menos que el tiempo que quitan; las que leen
+menos bytes ahorran tiempo y potencia de memoria (~48 W no son ni GPU ni CPU). Las palancas se ordenan solo por ms
+por paso medidos de punta a punta, base primero y último, nunca por la aritmética de este presupuesto.
+
+### 28.5 Palancas que salen del presupuesto
+
+| Palanca | Costo medido hoy | Ahorro | Estado |
+|---|---|---|---|
+| Modo de potencia del paquete (BIOS o límites PPT) | GPU a ~2.48 GHz y fclk ~1.67 GHz bajo SPPT, en decode y prefill | desconocido sin cambiar el modo | decisión del Director; la re-medida es esta misma cadena más el prefill, con los contadores térmicos |
+| GPU parada dentro de la verificación | ≤ ~4 ms | hasta ~4 ms | causa por aislar: latencia del lote de submit (100 nodos) frente al ritmo de grabación (15.6 ms para 3269 nodos, 4.8 µs por nodo); ventana v28 |
+| Grafos del draft reconstruidos (hook y primer paso) | ~1.3 ms (build + alloc de dos grafos) | ~1.3 ms | reutilizar dos grafos en el contexto del draft; hoy `gf_res_prev` guarda uno |
+| Mezcladores hc a 107 GB/s | 3.37 ms | ~1.7 ms a 210 GB/s | 324 filas × k 10240 dan 81 workgroups; candidato split-k. El microbench no sirve (tensores en la MALL, sección 26.1) |
+| Expertos gate/up a ~160 GB/s | 11.2 ms | ~2.5 ms a 210 GB/s | D2; sin ganancia por forma de kernel (sección 26.1) |
+| Muestreo del target en CPU | 1.27 ms + clon 0.21 | < 1 ms | microbench de CPU en v28 (`sampler_bench.cpp`) |
+| set_inputs de la verificación | 1.8 ms | ~1 ms | D7, agrupación QSA incremental |
+| Ops chicos y barreras | 8.9 ms en ~2300 dispatches | fusiones de la fila 17 (~220 dispatches) | medido por familia; cada fusión se mide de punta a punta |
+
+Ventana siguiente (v28), producción descargada, base sin instrumentar primero y último: una carga con
+`LLAMA_SPEC_TIMING` solo (su tramo `verify` es decode + sync sin las sincronizaciones forzadas de `LLAMA_INPUT_TIMING`,
+para acotar la GPU parada con el paso sin perturbar), `GGML_VK_MAX_NODES_PER_SUBMIT` en 25, 50 y 200 (separa la
+latencia del lote de submit del ritmo de grabación) y el microbench del muestreo antes de la primera carga.
