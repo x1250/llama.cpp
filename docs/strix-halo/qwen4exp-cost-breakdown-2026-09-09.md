@@ -1472,3 +1472,27 @@ Lecturas:
 Pendientes de la sección 25 fuera de esta ronda: E2 y E5 (kernels compartidos con el LLM), E3 (caché de embeddings,
 un componente nuevo), E4 (exige transformar el mmproj, decisión del Director), C4 a C6 y las palancas de prefill de
 texto (25.4).
+
+
+### 26.1 Barrido de los mat-vec del lote de verificación (cadena v24): sin quick wins
+
+Las vías 3, 10 y 13 atribuían parte del decode a la forma de los mat-vec (filas por workgroup, tamaño del
+workgroup). Se midieron con perillas temporales (no quedan en el árbol) sobre los casos de perf del lote de 3 tokens
+que ahora trae `test-backend-ops` (router f32, mezcladores hc, alfa/beta, proyecciones, cabeza, gate+up fusionado y
+down de expertos), base primero y último:
+
+| Variante | Router f32 m=512 | gate+up iq3_s m=1280 | down iq4_nl m=2560 | hc down m=324 | Resto |
+|---|---|---|---|---|---|
+| Base (repetida al final) | 9.1 µs | 160 µs | 92-98 µs | 12.6 µs | — |
+| f32 con 2 / 4 filas (vía 13) | 9.6 / 9.9 | igual | igual | igual | igual |
+| IQ con 8 filas (vía 3) | igual | 159 | 89 | 44.0 | alfa/beta 4.1 → 6.7 |
+| IQ con 2 filas | igual | 180 | 105 | 12.2 | proyecciones +5-10 % |
+| Workgroup grande en AMD, k ≥ 1024 / ≥ 256 | 11.6 | 212 / 206 | 94 / 163 | 11.6 | proyecciones +40-110 % |
+
+Los valores por defecto de RDNA (4 filas en IQ, workgroup de un subgrupo) son los mejores para estas formas; la
+primera medida de la base del router (15.4 µs) fue un artefacto de la primera corrida. Los tensores de menos de ~32
+MB quedan en la MALL entre corridas del microbench (el router lee a >500 GB/s aislado, 99 GB/s en el modelo), así que
+el microbench no reproduce el costo de DRAM de esos nodos: lo que cuestan en el modelo es ancho de banda y contexto
+del grafo, no la forma del workgroup. Las vías 3, 10 y 13 quedan cerradas como afinación; lo que sigue en decode
+exige menos bytes (router q8_0 en el GGUF, vía 13 alternativa; cabeza del draft recortada, vía 9) o menos trabajo
+(vía 16), no otra forma del kernel.
