@@ -1758,3 +1758,15 @@ paso). Clasificación por pila con `~/dbg/merge/perf_fold.py`, 402 pasos. El hil
 cada candidato vuelve a probar ~13 patrones de fusión y, para el patrón QSA, todos sus desplazamientos. El llenado de
 candidatos cuesta 0.18-0.22 ms por posición en el server frente a 0.077 en el microbench con logits en memoria normal;
 los logits del server viven en el buffer de salida pinned de Vulkan (tipo de memoria sin verificar).
+
+### 28.9 `match_pattern` del optimizador de grafos con salida temprana: adoptado (cadena v32, cda30216f)
+
+`ggml_vk_graph_optimize` comparaba cada op de un patrón de fusión aunque el primero ya no coincidiera; ahora retorna en
+la primera diferencia, con el mismo orden de salida. Perfil DWARF de la carga nueva (turno de producción, 415 pasos):
+el optimizador baja de 0.77 a 0.60 ms de host por paso; el resto del reparto de la sección 28.8 no cambia. Paso sin
+instrumentar 61.98 / 61.36 ms (greedy / producción) frente a 61.82 / 61.61 de la build de v30: la ganancia queda bajo el
+ruido del paso. Respuestas idénticas a las de la build de v30 en los dos turnos, `graph_diff4` 72 nodos, probe idéntico
+a `probe-v26.out`, conversación con imagen 5/5 y la imagen de 2048×2048 en 14.2 s, cero timeouts de anillo.
+
+Lo que queda del optimizador (0.60 ms por paso) es `is_src_of` y la ventana de 20 nodos por candidato, en cada uno de
+los dos grafos del draft que se reconstruyen por paso; la palanca completa es no reconstruirlos (sección 28.5).
