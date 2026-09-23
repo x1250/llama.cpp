@@ -11,7 +11,8 @@
   re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s (64 ms por paso de 2.46 tokens, sección 24). Turno con una
   imagen de 448×448 en producción 4.1 s (antes 30.9). Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
-- Lista de trabajo vigente: sección 13. Desglose por nodo vigente: sección 2. Las secciones 5-12 son el
+- Lista de trabajo vigente: sección 13 (prefill) y sección 25 (encoder, imágenes, ejecución paralela, con la
+  ventana v21 del 2026-09-23). Desglose por nodo vigente: sección 2. Las secciones 5-12 son el
   registro de cada ventana de medición, en orden cronológico.
 
 Cronología del prefill de 39.5k a 40k (misma máquina, mismo rig):
@@ -553,7 +554,7 @@ cadena de medición completa (base primero y último, MTP on, determinismo).
 | 2 | Vía 2 bis: lista por token de la FA sparse construida desde los índices del selector QSA (hoy el prepass barre la fila de máscara entera, 40k columnas por token) y las 4 filas coopmat vacías. **Hecha la lista desde los índices (2026-09-22, sección 21): −0.4 s a 40k, −0.2 s a 55k, −9 % del nodo a 131k; el barrido era ~1 % del nodo, no el 40 % que suponía la sección 9: lo que queda de la FA sparse son los gathers de K/V por token. Las 4 filas vacías no cambian ese tráfico** | — | — | — |
 | 3 | Desquantizado IQ3_S en el kernel coopmat de MUL_MAT_ID (recuento de instrucciones, cargas de 16 bits, tabla en shmem). **Hecha la anchura de carga (2026-09-22, sección 22): 16 valores por hilo, −4 a −7 % del nodo, −0.6 s en el modelo, bit-idéntica. Lo que queda del nodo es el MMA desperdiciado del tile (128 columnas para 40 filas por experto), no el desquantizado** | ≤ −0.5 s más | medio | microbench |
 | 4 | Vía 12: host (`prefetch_ple_rows`, 20k llamadas síncronas por ubatch; huecos entre submisiones, 204 ms por ciclo). **Cerrada (2026-09-18, sección 16): el input PLE son 130-190 ms de E/S aleatoria por ubatch; agrupar o repartir el encolado no cambia el total, batch 8192 pierde decode. El read-ahead entre decodes por hint del server está hecho (2026-09-22, sección 20): −3.3 s, set_inputs 157 → 27 ms por ubatch** | — | — | — |
-| 5 | Vía 16: el draft reutiliza la selección QSA del target (sin indexador en el draft) | −2 s a 40k, crece con la profundidad | medio-alto: flujo del MTP | diseño |
+| 5 | Vía 16: el draft reutiliza la selección QSA del target (sin indexador en el draft). **Re-valorada (2026-09-23, sección 25.4): la fila 9 dejó la atención densa del draft solo en las filas de salida (draft 232 → 64 ms por ubatch), así que en el prefill ya no queda casi nada; sigue como palanca de decode (FA densa del draft, ~1.3 ms por paso a 40k)** | ~0 en prefill | medio-alto: flujo del MTP | diseño |
 | 6 | Elementwise sobre el residual ancho (RMS_NORM_MUL 2.5 s, HC_GATED_MEAN 1.9, CONT 0.85, ADD 0.8): fusiones adicionales. **Rebajada (2026-09-22, sección 20): quitar el CONCAT entero (0.93 s en el perfil serializado) dio −0.13 s en el modelo; el backend solapa estos nodos con las matmuls, así que el perfil serializado sobreestima su costo real varias veces** | ≤ −0.5 s | medio | perfil por nodo (sección 2) |
 | 7 | Vía 1 bis: expertos `down` (k=640, ~9 ms por dispatch, 7.3 TFLOPS): cargas de B fuera del bucle de filas, BK_STEP. **Hecha en parte (2026-09-22, sección 20): ceros en las columnas sin fila del tile, −3.8 % en el nodo MMQ (−0.3 s); BK_STEP=2 medido en el microbench (sección 20)** | — | — | — |
 | 8 | Vías menores 19-23: QSA por bloques, ssm_conv (= fila 11), mat-muls diminutos (techo 0.5 s repartido en 2-3 arreglos, sección 18), MMVQ IQ4_NL, GDN chunked | −0.5 a −1 s cada una | bajo-medio | varias |
@@ -609,8 +610,8 @@ target 3.8 ms (D5), cabeza del draft 3.2 ms (vía 9, aplazada).
 |---|---|---|---|---|
 | Prefill | 80.8 s a 40k (489 t/s) | sí (secciones 2, 13) | −8 a −10 s con las filas 1-4 de la sección 13 (~550 t/s); techo ~68 s | vía 18 (gate/up en un tensor) |
 | Decode | 38-41 t/s a 40k; 39.3 ms de GPU por paso | sí (sección 1) | −6 a −9 ms por paso (46-48 t/s): los grafos del draft son el 35 % del paso y sus expertos cuestan 4.8 ms para un bloque frente a 8.5 ms de los 48 del target | perfil por nodo del draft (`GGML_VK_PERF_LOGGER` sobre los grafos pequeños) |
-| Imágenes | **resuelto (2026-09-22, sección 24.2): el encoder corría en CPU por un flag del launcher. En la GPU: 448×448 30.9 → 3.4 s, captura 1920×1080 103 → 7.7 s, 2048×2048 (tope de 4096 tokens) 381 → 14.6 s, misma memoria, mismas respuestas** | sí | — | queda el prefill del LLM sobre los tokens de imagen, ahora la mayor parte del turno |
-| Ejecución paralela (NP=2) | sin medir | no: todos los rigs son NP=1 | desconocida; el server mete los tokens de ambos slots en un batch, así que el decode de dos peticiones debería costar poco más que uno; abiertos: reparto del prefill entre slots, MTP con dos slots activos, memoria de estados GDN y checkpoints por slot | rig con dos peticiones concurrentes (prefill y decode) con el conjunto de producción |
+| Imágenes | **resuelto (2026-09-22, sección 24.2): el encoder corría en CPU por un flag del launcher. En la GPU: 448×448 30.9 → 3.4 s, captura 1920×1080 103 → 7.7 s, 2048×2048 (tope de 4096 tokens) 381 → 14.6 s, misma memoria, mismas respuestas** | sí | — | queda: los tokens de imagen van al ritmo del texto; el encoder (27-47 % del prompt) y el decode posterior a una imagen (−22.5 % a 40k por el caché QSA agrupado) tienen palancas medidas en la sección 25 |
+| Ejecución paralela (NP=2) | **medida (2026-09-23, sección 25.3): dos agentes generando a 40k dan 19.6-20.0 t/s cada uno, 38.6 en total (uno solo: 33.7); el MTP sigue ganando con dos streams; un agente que genera cae a 0.6 t/s mientras el otro procesa un prompt** | sí | el reparto del paso entre prompt y decode (C1) | decisión del Director sobre el reparto |
 
 Prefill de 76.5k tokens en producción (log del Director, 2026-09-16, NP=2, con cortes de imagen):
 
@@ -1263,4 +1264,161 @@ sobre el perfil, no de formas de nodo, y por lo aprendido con el concat (secció
 fracción: −0.5 a −1.2 s a 40k entre las tres; las dos primeras crecen de forma cuadrática con la profundidad del
 prefill.
 
-No cubierto: ejecución paralela con dos slots (NP=2).
+No cubierto: ejecución paralela con dos slots (NP=2); medida en la sección 25.3.
+
+## 25. Inventario de palancas del encoder, las imágenes, la ejecución paralela y el prefill (2026-09-23, ventana v21)
+
+Tres auditorías de solo lectura del código (encoder de visión, lado LLM de los prompts con imagen, servidor con dos
+slots), cada afirmación verificada contra el código, y una ventana de medición para lo que el código no resuelve
+(`chain_v21.sh`, build 416 más los casos de perf de la ViT en `test-backend-ops`): microbench de la flash attention
+de la ViT, perfil de la ViT con el perf logger, decode a 40k con y sin una imagen al inicio (`LLAMA_INPUT_TIMING`)
+y rigs NP=2 a 40k por slot con n-max 2, 1 y sin MTP. Cero timeouts de anillo en toda la ventana; el mínimo de
+MemAvailable fue 41 GiB.
+
+### 25.1 Encoder (ViT de Qwen3-VL, en la GPU)
+
+La ViT corre con flash attention por el camino coopmat1 (`-fa on` → `CLIP_FLASH_ATTN_TYPE_ENABLED`,
+`GGML_PREC_F32`, sin máscara): con `GGML_VK_DISABLE_COOPMAT=1` el mismo caso tarda 13.2 ms en lugar de 10.2. Un
+nodo que supera el tope de FLOPs por envío (200 GFLOP como máximo, `ggml-vulkan.cpp:19083`) va en un envío propio
+(`:19134-19143`), así que el tope de 2 s por envío no está en juego: 168 ms por capa al tope.
+
+Reparto por familia (perf logger serializado; la FA coincide con el microbench):
+
+| Imagen | Parches | ViT | FA | Matmul | ADD (bias) | Resto |
+|---|---|---|---|---|---|---|
+| 448×448 | 4096 | 0.61 s | 0.27 (44 %) | 0.22 | 0.05 | 0.07 |
+| 1920×1080 | 8160 | 2.17 s | 1.48 (68 %) | 0.43 | 0.13 | 0.13 |
+| 2048×2048 | 16384 | 5.95 s | 4.52 (76 %) | 0.89 | 0.27 | 0.27 |
+
+El preproceso en CPU (base64, PNG, bicubic, normalización) y el texto previo suman ~0.1 s; la primera imagen tras
+cargar paga ~0.15 s de compilación de pipelines. Ninguno es palanca.
+
+Microbench de la FA de la ViT (16 cabezas, sin máscara, f32 acc; ms por capa):
+
+| Cabeza | Parches | ms | TFLOPS |
+|---|---|---|---|
+| 72 | 4096 | 10.05 | 7.7 |
+| 72 | 8160 (no múltiplo de 64: variante `Clamp`) | 54.96 | 5.6 |
+| 72 | 8192 | 41.25 | 7.5 |
+| 72 | 16384 | 168.6 | 7.3 |
+| 64 | 16384 | 113.4 | 9.7 |
+| 80 | 16384 | 141.9 | 9.7 |
+
+La cabeza 80 hace un 11 % más de trabajo que la 72 y tarda un 16 % menos. Con 72 el último trozo de 16 columnas de K
+(64-79) no está completo y va por `stage_k` (`flash_attn_cm1.comp:329`): dos barreras y una copia a memoria
+compartida por cada bloque de 64 claves; con 80 se carga directo. La variante `Clamp` (N no múltiplo de 64, casi toda
+imagen no cuadrada) activa los chequeos de límite en todos los bloques y cuesta un 33 %.
+
+| # | Palanca | Ganancia | Base | Riesgo |
+|---|---|---|---|---|
+| E1 | Cabeza de la ViT rellenada a 80 con ceros (Q, K y V; la salida se recorta a 72). Los MMA son los mismos que hoy (72 ya se rellena a 80 dentro del kernel), así que se espera bit-idéntico | −0.72 s al tope, −0.16 s a 8192, −0.03 s en 448×448 | medido: 141.9 frente a 168.6 ms por capa × 27 | bajo si se hace en el grafo de clip; el costo del relleno (~1 ms por capa) está por medir |
+| E2 | FA sin `Clamp` en los bloques completos: solo el último bloque con chequeo de límite | −0.37 s en 1920×1080 (55.0 → 41.2 ms por capa) | medido | medio: shader compartido con el LLM, compuertas de determinismo |
+| E3 | Caché de embeddings por id de imagen (sha256 + tamaño, LRU acotado): hoy no existe (`mtmd.cpp:2150-2167`, el lote se resetea por tarea en `server-context.cpp:432`) | −0.7 / −2.4 / −6.0 s por imagen que se reprocesa (volver a un checkpoint anterior a la imagen, cambio de slot, fallo del prompt cache); 0 en un multi-turno normal | código | bajo; 10-40 MiB por imagen |
+| E4 | `ffn_down` con K=4304, que no es múltiplo de 32 (la alineación mínima de los tiles, `ggml-vulkan.cpp:4712-4714`), va por el kernel no alineado: 10.2 TFLOPS, frente a 20.1 de `ffn_up` (mismos FLOPs) y 19.3 de la proyección de salida de la atención (misma m=1152, K=1152 alineado) | −0.21 s al tope, −0.11 s en 1080p, −0.06 s en 448 | medido (429 frente a 218 ms al tope, serializado) | bajo: relleno con ceros a 4352 de las filas de `ffn_up` y su bias y de las columnas de `ffn_down` al cargar el mmproj (GELU(0) = 0) |
+| E5 | Bias de las matmuls fusionado en el epílogo (hoy un ADD aparte) | ≤ −0.27 s al tope | perf logger serializado | medio: epílogo del matmul compartido |
+| E6 | mmproj en Q8_0 | ≤ −0.2 s al tope | inferido | calidad de lectura y grounding: decide el Director |
+
+Suma realista de E1, E2, E4 y E5: al tope 5.95 → ~4.9 s (−18 %), en 1080p 2.17 → ~1.5 s (−30 %), en 448×448 0.61 →
+~0.5 s. Techo por encima de eso: la FA de la ViT corre a 7-10 TFLOPS contra 18-23 de las matmuls densas; una FA con
+tiles de más filas para N grande (hoy Br = 16: K y V se releen N/16 veces por cabeza) es un proyecto de kernel, sin
+estimación medida.
+
+### 25.2 Imágenes, lado del LLM
+
+El reparto del turno está en la sección 24.2: los tokens de imagen se procesan al ritmo del texto. Lo que aparece
+en la ventana es un costo del decode que queda para el resto de la conversación.
+
+Decode a ~40k de profundidad, mismo texto y 256 tokens greedy, con y sin una imagen de 448×448 al inicio (rig NP=1,
+`LLAMA_INPUT_TIMING`, medianas del grafo de verificación):
+
+| Turno | t/s | Paso de verificación | build | alloc | set_inputs | compute + espera de GPU |
+|---|---|---|---|---|---|---|
+| Texto | 33.70 | 53.1 ms | 0 | 0 | 1.86 | 51.1 |
+| Imagen + texto | **26.10** | **66.3 ms** | **2.17** | **11.1** | 3.45 | 51.2 |
+| Texto (caché) | 34.26 | 52.4 ms | 0 | 0 | 1.35 | 51.0 |
+
+Con la imagen el grafo de verificación se reconstruye y se reasigna en cada paso (+13.3 ms) y el set_inputs sube
+1.6 ms: −22.5 % de decode. Causa (código): la marca de agua del caché de claves agrupadas del QSA (`pooled_valid`)
+cuenta bloques por rango cuando la secuencia tiene una imagen (las celdas de imagen comparten posición y el
+agrupamiento pasa a rango, `llama-memory-hybrid-idx.cpp:583-613`), pero `pooled_rm` la retrocede con la posición
+del primer token borrado (`p0/ratio`, `llama-memory-hybrid-idx.cpp:383-406`). Tras cada verificación con rechazo el
+server borra desde `pos_next()` (`server-context.cpp:4059`), la marca cae ~250 bloques (las 1024 celdas de la imagen
+ocupan pocas posiciones), el ubatch siguiente vuelve a agrupar esos bloques y el tamaño de las tablas de bloques
+sucios cambia de paso a paso, así que `llm_graph_input_qsa::can_reuse` falla (`qwen4exp.cpp:797`). Cada imagen
+adicional suma su diferencia entre celdas y posiciones.
+
+| # | Palanca | Ganancia | Base | Riesgo |
+|---|---|---|---|---|
+| I1 | `pooled_rm` con el rango de la primera celda borrada cuando la secuencia está ordenada por rango (el mismo orden que usa `set_input_qsa`) | 66.3 → ~53 ms por paso a 40k con una imagen: 26.1 → ~33 t/s (+25 %); más con más imágenes | medido el síntoma, causa en código | bajo: exacto (los bloques anteriores no cambian); gates de determinismo y la conversación texto → imagen → texto |
+| I2 | Orden por rango incremental por secuencia (hoy un `std::sort` de todas las celdas por ubatch con la GPU parada) | ~−1.6 ms por paso a 40k con imagen, crece con n_kv | medido (set_inputs 3.45 frente a 1.86) | bajo, exacto |
+| I3 | = E3 (caché de embeddings) | | | |
+| I4 | Texto y tokens de imagen en un mismo ubatch (hoy texto previo, cada trozo de imagen y la cola van en `llama_decode` separados) | −0.2 a −0.5 s por turno con imagen | código; la cola cuesta ≤ 0.35 s | alto: el grafo elige token o embd por ubatch, el PLE y el grafo MTP exigen tokens |
+| I5 | Presupuesto de tokens de imagen (hoy mínimo 1024, tope 4096) | el mínimo cuesta ~1.5 s por imagen chica; un tope de 2048 ahorra ~3 s de LLM y ~4 s de ViT al tope | código | calidad: decide el Director |
+| I6 | Checkpoint después de un chunk de imagen | solo si se edita entre el fin de la imagen y el final del mismo prompt: 2.4-12 s en ese caso | código | raro en agentes |
+
+No son palancas: `n_cache_reuse` con imagen (el estado GDN no permite quitar tramos intermedios), el PLE de los
+tokens de imagen (un solo n-grama sustituto), el draft MTP durante la imagen (no corre) y su posición tras la imagen
+(`b0dcb8192` ya está en el fork como 9361fffb2).
+
+### 25.3 Ejecución paralela (NP=2)
+
+Cómo arma el server un paso con dos slots (código): los tokens de los slots que generan entran primero al batch y
+los prompts llenan el resto hasta n_batch = 2048, sin tope ni reparto (`server-context.cpp:3126-3145, 3548`); todo
+va en un solo `llama_decode` y el hook del draft corre sobre el batch completo antes de muestrear
+(`:3726, :3794`). El n-max del draft no mira a los otros slots (`:508-527`), y n_kv del grafo es el máximo entre
+los streams (`llama-kv-cache.cpp:1260-1274`).
+
+Rigs NP=2 (2 × 49152, ~39k tokens de prefijo por slot, 384 tokens greedy por stream):
+
+| Configuración | Un stream (A / B) | Dos streams, por stream | Dos streams, total |
+|---|---|---|---|
+| MTP n-max 2 (base, primera carga) | 33.7 / 33.7 t/s | 19.6-19.9 | 38.6 |
+| MTP n-max 1 | 32.9 / 31.9 | 19.7-20.3 | 38.8-39.2 |
+| Sin MTP | 26.7 / 26.8 | 18.8-19.0 | 37.0-37.4 |
+| MTP n-max 2 (base, última carga) | 34.0 / 34.0 | 19.6-20.0 | 38.7 |
+
+El segundo agente suma un 15 % al total y cada uno va al 58 % de lo que iría solo. Con dos generando, el MTP todavía
+gana un 4 % frente a apagarlo y n-max 1 queda dentro del ruido de n-max 2: la medición del 2026-09-02 del launcher
+(−9 % con MTP y dos streams, otra quant, otro draft y sin los kernels de hoy) ya no vale.
+
+Un agente que genera mientras el otro manda un prompt nuevo (15k tokens, n-max 2): el que genera pasa de 32.8 t/s
+a **0.59 t/s** durante los 29 s del prefill ajeno (17 tokens, huecos de hasta 4.4 s) y vuelve a 33.3 después. Es
+lo que predice el código: cada paso suyo espera un trozo de 2048 tokens del otro más el hook del draft.
+
+| # | Palanca | Ganancia | Base | Riesgo |
+|---|---|---|---|---|
+| C1 | Reparto del paso cuando un slot genera y otro procesa un prompt: k pasos de decode por trozo de prompt, o un tope de tokens de prompt por paso | el que genera: de 0.6 a ~7 t/s con el 20 % de la GPU, ~17 con el 50 % (solo va a 33.7); el prefill del otro se alarga en la misma proporción | medido el problema, reparto inferido | medio: planificador del server; el reparto es una decisión del Director |
+| C2 | n-max según los slots que generan. **Cerrada por la medición: con dos generando, n-max 1 da +1 % (ruido) y sin MTP −4 %** | — | medido | — |
+| C3 | `--no-cache-idle-slots`: hoy cada tarea nueva copia el estado entero del slot idle al prompt cache (`:2455-2468`), aunque al reasignar el slot se guarda igual (`:1654-1668`) | decenas a cientos de ms por turno según la profundidad | código, costo inferido | bajo |
+| C4 | n_kv por stream: hoy el slot corto paga la profundidad del largo | hasta ~8 ms por paso a 40k de diferencia | inferido | alto: estructural |
+| C5 | `-ub 1024`: la mitad de espera por paso ajeno y de re-prefill por checkpoint | a medir: ub512 era −23 % de prefill a 4.7k | inferido | bajo, medir a profundidad |
+| C6 | Recorte del draft cuando dos prompts comparten ubatch (`qwen4exp.cpp:553-555` exige un stream) | ~170 ms por ubatch cuando ocurre | inferido | bajo |
+
+Notas: con más de dos agentes, las entradas del prompt cache de más de ~160k tokens superan los 4 GiB y se
+descartan (el agente desalojado paga un prefill completo); NP=3 daría 9 filas de verificación y sacaría a los
+expertos del mat-vec-id; `-kvu` desactiva el caché agrupado del QSA.
+
+### 25.4 Prefill de texto (70.4 s a 40k)
+
+Sin palancas nuevas; lo vigente de la sección 13:
+
+| # | Palanca | Ganancia | Nota |
+|---|---|---|---|
+| T1 | Nodo coopmat gate/up de expertos (~24 % de la GPU): limitante sin identificar (sección 23) | −2 a −4 s si el nodo gana 20-30 % | investigación, sin mecanismo |
+| T2 | Fila 15: indexador QSA fusionado | −0.3 a −0.7 s | cuadrático con la profundidad |
+| T3 | Fila 16: máscara QSA sin construir | −0.2 a −0.4 s | cuadrático |
+| T4 | Fila 17: fusiones de pesos | −0.5 s y −0.5 ms por paso de decode | dos exigen transformar el GGUF (Director) |
+| T5 | Filas 3, 6 y 8 (restos) | ≤ −0.5 s cada una | confianza baja |
+
+La fila 5 (vía 16) ya no es palanca de prefill: la fila 9 dejó el draft en 64 ms por ubatch (era 232). Sigue siendo
+palanca de decode (FA densa del draft, ~1.3 ms por paso a 40k).
+
+### 25.5 Orden propuesto
+
+1. I1 + I2: exactos y locales al caché QSA; devuelven el decode de toda conversación con imágenes al nivel del
+   texto (+25 % a 40k con una imagen).
+2. C1: el reparto entre un agente que genera y otro que manda un prompt (hoy el que genera cae a 0.6 t/s);
+   necesita la decisión del Director sobre el reparto.
+3. E1, E4: la ViT al tope −0.9 s con cambios en el grafo de clip y en la carga del mmproj.
+4. E3: caché de embeddings, para los re-procesos de imagen.
+5. E2, E5: kernels compartidos con el LLM, con las compuertas completas.
