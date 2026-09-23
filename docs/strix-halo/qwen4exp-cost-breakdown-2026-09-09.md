@@ -2,12 +2,12 @@
 
 ## Estado actual (2026-09-22)
 
-- Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410), las listas de la FA sparse desde la selección QSA (sección 21, build 413) y la carga IQ3_S de 16 valores por hilo (sección 22, build 415).
+- Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410), las listas de la FA sparse desde la selección QSA (sección 21, build 413), la carga IQ3_S de 16 valores por hilo (sección 22, build 415) y los tiles de expertos que saltan las columnas vacías (sección 23, build 416).
   Producción: `strix load qwen38flash`
   (NP=2, `-c 524288` = 262144 × 2 slots, batch = ubatch 2048, KV q8_0, lazy mode auto, draft MTP IQ4_NL
   n-max 2, mmproj, `--ctx-checkpoints 8`), archivo `NL3S/qwen4exp-nl3s-hcdi-gu-oproj8.gguf`
   (`quant = nl3s-hcdi-gu-oproj8`).
-- Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **72.9 s (542 t/s)**,
+- Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **70.4 s (561 t/s)**,
   re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s. Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13. Desglose por nodo vigente: sección 2. Las secciones 5-12 son el
@@ -34,6 +34,7 @@ Cronología del prefill de 39.5k a 40k (misma máquina, mismo rig):
 | hint del server para el PLE + conv sin concat + guard y BK_STEP 2 del MMQ (2026-09-22, sección 20) | **73.3 s** | **539** | −5.0 %: el hint −3.3 s, las otras ~−0.6 s |
 | listas de la FA sparse desde la selección QSA, vía 2 bis (2026-09-22, sección 21) | 73.2 s | 539 | −0.2 s (−0.3 %); −9 % del nodo FA a 131k |
 | carga IQ3_S de 16 valores por hilo en el coopmat (2026-09-22, sección 22) | **72.9 s** | **542** | −0.6 s (−0.9 %), bit-idéntica |
+| tiles de expertos: sub-tiles de columnas vacías saltados (2026-09-22, sección 23) | **70.4 s** | **561** | −2.0 s (−2.8 %), bit-idéntica |
 
 Lo que sigue es el documento original del 2026-09-09 con sus secciones anotadas; el desglose de
 la sección 2 está reemplazado por el perfil del build actual.
@@ -125,7 +126,7 @@ exista aunque el cambio sea correcto.
 
 | # | Vía | Fase | Ganancia estimada | Evidencia | Riesgo | Comprobación previa |
 |---|---|---|---|---|---|---|
-| 1 | MUL_MAT_ID del prefill: tile por filas por experto (mediana 21, BN=128), hoisting de ids para 512 expertos, cargas de B fuera de `_ne1`, BK_STEP=1. **Hoisting hecho y medido (7fc9ae43d, 2026-09-16): prefill 109.6 → 94.7 s (−13.5 %), re-prefill 6.05 → 5.30 s, decode igual.** El tile por filas por experto (`GGML_VK_MMID_SMALLN=1`) resultó neutro (94.4 s) y queda como sonda apagada; ubatch 4096 pierde un 9 % y deja los checkpoints a 4096. Pendientes: cargas de B fuera de `_ne1`, BK_STEP | prefill | −13.5 % medido (hoisting); resto sin estimar | Medida directa: 4.6 y 10 TFLOPS frente a 22 en los densos; causas leídas en `mul_mmq.comp`; externa, misma GPU: halo-box selecciona el tile por filas esperadas por experto (`GGML_VK_MMID_SMALLN` con `M128` y `BM64`, sobre un prepass de listas de filas) y midió +16.3 % pp512 en Qwen3.6-35B-A3B (~32 filas por experto), MUL_MAT_ID q5_K de 2.33 a 4.43 TFLOPS; es la implementación de referencia (auditoría, sección 10). Ruta entera (MMQ q8_1) frente a coopmat, medido a nivel de modelo el 2026-09-16 con `GGML_VK_DISABLE_COOPMAT_MMQ=1`: para IQ4_NL la entera gana 2.4 % de prefill (104.0 frente a 106.5 s); para IQ3_S la coopmat gana 2.1 % (109.7 frente a 112.0 s), y en el microbench aislado la coopmat gana en ambos tipos: el +3.7 % de b9c196c1c se sostiene solo en el grafo real | Medio: otro límite (L2, ocupación) puede aparecer al llenar los tiles | test-backend-ops perf con 64 expertos (320 filas por experto): si alcanza 15-20 TFLOPS, el tile es la causa; ubatch 4096 en el rig con MTP (80 filas por experto; compute buffer 4.3 GiB a 2048, verificar el tamaño con `-lv 4` antes de cargar) |
+| 1 | MUL_MAT_ID del prefill: tile por filas por experto (mediana 21, BN=128), hoisting de ids para 512 expertos, cargas de B fuera de `_ne1`, BK_STEP=1. **Hoisting hecho y medido (7fc9ae43d, 2026-09-16): prefill 109.6 → 94.7 s (−13.5 %), re-prefill 6.05 → 5.30 s, decode igual. Columnas vacías del tile saltadas (2026-09-22, sección 23): −2.0 s.** El tile por filas por experto (`GGML_VK_MMID_SMALLN=1`) resultó neutro (94.4 s) y queda como sonda apagada; ubatch 4096 pierde un 9 % y deja los checkpoints a 4096. Pendientes: cargas de B fuera de `_ne1`, BK_STEP | prefill | −13.5 % medido (hoisting); resto sin estimar | Medida directa: 4.6 y 10 TFLOPS frente a 22 en los densos; causas leídas en `mul_mmq.comp`; externa, misma GPU: halo-box selecciona el tile por filas esperadas por experto (`GGML_VK_MMID_SMALLN` con `M128` y `BM64`, sobre un prepass de listas de filas) y midió +16.3 % pp512 en Qwen3.6-35B-A3B (~32 filas por experto), MUL_MAT_ID q5_K de 2.33 a 4.43 TFLOPS; es la implementación de referencia (auditoría, sección 10). Ruta entera (MMQ q8_1) frente a coopmat, medido a nivel de modelo el 2026-09-16 con `GGML_VK_DISABLE_COOPMAT_MMQ=1`: para IQ4_NL la entera gana 2.4 % de prefill (104.0 frente a 106.5 s); para IQ3_S la coopmat gana 2.1 % (109.7 frente a 112.0 s), y en el microbench aislado la coopmat gana en ambos tipos: el +3.7 % de b9c196c1c se sostiene solo en el grafo real | Medio: otro límite (L2, ocupación) puede aparecer al llenar los tiles | test-backend-ops perf con 64 expertos (320 filas por experto): si alcanza 15-20 TFLOPS, el tile es la causa; ubatch 4096 en el rig con MTP (80 filas por experto; compute buffer 4.3 GiB a 2048, verificar el tamaño con `-lv 4` antes de cargar) |
 | 2 | FA sparse token-major en prefill: tiles de 12 cabezas × 1 token (la ruta GQA del decode) en vez de 16 tokens × 1 cabeza, unión 6.3× la lista. **Hecha y medida (2026-09-16, sección 9): prefill 94.7 → 88.8 s (−6.3 %), re-prefill de 2k 5.3 → 4.75 s (−10 %), decode igual, determinismo verificado.** | prefill | −7.5 % a 40k (−8 s), más a mayor profundidad | Medida directa: 67.5 ms sparse vs 229 densa por nodo; uniones del 33 % medidas por el backend a 16k | Medio: asume FA limitada por cómputo; el gather compacto no ganó, lo que apunta a cómputo pero no lo prueba | `LLAMA_QSA_QUERY_BLOCK=8` fuerza bloques de 8 tokens por la ruta GQA existente; el perf logger da el coste de la FA por token sin escribir shader |
 | 3 | Forma del workgroup del mat-vec de expertos en decode: NUM_ROWS mayor o reparto de k en `down` (k=640, una iteración y media por hilo), gate+up como tensor fusionado (m=1280) | decode | hasta −6.5 % (18.2 → ~14 ms) | Tasas medidas: 160 GB/s en expertos frente a 210-227 en densos grandes de la misma GPU; halo-box midió sobre este modelo en Vulkan el troceado por columnas del mat-vec por lotes: gana en q8_0 y q6_K (MTP n-max 4: 9.6 → 15 t/s) y pierde en q4_K por releer los pesos por trozo; nuestro mat-vec-id ya despacha por token | Medio-alto: estimación por tasa, del mismo tipo que la vía retirada | test-backend-ops perf con las formas reales (640×2560, 2560×640, 10 de 512, n=3) y variantes de NUM_ROWS antes de tocar el grafo |
 | 4 | Mezcladores hyper-connection en prefill: tiles para m=320 y k=320 (48 workgroups, B en f32), formulación transpuesta o fusión del inject m=4 **Medida (2026-09-16, sección 11): `hc_*_inject` fusionado en `hc_*_down` (archivo y loader) −5.2 % prefill y decode +15 %; tile medio alineado para k=320 −1.3 %; split_k para pocos tiles negativo.** | prefill | −5.5 % (−6 s) | Medida directa: 7.5 TFLOPS y 0.1 TFLOPS en formas concretas | Bajo-medio | test-backend-ops perf en esas tres formas con la heurística de split_k relajada (una línea) |
@@ -1081,3 +1082,35 @@ coopmat de los densos. El desquantizado de A es secundario (por eso 16 valores d
 sonda de tile pequeño no ayuda porque el tile chico carga A proporcionalmente más veces por columna útil. Lo
 que queda en este nodo es el MMA desperdiciado, y la única vía contra eso es agrupar filas de varios expertos
 en un tile (otra arquitectura de kernel), no el desquantizado.
+
+## 23. Los tiles de expertos saltan las columnas vacías (2026-09-22, build 416)
+
+Con 512 expertos y 10 activos, cada experto ve ~40 filas de un ubatch de 2048 y el tile de MUL_MAT_ID es de 128
+columnas: las 88 restantes se cargaban con ceros (sección 20.3) y aun así entraban en todas las multiplicaciones,
+y el almacenamiento las descartaba. Ahora cada warp calcula solo los sub-tiles de columnas que alcanzan una fila
+del experto (`_ne1`): en el coopmat (gate/up IQ3_S) los sub-tiles de 16 columnas, en la ruta entera (down IQ4_NL)
+las iteraciones de columna de 16. La cuenta es uniforme por warp y la selección se hace una vez por tile con un
+`switch` de copias completamente desenrolladas del bloque de multiplicación: una rama dentro del bucle
+desenrollado (`break` o `if`) desindexa estáticamente los acumuladores coopmat y el nodo empeora 3-11 % incluso
+sin saltar nada (medido en dos intentos antes de llegar al `switch`). Las filas válidas se acumulan en el mismo
+orden, así que el resultado es bit-idéntico.
+
+Microbench (test-backend-ops perf, 512 de 10, n = 2048), lv 16 como base:
+
+| Nodo | antes | ahora |
+|---|---|---|
+| gate+up IQ3_S coopmat m=1280 k=2560 | 16.2-16.6 ms | 16.07 |
+| gate/up IQ3_S coopmat m=640 | 8.9-9.2 | 9.02 |
+| down IQ4_NL entera m=2560 k=640 | 7.8 | 7.43 (−5 %) |
+| IQ4_NL entera m=640 / m=1280 | 7.73 / 15.1 | 7.37 / 14.35 (−5 %) |
+
+Rigs de 40k con MTP (chain_v19, base = build 415): base 72.48 / 72.31 s, **nuevo 70.38 s (561.4 t/s, −2.0 s,
+−2.8 %)**, re-prefill 4.14 → 4.06 s, decode igual; con la sonda de tile pequeño encima 70.29 s (ruido, sigue
+apagada). Textos greedy idénticos a la base en los 5 turnos, depth_repeat 5/5, probe igual a la 405, imágenes
+idénticas, graph_diff4 con los 72 SET_ROWS. La ganancia en el modelo (2.8 %) supera la del microbench (1-5 % por
+nodo): el microbench mide cada nodo aislado y en el grafo real los 47 nodos por ubatch corren solapados con lo
+demás, donde el trabajo que se quita libera los CUs para los nodos vecinos.
+
+Lo que enseña: el nodo coopmat apenas gana con el salto (1-3 %), así que no está limitado por el MMA
+desperdiciado como suponía la sección 22; el techo coopmat f16 de la GPU está muy por encima de los 24 TFLOPS
+brutos. Queda por identificar qué limita ese nodo (latencia de las cargas de A por hilo, ocupación).
