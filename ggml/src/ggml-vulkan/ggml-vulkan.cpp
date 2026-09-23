@@ -19558,16 +19558,15 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
 
         // Check for fusion patterns and avoid reordering them
         auto const &match_pattern = [&](const std::initializer_list<ggml_op> &pattern, int start) -> bool {
-            if (start + (int)pattern.size() <= graph->n_nodes) {
-                bool is_pattern = true;
-                for (size_t j = 0; j < pattern.size(); ++j) {
-                    if (graph->nodes[start + j]->op != pattern.begin()[j] || used[start + j]) {
-                        is_pattern = false;
-                    }
-                }
-                return is_pattern;
+            if (start + (int)pattern.size() > graph->n_nodes) {
+                return false;
             }
-            return false;
+            for (size_t j = 0; j < pattern.size(); ++j) {
+                if (graph->nodes[start + j]->op != pattern.begin()[j] || used[start + j]) {
+                    return false;
+                }
+            }
+            return true;
         };
 
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
