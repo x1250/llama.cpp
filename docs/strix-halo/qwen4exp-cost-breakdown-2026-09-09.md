@@ -610,7 +610,7 @@ target 3.8 ms (D5), cabeza del draft 3.2 ms (vía 9, aplazada).
 |---|---|---|---|---|
 | Prefill | 80.8 s a 40k (489 t/s) | sí (secciones 2, 13) | −8 a −10 s con las filas 1-4 de la sección 13 (~550 t/s); techo ~68 s | vía 18 (gate/up en un tensor) |
 | Decode | 38-41 t/s a 40k; 39.3 ms de GPU por paso | sí (sección 1) | −6 a −9 ms por paso (46-48 t/s): los grafos del draft son el 35 % del paso y sus expertos cuestan 4.8 ms para un bloque frente a 8.5 ms de los 48 del target | perfil por nodo del draft (`GGML_VK_PERF_LOGGER` sobre los grafos pequeños) |
-| Imágenes | **resuelto (2026-09-22, sección 24.2): el encoder corría en CPU por un flag del launcher. En la GPU: 448×448 30.9 → 3.4 s, captura 1920×1080 103 → 7.7 s, 2048×2048 (tope de 4096 tokens) 381 → 14.6 s, misma memoria, mismas respuestas** | sí | — | queda: los tokens de imagen van al ritmo del texto; el encoder (27-47 % del prompt) y el decode posterior a una imagen (−22.5 % a 40k por el caché QSA agrupado) tienen palancas medidas en la sección 25 |
+| Imágenes | **resuelto (2026-09-22, sección 24.2): el encoder corría en CPU por un flag del launcher. En la GPU: 448×448 30.9 → 3.4 s, captura 1920×1080 103 → 7.7 s, 2048×2048 (tope de 4096 tokens) 381 → 14.6 s, misma memoria, mismas respuestas** | sí | — | queda: los tokens de imagen van al ritmo del texto; el encoder (27-47 % del prompt) y el decode posterior a una imagen (+13 ms por paso a 40k por el caché QSA agrupado, ~+21 % con su arreglo) tienen palancas medidas en la sección 25 |
 | Ejecución paralela (NP=2) | **medida (2026-09-23, sección 25.3): dos agentes generando a 40k dan 19.6-20.0 t/s cada uno, 38.6 en total (uno solo: 33.7); el MTP sigue ganando con dos streams; un agente que genera cae a 0.6 t/s mientras el otro procesa un prompt** | sí | el reparto del paso entre prompt y decode (C1) | decisión del Director sobre el reparto |
 
 Prefill de 76.5k tokens en producción (log del Director, 2026-09-16, NP=2, con cortes de imagen):
@@ -1338,7 +1338,8 @@ Decode a ~40k de profundidad, mismo texto y 256 tokens greedy, con y sin una ima
 | Texto (caché) | 34.26 | 52.4 ms | 0 | 0 | 1.35 | 51.0 |
 
 Con la imagen el grafo de verificación se reconstruye y se reasigna en cada paso (+13.3 ms) y el set_inputs sube
-1.6 ms: −22.5 % de decode. Causa (código): la marca de agua del caché de claves agrupadas del QSA (`pooled_valid`)
+1.6 ms. La caída de 33.7 a 26.1 t/s mezcla eso con la aceptación del draft, que es otra porque la respuesta es otra
+(1.97 tokens por paso frente a 2.25; 75.4 frente a 66.6 ms por paso). Causa de los 13.3 ms (código): la marca de agua del caché de claves agrupadas del QSA (`pooled_valid`)
 cuenta bloques por rango cuando la secuencia tiene una imagen (las celdas de imagen comparten posición y el
 agrupamiento pasa a rango, `llama-memory-hybrid-idx.cpp:583-613`), pero `pooled_rm` la retrocede con la posición
 del primer token borrado (`p0/ratio`, `llama-memory-hybrid-idx.cpp:383-406`). Tras cada verificación con rechazo el
@@ -1349,8 +1350,8 @@ adicional suma su diferencia entre celdas y posiciones.
 
 | # | Palanca | Ganancia | Base | Riesgo |
 |---|---|---|---|---|
-| I1 | `pooled_rm` con el rango de la primera celda borrada cuando la secuencia está ordenada por rango (el mismo orden que usa `set_input_qsa`) | 66.3 → ~53 ms por paso a 40k con una imagen: 26.1 → ~33 t/s (+25 %); más con más imágenes | medido el síntoma, causa en código | bajo: exacto (los bloques anteriores no cambian); gates de determinismo y la conversación texto → imagen → texto |
-| I2 | Orden por rango incremental por secuencia (hoy un `std::sort` de todas las celdas por ubatch con la GPU parada) | ~−1.6 ms por paso a 40k con imagen, crece con n_kv | medido (set_inputs 3.45 frente a 1.86) | bajo, exacto |
+| I1 | `pooled_rm` con el rango de la primera celda borrada cuando la secuencia está ordenada por rango (el mismo orden que usa `set_input_qsa`) | −13.3 ms por paso de verificación a 40k con una imagen: el turno medido pasa de 26.1 a ~31.7 t/s (+21 %); más con más imágenes | medido el síntoma, causa en código | bajo: exacto (los bloques anteriores no cambian); gates de determinismo y la conversación texto → imagen → texto |
+| I2 | Orden por rango incremental por secuencia (hoy un `std::sort` de todas las celdas por ubatch con la GPU parada) | ≤ −1.6 ms por paso a 40k con imagen, crece con n_kv; esos 1.6 ms incluyen escribir las ~250 filas sucias que I1 quita, así que el reparto se conoce después de I1 | medido (set_inputs 3.45 frente a 1.86) | bajo, exacto |
 | I3 | = E3 (caché de embeddings) | | | |
 | I4 | Texto y tokens de imagen en un mismo ubatch (hoy texto previo, cada trozo de imagen y la cola van en `llama_decode` separados) | −0.2 a −0.5 s por turno con imagen | código; la cola cuesta ≤ 0.35 s | alto: el grafo elige token o embd por ubatch, el PLE y el grafo MTP exigen tokens |
 | I5 | Presupuesto de tokens de imagen (hoy mínimo 1024, tope 4096) | el mínimo cuesta ~1.5 s por imagen chica; un tope de 2048 ahorra ~3 s de LLM y ~4 s de ViT al tope | código | calidad: decide el Director |
@@ -1415,8 +1416,8 @@ palanca de decode (FA densa del draft, ~1.3 ms por paso a 40k).
 
 ### 25.5 Orden propuesto
 
-1. I1 + I2: exactos y locales al caché QSA; devuelven el decode de toda conversación con imágenes al nivel del
-   texto (+25 % a 40k con una imagen).
+1. I1 + I2: exactos y locales al caché QSA; quitan la reconstrucción del grafo en cada paso de toda conversación
+   con imágenes (+21 % en el turno medido a 40k con una imagen, más con más imágenes).
 2. C1: el reparto entre un agente que genera y otro que manda un prompt (hoy el que genera cae a 0.6 t/s);
    necesita la decisión del Director sobre el reparto.
 3. E1, E4: la ViT al tope −0.9 s con cambios en el grafo de clip y en la carga del mmproj.
