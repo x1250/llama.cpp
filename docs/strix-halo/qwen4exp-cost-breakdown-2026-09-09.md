@@ -1732,3 +1732,29 @@ producción: un slot solo 33.8-34.1 t/s (v26: 32.2), dos slots a la vez 38.3-38.
 
 Queda de la GPU parada antes de la verificación: set_inputs 1.8 ms (D7) y 0.8 ms del scheduler (split de CPU, copias y
 las 2 sincronizaciones).
+
+### 28.8 Perfil de CPU del host durante el decode (cadena v31)
+
+Con `kernel.perf_event_paranoid=2` (puesto por el Director, no persistente), una carga NP=1 con la build de producción
+(fb27b714f), el prefill de 39.5k y dos turnos de 1024 tokens bajo `perf record -e cycles:u`: plano a 4999 Hz (turno
+greedy, 62.00 ms por paso) y con pilas DWARF a 999 Hz (turno de producción, 62.12 ms por paso; `perf` no cambia el
+paso). Clasificación por pila con `~/dbg/merge/perf_fold.py`, 402 pasos. El hilo principal del server está ocupado
+34.1 ms por paso, de los que ~16 son la espera activa del fence mientras la GPU trabaja; el resto es trabajo real:
+
+| Actividad | ms por paso | Camino crítico |
+|---|---|---|
+| Grabación de comandos Vulkan (todos los grafos) | 9.4 | no en la verificación (la GPU no espera desde el primer submit); sí en el hook y el draft |
+| Chequeos de fusión dentro de la grabación (`ggml_can_fuse*`, `ggml_vk_can_fuse`) | 2.5 | ídem |
+| Contadores atómicos de `shared_ptr` dentro de la grabación | ~2.2 | ídem |
+| Reconstrucción de los dos grafos del draft: `ggml_vk_graph_optimize` | 0.76 | sí |
+| Reconstrucción: resto de alloc y split del scheduler | 0.47 | sí |
+| Reconstrucción: build del grafo del modelo | 0.18 | sí |
+| `set_input_qsa` (agrupación QSA, D7) | 1.20 | sí |
+| `set_input_kq_mask` (atención densa del draft a 40k, tres grafos por paso) | 0.51 | sí |
+| Muestreo del target: llenado de 248320 candidatos × 3 | 0.67 | sí |
+| Muestreo del target: top-k (`partial_sort`) | 0.38 | sí |
+
+`ggml_vk_graph_optimize` corre en cada grafo reconstruido (0.38 ms por grafo): su ventana es de 20 nodos, pero por
+cada candidato vuelve a probar ~13 patrones de fusión y, para el patrón QSA, todos sus desplazamientos. El llenado de
+candidatos cuesta 0.18-0.22 ms por posición en el server frente a 0.077 en el microbench con logits en memoria normal;
+los logits del server viven en el buffer de salida pinned de Vulkan (tipo de memoria sin verificar).
