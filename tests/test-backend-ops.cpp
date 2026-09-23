@@ -11417,6 +11417,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // qwen38flash ViT (Qwen3-VL, 16 heads of 72, no mask): 448x448 at --image-min-tokens 1024 (4096 patches),
+    // 1920x1080 (8160, not a multiple of the 64-column tile), 8192, and 2048x2048 at the projector's cap (16384);
+    // heads of 64 and 80 at the cap for the cost of the 72 head's tiling
+    for (int n_patch : {4096, 8160, 8192, 16384}) {
+        test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, n_patch, n_patch, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    for (int hs : {64, 80}) {
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 16, {1, 1}, 16384, 16384, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
