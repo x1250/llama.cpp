@@ -1453,6 +1453,12 @@ Lecturas:
   prompt solo cuando los pasos de decode ya tuvieron el 40 % del tiempo desde que empezó la contención, y la cuenta
   se reinicia cuando uno de los dos trabajos se acaba. Sin contención el server se comporta como upstream. El agente
   que genera recibe su 40 % en ráfagas: huecos de hasta ~4.4 s (un trozo de 2048 a 40k) seguidos de ~2.3 s de decode.
+  Una imagen es un solo paso de prompt (el ViT y todos sus ubatches van dentro de `process_mtmd_chunk`): con una
+  imagen al tope, el agente que genera espera ~12 s antes de que el reparto le devuelva su parte. Con dos agentes
+  generando, la salida de cada uno ya variaba entre corridas sin el reparto (aceptación 204/358 y 210/343 en la
+  v22), así que la compuerta de ese escenario es el agregado dentro del 5 %, no la identidad. El launcher aplica
+  el 40 % a todo modelo con NP >= 2; solo se midió qwen38flash. El ejecutable `~/.local/bin/llama-server` solo
+  llama `llama_server(argc, argv)` de `libllama-server-impl`, así que un cambio de `common_params` no lo rompe.
 - **C3**: la copia del slot idle explicaba ~0.1 s por turno, no los 0.25 s que se le atribuían; los otros ~135 ms del
   hueco entre lanzamientos están en el camino HTTP (tokenización o plantilla de un prompt de 39k) y no se tocaron.
 - **E1** queda solo como relleno de la cabeza a 80 en el grafo de clip (medido: 141.9 frente a 168.6 ms por capa al
