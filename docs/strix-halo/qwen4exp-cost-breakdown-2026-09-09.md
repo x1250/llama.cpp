@@ -10,8 +10,8 @@
   archivo `NL3S/qwen4exp-nl3s-hcdi-gu-rq8-oproj8.gguf` (`quant = nl3s-hcdi-gu-rq8-oproj8`, router en Q8_0,
   sección 27).
 - Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **70.4 s (561 t/s)**,
-  re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s (63.9 ms por paso sin instrumentar, sección 28; los tokens por
-  paso dependen del texto). Turno con una
+  re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s (61.7 ms por paso sin instrumentar tras el cambio del scheduler de
+  la sección 28.7, antes 63.9; los tokens por paso dependen del texto). Turno con una
   imagen de 448×448 en producción 4.1 s (antes 30.9). Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13 (prefill), sección 25 (encoder, imágenes, ejecución paralela, con la
@@ -1647,7 +1647,7 @@ por paso medidos de punta a punta, base primero y último, nunca por la aritmét
 | Palanca | Costo medido hoy | Ahorro | Estado |
 |---|---|---|---|
 | Modo de potencia del paquete (BIOS o límites PPT) | GPU a ~2.48 GHz y fclk ~1.67 GHz bajo SPPT, en decode y prefill | desconocido sin cambiar el modo | decisión del Director; la re-medida es esta misma cadena más el prefill, con los contadores térmicos |
-| GPU parada antes del primer submit de la verificación | 5.6 ms (set_inputs 1.8 + scheduler 3.4 + primer lote 0.4) | hasta ~3 ms del scheduler | sección 28.6: 29 sincronizaciones por entrada del split de Vulkan; una por split basta (cadena v30) |
+| GPU parada antes del primer submit de la verificación | 5.6 ms (set_inputs 1.8 + scheduler 3.4 + primer lote 0.4) | **−2.5 ms medidos** | **hecho (sección 28.7, fb27b714f)**: 2 sincronizaciones por split en vez de una por entrada; quedan set_inputs 1.8 y el scheduler 0.8 |
 | Grafos del draft reconstruidos (hook y primer paso) | ~1.3 ms (build + alloc de dos grafos) | ~1.3 ms | reutilizar dos grafos en el contexto del draft; hoy `gf_res_prev` guarda uno |
 | Mezcladores hc a 107 GB/s | 3.37 ms | ~1.7 ms a 210 GB/s | 324 filas × k 10240 dan 81 workgroups; candidato split-k. El microbench no sirve (tensores en la MALL, sección 26.1) |
 | Expertos gate/up a ~160 GB/s | 11.2 ms | ~2.5 ms a 210 GB/s | D2; sin ganancia por forma de kernel (sección 26.1) |
@@ -1701,3 +1701,34 @@ Muestreo del target: el microbench de CPU (`sampler_bench.cpp`, cadena v29) da 0
 `LLAMA_SPEC_TIMING` en el server (1.27 ms por 3 posiciones). Los ~0.85 ms restantes por paso están fuera de la cadena
 del microbench (samplers del server que el microbench no incluye, como el logit bias de tokens suprimidos o el
 presupuesto de razonamiento, y el clon y el accept); sin atribuir.
+
+### 28.7 Una sincronización por split en las copias de entrada: adoptado (cadena v30, fb27b714f)
+
+Cambio en `ggml_backend_sched_compute_splits` (`ggml/src/ggml-backend.cpp`), solo para el caso sin eventos: una
+`ggml_backend_synchronize(split_backend)` antes de la primera copia de entrada de un split y otra después de la
+última copia asíncrona, en lugar de una antes de cada entrada. Las copias de expertos (pesos inmutables en host) no
+cuentan para la segunda. El camino con eventos (pipeline parallel) no cambia. Ventana NP=1 a 40k, base (copia de
+`build/bin` cargada por `LD_LIBRARY_PATH`, verificada en `/proc/<pid>/maps`) primero y último:
+
+| Carga | Greedy, ms por paso | Producción, ms por paso | t/s greedy / producción |
+|---|---|---|---|
+| Base (primera) | 64.77 | 64.16 | 33.82 / 33.08 |
+| **Nueva** | **61.82** | **61.61** | **35.43 / 34.45** |
+| Base (última) | 63.77 | 72.58 (*) | 34.35 / 29.24 |
+
+(*) Turno anómalo: gfxclk bajó a 1.83 GHz en ese turno y el paso subió 8.8 ms; causa no identificada, se descarta. Las
+bases sin instrumentar de las cadenas v27-v29 dieron 63.3-64.4 ms (greedy) y 63.6-64.5 (producción): la ganancia es
+**−2.5 ms por paso (−4 %)**, +4 % de t/s.
+
+Traza (`GGML_VK_TRACE_SYNC`, mediana de 177 y 183 verificaciones): sincronizaciones del target antes del
+`graph_compute` 29 → 2 (15 → 1 con trabajo), host del scheduler 3.4-6.0 → 0.8 ms, compute + espera de la verificación
+50.4-52.4 → 48.4-48.5 ms; la GPU sigue ocupada 46.8-46.9 ms desde el primer submit.
+
+Exactitud: respuestas de la build nueva idénticas a las de la base en greedy y en muestreo de producción (1024 tokens
+cada una, `ignore_eos`), base contra base idénticas, `graph_diff4` 72 nodos (las vistas SET_ROWS conocidas), probe de
+producción idéntico a `probe-v26.out`, conversación texto → imagen → texto 5/5 y la imagen de 2048×2048 en 14.1 s
+(el encoder de visión usa su propio scheduler, así que también pasa por el cambio), cero timeouts de anillo. NP=2 en
+producción: un slot solo 33.8-34.1 t/s (v26: 32.2), dos slots a la vez 38.3-38.9 t/s agregados (v26: 36.9-38.5).
+
+Queda de la GPU parada antes de la verificación: set_inputs 1.8 ms (D7) y 0.8 ms del scheduler (split de CPU, copias y
+las 2 sincronizaciones).
