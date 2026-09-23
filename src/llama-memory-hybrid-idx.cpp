@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 
 //
@@ -500,6 +501,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
     std::vector<int32_t> order;
     std::vector<int32_t> rank;
+    std::vector<int64_t> pos_next;
 
     if (dst_blk_pos != nullptr) {
         std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
@@ -603,28 +605,61 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         // mrope repeats one position across an image, so rank cells instead of using the position
         if (dup && ubatch->is_pos_2d() && one_seq) {
-            order.clear();
-            order.reserve(n_kv);
+            // same total order the mrope causal mask uses: pos, then ext.y, then ext.x. A counting sort by position,
+            // then the cells that share a position (an image's) by ext: one pass per cell instead of a comparison
+            // sort of every cell, run on each ubatch with the GPU idle. No two cells share (pos, ext), so the order
+            // is the same as the comparison sort's
+            llama_pos p_min = std::numeric_limits<llama_pos>::max();
+            llama_pos p_max = std::numeric_limits<llama_pos>::min();
+            int64_t   n_cells = 0;
 
             for (int64_t j = 0; j < n_kv; ++j) {
                 if (!cells.is_empty(j)) {
-                    order.push_back((int32_t) j);
+                    p_min = std::min(p_min, cells.pos_get(j));
+                    p_max = std::max(p_max, cells.pos_get(j));
+                    n_cells++;
                 }
             }
 
-            // same total order the mrope causal mask uses: pos, then ext.y, then ext.x
-            std::sort(order.begin(), order.end(), [&cells](int32_t a, int32_t b) {
-                const llama_pos pa = cells.pos_get(a);
-                const llama_pos pb = cells.pos_get(b);
+            // pos_next[p - p_min]: the next free slot of position p in order
+            pos_next.assign(p_max - p_min + 2, 0);
 
-                if (pa != pb) {
-                    return pa < pb;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (!cells.is_empty(j)) {
+                    pos_next[cells.pos_get(j) - p_min + 1]++;
+                }
+            }
+
+            for (size_t p = 1; p < pos_next.size(); ++p) {
+                pos_next[p] += pos_next[p - 1];
+            }
+
+            order.resize(n_cells);
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (!cells.is_empty(j)) {
+                    order[pos_next[cells.pos_get(j) - p_min]++] = (int32_t) j;
+                }
+            }
+
+            for (int64_t k = 0; k < n_cells; ) {
+                const llama_pos p = cells.pos_get(order[k]);
+
+                int64_t e = k + 1;
+                while (e < n_cells && cells.pos_get(order[e]) == p) {
+                    e++;
                 }
 
-                const auto & ea = cells.ext_get(a);
+                if (e - k > 1) {
+                    std::sort(order.begin() + k, order.begin() + e, [&cells](int32_t a, int32_t b) {
+                        const auto & ea = cells.ext_get(a);
 
-                return cells.ext_get(b).is_2d_gt(ea.x, ea.y);
-            });
+                        return cells.ext_get(b).is_2d_gt(ea.x, ea.y);
+                    });
+                }
+
+                k = e;
+            }
 
             rank.assign(n_kv, -1);
 
