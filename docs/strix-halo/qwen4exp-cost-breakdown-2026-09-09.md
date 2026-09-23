@@ -1578,8 +1578,8 @@ régimen algo perturbado; las cifras de GPU no dependen de eso.
 | **Total** | **66.06** | **≤ 54.0** | |
 
 La GPU trabaja ≤ 54 ms de 66 (gfx_activity medio 84-86 %). Unos 12 ms del paso son host en serie con la GPU:
-set_inputs de la verificación 1.8, GPU esperando dentro de la verificación ≤ ~4 (51.4 ms de compute + espera frente a
-≤ 47.6 de trabajo, en la carga perturbada), hook 1.4, pasos del draft 1.7 y huecos 3.1. Dónde se va el tiempo de
+set_inputs de la verificación 1.8, host del scheduler antes del primer submit 3.8 (medido en la sección 28.6),
+hook 1.4, pasos del draft 1.7 y huecos 3.1. Dónde se va el tiempo de
 host del hook y del draft: `llama_context` guarda un solo grafo previo (`gf_res_prev`), y el hook (3 tokens) y el
 paso del draft (1 token) se alternan en el mismo contexto, así que cada paso reconstruye y reasigna dos grafos.
 
@@ -1647,7 +1647,7 @@ por paso medidos de punta a punta, base primero y último, nunca por la aritmét
 | Palanca | Costo medido hoy | Ahorro | Estado |
 |---|---|---|---|
 | Modo de potencia del paquete (BIOS o límites PPT) | GPU a ~2.48 GHz y fclk ~1.67 GHz bajo SPPT, en decode y prefill | desconocido sin cambiar el modo | decisión del Director; la re-medida es esta misma cadena más el prefill, con los contadores térmicos |
-| GPU parada dentro de la verificación | ≤ ~4 ms | hasta ~4 ms | causa por aislar: latencia del lote de submit (100 nodos) frente al ritmo de grabación (15.6 ms para 3269 nodos, 4.8 µs por nodo); ventana v28 |
+| GPU parada antes del primer submit de la verificación | 5.6 ms (set_inputs 1.8 + scheduler 3.4 + primer lote 0.4) | hasta ~5 ms | sección 28.6: los 3.4 ms del scheduler son del split de CPU (embeddings y filas PLE de la tabla lazy); sospecha: fallos de página en la tabla PLE |
 | Grafos del draft reconstruidos (hook y primer paso) | ~1.3 ms (build + alloc de dos grafos) | ~1.3 ms | reutilizar dos grafos en el contexto del draft; hoy `gf_res_prev` guarda uno |
 | Mezcladores hc a 107 GB/s | 3.37 ms | ~1.7 ms a 210 GB/s | 324 filas × k 10240 dan 81 workgroups; candidato split-k. El microbench no sirve (tensores en la MALL, sección 26.1) |
 | Expertos gate/up a ~160 GB/s | 11.2 ms | ~2.5 ms a 210 GB/s | D2; sin ganancia por forma de kernel (sección 26.1) |
@@ -1656,6 +1656,40 @@ por paso medidos de punta a punta, base primero y último, nunca por la aritmét
 | Ops chicos y barreras | 8.9 ms en ~2300 dispatches | fusiones de la fila 17 (~220 dispatches) | medido por familia; cada fusión se mide de punta a punta |
 
 Ventana siguiente (v28), producción descargada, base sin instrumentar primero y último: una carga con
-`LLAMA_SPEC_TIMING` solo (su tramo `verify` es decode + sync sin las sincronizaciones forzadas de `LLAMA_INPUT_TIMING`,
-para acotar la GPU parada con el paso sin perturbar), `GGML_VK_MAX_NODES_PER_SUBMIT` en 25, 50 y 200 (separa la
-latencia del lote de submit del ritmo de grabación) y el microbench del muestreo antes de la primera carga.
+`LLAMA_SPEC_TIMING` solo, una traza de submits (`GGML_VK_TRACE_SYNC`), `GGML_VK_MAX_NODES_PER_SUBMIT` en 25, 50 y 200 y
+el microbench del muestreo antes de la primera carga. Resultado en 28.6.
+
+### 28.6 Dónde está parada la GPU en la verificación (cadena v28)
+
+Cargas hechas: sin instrumentar (63.46 / 63.87 ms por paso, greedy / producción), `LLAMA_SPEC_TIMING` solo (65.12 /
+64.48: la instrumentación sola ya agrega ~1.1 ms) y la traza (`LLAMA_INPUT_TIMING` + `GGML_VK_TRACE_SYNC`, 384 tokens por
+turno). La traza marca, en el reloj del host, la entrada al `graph_compute` de Vulkan, cada submit y la espera del
+fence; su desfase con `ggml_time_us` sale de la mediana de (fin del ubatch − fin de la espera). Mediana de 177 y 183
+verificaciones:
+
+| Tramo de la verificación | ms | GPU |
+|---|---|---|
+| set_inputs (agrupación QSA, hash y prefetch PLE) | 1.81 | parada |
+| Scheduler antes del `graph_compute` de Vulkan (split de CPU y copias de sus salidas) | 3.44 / 3.58 | parada |
+| Grabación hasta el primer submit | 0.38 | parada |
+| Primer submit → fence (33 submits; la grabación termina a los 11.8 ms) | 46.5 | ocupada |
+| **compute + espera de `LLAMA_INPUT_TIMING`** | **50.4** | |
+
+Desde el primer submit la GPU no espera al host: 46.5 ms coinciden con el trabajo que mide el perf logger (≤ 47.6,
+cota superior) y la grabación termina 35 ms antes que la GPU. El barrido de `GGML_VK_MAX_NODES_PER_SUBMIT` no se
+corrió (el launcher rechazó las cargas por una descarga activa, regla del freeze #5) y ya no hace falta: el tamaño del
+lote de submit no es el problema. La GPU parada son 5.6 ms por paso, todos antes del primer submit.
+
+El grafo del target tiene 2 splits con batch chico (`graph splits = 6 (with bs=2048), 2 (with bs=1)`): el primero es de
+CPU, con los `get_rows` de `token_embd` (capa de entrada en CPU) y de `per_layer_token_embd`, la tabla PLE de 27 GiB
+que se lee lazy por mmap. Las filas PLE salen de un hash de n-gramas, así que en decode caen en páginas dispersas de la
+tabla; `set_inputs` solo encola su lectura (`posix_madvise`), y el `get_rows` del split de CPU espera las que no
+están residentes. Hipótesis a medir en la ventana siguiente: los 3.4 ms son fallos de página mayores en la tabla PLE
+(`power_sampler.py` cuenta ahora `majflt` y `minflt` del server por segundo). Si se confirma, la palanca es exacta y de
+host: pedir las filas PLE de cada token apenas se conoce (el último muestreado antes del hook, cada token del draft al
+salir), con el mismo mecanismo del hint del server de la sección 20.1, para que estén residentes al llegar la
+verificación. Lo que sí está medido: son 3.4 ms de host con la GPU parada en cada paso, fuera de la GPU y del
+set_inputs.
+
+El microbench del muestreo no compiló (la firma de `llama_sampler_init_penalties` cambió); corregido para la ventana
+siguiente.
