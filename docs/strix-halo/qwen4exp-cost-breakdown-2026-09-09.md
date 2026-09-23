@@ -5,10 +5,11 @@
 - Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410), las listas de la FA sparse desde la selección QSA (sección 21, build 413), la carga IQ3_S de 16 valores por hilo (sección 22, build 415) y los tiles de expertos que saltan las columnas vacías (sección 23, build 416).
   Producción: `strix load qwen38flash`
   (NP=2, `-c 524288` = 262144 × 2 slots, batch = ubatch 2048, KV q8_0, lazy mode auto, draft MTP IQ4_NL
-  n-max 2, mmproj, `--ctx-checkpoints 8`), archivo `NL3S/qwen4exp-nl3s-hcdi-gu-oproj8.gguf`
-  (`quant = nl3s-hcdi-gu-oproj8`).
+  n-max 2, mmproj con el encoder de visión en la GPU desde el 2026-09-22 (sección 24), `--ctx-checkpoints 8`),
+  archivo `NL3S/qwen4exp-nl3s-hcdi-gu-oproj8.gguf` (`quant = nl3s-hcdi-gu-oproj8`).
 - Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **70.4 s (561 t/s)**,
-  re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s. Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
+  re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s (64 ms por paso de 2.46 tokens, sección 24). Turno con una
+  imagen de 448×448 en producción 4.1 s (antes 30.9). Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13. Desglose por nodo vigente: sección 2. Las secciones 5-12 son el
   registro de cada ventana de medición, en orden cronológico.
@@ -59,6 +60,11 @@ LM head Q6_K, wqkv de GDN Q5_K, router `ffn_gate_inp` F32, indexador BF16, resto
 o_proj Q8_0. Pesos por token: densos ~3.1 GB, expertos 1.33 GB.
 
 ## 1. Decode a 40k con MTP (perfil del 2026-09-16 noche, build 382+, archivo hcdi)
+
+**Corrección (2026-09-22, sección 24.1):** la tabla de esta sección promedia el grafo de verificación del target
+con el grafo del hook del draft, que también corre sobre 3 tokens. La verificación cuesta 45-50 ms, no 25.7, y el
+paso completo 64 ms, no 39.3; con 2.46 tokens por paso eso da los 38 t/s medidos. Las proporciones entre nodos
+de la tabla siguen siendo útiles; los milisegundos absolutos, no.
 
 Perf logger a 40k (`~/dbg/depth/strix-decode-prof-prof383.log`, `GGML_VK_PERF_LOGGER_FREQUENCY=1`,
 que serializa cada nodo: sus sumas son cotas superiores). Un paso = un grafo de verificación del
@@ -557,6 +563,9 @@ cadena de medición completa (base primero y último, MTP on, determinismo).
 | 12 | RMS norm agrupada como un op (sección 17.4). **Cerrada (2026-09-22, sección 18): el nodo ya corre a 210 GB/s, la premisa de 123 era un error de reparto; un kernel por subgrupo probado y neutro** | — | — | — |
 | 13 | Host entre batches del prompt (sección 17.5). **Hecha (2026-09-22, sección 18): −7 ms por batch (0.2 %); las 2048 sincronizaciones costaban 7 ms, no 60** | — | — | — |
 | 14 | Camino split de la QSA: concats encadenados. **Cerrada por aritmética (2026-09-22, sección 18): 0.1 % incluso a 262k** | — | — | — |
+| 15 | Indexador QSA: relu, suma de las 4 cabezas y bias en un solo kernel (hoy RELU + CONT + 3 ADD + ADD de bias sobre [n_blocks, 4, 2048] f32 por capa QSA y ubatch) (sección 24.3) | −0.7 s serializado a 40k, cuadrático con la profundidad; real una fracción | bajo-medio: un kernel o un patrón de fusión, exacto si suma en el mismo orden | perfil por nodo con formas |
+| 16 | Máscara QSA sin construir: con `kv_idx` la FA puede leer la máscara base en las celdas candidatas (FILL + SET_ROWS + ADD sobre [n_kv, 2048] por capa) (sección 24.3) | −0.4 s serializado a 40k, cuadrático | medio: cambia la semántica del op; la CPU y el modo denso de Vulkan deben honrar `kv_idx` | diseño |
+| 17 | Fusiones de pesos de igual tipo y entrada: z + alfa + beta (iq4_nl, m=6240), gate y up del shexp (iq4_nl, m=1280), router + gate del shexp (f32, m=513) (sección 24.3) | −0.5 s en prefill, −0.5 ms por paso de decode | medio: dos exigen transformar el GGUF (decisión del Director, procedimiento del freeze #10); m=513 no está alineado y puede empeorar el prefill del router | ninguna |
 
 Suma realista de 2 y 3: ~4-6 s (73.7 → ~68-70 s, ~570 t/s). Techo con todo: ~62-64 s. El lote de riesgo bajo
 (filas 10, 12, 13, 14 y vía 21) se midió el 2026-09-22 y no mueve el prefill (sección 18); la fila 9 está hecha
@@ -587,6 +596,12 @@ Decode (38-41 t/s a 40k; 39.3 ms de GPU por paso, sección 1), pendientes por in
 | D4 | Vía 14: estado GDN in place (GET_ROWS + CPY 1.2 ms por paso) | −0.8 ms | |
 | D5 | Vía 7: split_k en el modo compacto de la FA sparse (2.3 ms por paso, 6 workgroups por capa) | −1 ms | |
 | D6 | Vía 17: menos dispatches pequeños (~2500 por paso, ~2 ms) | −0.5 a −1 ms | fusiones |
+| D7 | Agrupación QSA en CPU incremental: `set_input_qsa` es O(n_kv) por ubatch y en decode corre con la GPU parada (sección 24.3) | −1 ms por paso a 40k, crece con n_kv | el set_inputs del grafo de verificación mide 1.8 ms |
+| D8 | Hueco de host de ~2 ms entre el hook del draft y el primer paso del draft (sección 24.3) | hasta −2 ms | sin atribuir; medir con `LLAMA_SPEC_TIMING` |
+
+Re-valoración de D1-D6 con el perfil corregido (sección 24.3): expertos IQ3_S 10.8 ms por paso a ~172 GB/s (D2),
+mezcladores hc 3.2 ms a 104-124 GB/s (vía 10), router f32 2.5 ms a 99 GB/s (D3), estado GDN 2.5 ms (D4), FA del
+target 3.8 ms (D5), cabeza del draft 3.2 ms (vía 9, aplazada).
 
 ## 14. Los cuatro frentes: estado y orden propuesto (2026-09-17)
 
@@ -594,7 +609,7 @@ Decode (38-41 t/s a 40k; 39.3 ms de GPU por paso, sección 1), pendientes por in
 |---|---|---|---|---|
 | Prefill | 80.8 s a 40k (489 t/s) | sí (secciones 2, 13) | −8 a −10 s con las filas 1-4 de la sección 13 (~550 t/s); techo ~68 s | vía 18 (gate/up en un tensor) |
 | Decode | 38-41 t/s a 40k; 39.3 ms de GPU por paso | sí (sección 1) | −6 a −9 ms por paso (46-48 t/s): los grafos del draft son el 35 % del paso y sus expertos cuestan 4.8 ms para un bloque frente a 8.5 ms de los 48 del target | perfil por nodo del draft (`GGML_VK_PERF_LOGGER` sobre los grafos pequeños) |
-| Imágenes | **malo: 30-31 s por imagen de 448×448 (~1100 tokens), medido tres veces (2026-09-04 y dos el 2026-09-17, `img_test.py`), determinista** | sí, a nivel de turno; falta el perfil del encoder | grande: el mismo prefill en texto costaría ~2.5 s; el encoder ViT (`mmproj-F16`, 863 MB) o su ruta cuesta ~28 s por imagen. Además la fragmentación del prefill por los cortes de imagen (ubatches de 618-1687 tokens en el log de producción del 2026-09-16) | perfil del grafo del encoder (`GGML_VK_PERF_LOGGER` sobre el mmproj, o comprobar en qué backend corre) con producción descargada; el log del server a nivel info no muestra ni el backend de clip ni el tiempo de encode |
+| Imágenes | **resuelto (2026-09-22, sección 24.2): el encoder corría en CPU por un flag del launcher. En la GPU: 448×448 30.9 → 3.4 s, captura 1920×1080 103 → 7.7 s, 2048×2048 (tope de 4096 tokens) 381 → 14.6 s, misma memoria, mismas respuestas** | sí | — | queda el prefill del LLM sobre los tokens de imagen, ahora la mayor parte del turno |
 | Ejecución paralela (NP=2) | sin medir | no: todos los rigs son NP=1 | desconocida; el server mete los tokens de ambos slots en un batch, así que el decode de dos peticiones debería costar poco más que uno; abiertos: reparto del prefill entre slots, MTP con dos slots activos, memoria de estados GDN y checkpoints por slot | rig con dos peticiones concurrentes (prefill y decode) con el conjunto de producción |
 
 Prefill de 76.5k tokens en producción (log del Director, 2026-09-16, NP=2, con cortes de imagen):
@@ -1114,3 +1129,120 @@ demás, donde el trabajo que se quita libera los CUs para los nodos vecinos.
 Lo que enseña: el nodo coopmat apenas gana con el salto (1-3 %), así que no está limitado por el MMA
 desperdiciado como suponía la sección 22; el techo coopmat f16 de la GPU está muy por encima de los 24 TFLOPS
 brutos. Queda por identificar qué limita ese nodo (latencia de las cargas de A por hilo, ocupación).
+
+## 24. Auditoría de solo lectura (2026-09-22 noche) y el encoder de visión en la GPU (build 416)
+
+Auditoría del código y de los logs de las ventanas del día, sin cargar la GPU, seguida de una ventana para la
+palanca mayor que salió de ella (la visión). Fuentes: `srvlog-v16-all-t.log` (`LLAMA_INPUT_TIMING`, rig de 40k,
+build 407), `strix-decode-prof-v14prof-on.log` (perf logger, build 404, fases corta y de 40k) y
+`strix-decode-prof-prof383.log` (perf logger, build 382), los rigs de 40k y 55k de las cadenas v17, y el código de
+server, speculative, mtmd, qwen4exp y `llama-memory-hybrid-idx`.
+
+### 24.1 Decode medido: el paso real
+
+Con MTP n-max 2 a 40k, un paso da 2.46 tokens (150 aceptados de 208 propuestos en 104 pasos) y dura 64.3 ms:
+38.3 t/s, lo mismo que miden los rigs. Línea de tiempo del rig con timing (cada decode sincroniza para muestrear,
+así que el timing no cambia la forma del paso):
+
+| Tramo | ms por paso |
+|---|---|
+| Verificación del target, 3 tokens: 13 ms de grabación en host solapados con la GPU + 37 ms de espera | 52 |
+| Hook del draft sobre los 3 tokens | 1.7 |
+| Dos pasos del draft, 1 token cada uno | 3.1-4.6 cada uno |
+| Huecos de host: 0.44 tras la verificación, 2.07 tras el hook, 0.22 y 0.34 entre pasos | 3.1 |
+| **Total** | **64.3** |
+
+La verificación está limitada por la GPU: su suma de nodos en el perf logger es 49.5 ms (build 404, 3233
+dispatches), igual a su pared. El perfil de la build 382 da 45.3 ms para el mismo grafo; la diferencia está en los
+nodos que dependen de la profundidad (FA +1.75, TOPK_QSA +0.48, GET_ROWS +0.25), no en otro lado: no hay
+regresión, y la tabla de la sección 1 promediaba este grafo con el del hook (1.5 ms).
+
+Verificación por familia (perf logger serializado, cotas superiores; build 404, 40k):
+
+| Familia | ms | Detalle |
+|---|---|---|
+| Mat-vec densos | 18.6 | wqkv q5_K 3.0 (216 GB/s), router f32 2.55 (99 GB/s; el bf16 de igual forma del mismo grafo va a 165), cabeza q6_K 2.3 (227), ssm_out 1.7 (184), hc down m=324 1.7 (104), z 1.6 (194), hc up k=320 1.45 (124), wq 1.0, wo 0.96 |
+| Expertos gate/up IQ3_S (`batch=3`, camino de matmul) | 10.8 | ~26-28 expertos distintos por capa para 3 tokens: ~172 GB/s |
+| Expertos down IQ4_NL | 5.5 | ~224 GB/s |
+| FA sparse (12 capas) | 3.8 | modo compacto |
+| GET_ROWS + CPY (estado GDN) | 2.5 | 145 + 151 dispatches |
+| TOPK_QSA, RMS_NORM_MUL, GDN y el resto | ~8 | ~2500 dispatches pequeños |
+
+Grafos del draft: el paso de 1 token suma 2.97 ms, de los que 1.58 son la cabeza iq4_nl de 248k filas y 0.53 la FA
+densa a 40k; el hook suma 1.5 ms, con 0.75 de FA densa.
+
+Profundidad: de ~1k a 40k (build 404, antes de las listas de la sección 21) el paso crece +7.9 ms: FA del target
++3.4, TOPK_QSA +0.9, GET_ROWS +0.5, FA del draft +1.5 y la agrupación QSA en CPU ~+1. De 40k a 55k, con la build
+actual y prompts distintos, el paso cambia entre −0.9 y +3.1 ms: dentro del ruido entre prompts. No hay datos para
+extrapolar a 262k.
+
+### 24.2 Visión: el encoder corría en la CPU
+
+El launcher pasaba `--no-mmproj-offload` desde su primer commit (strix-halo c8a5bdc, 2026-05-23), sin motivo
+registrado. Sin offload, `tools/mtmd/clip.cpp` pone el ViT entero en el backend CPU. El ViT de Qwen3-VL tiene 27
+capas, 1152 de ancho, FFN 4304 y 449M parámetros; con `--image-min-tokens 1024` procesa al menos 4096 parches
+por imagen, y el proyector acepta hasta 4096 tokens (16384 parches). Todos sus ops tienen soporte en Vulkan
+(conv de parches, resize bilineal de posiciones, rope multi, layer norm, flash attention con cabeza 72).
+
+Cambio (strix-halo 55bb358): `MMPROJ_OFFLOAD=1` por defecto pone el encoder en la GPU, `MMPROJ_OFFLOAD=0` lo
+devuelve a la CPU, y el gate de memoria del launcher suma el mmproj. Ventana chain_v20: rigs NP=1, ctx 57344 con
+MTP, CPU / GPU / CPU, cada uno con la conversación de referencia dos veces y, en el primer par, una captura de
+1920×1080 con texto chico y una imagen de 2048×2048 al tope de tokens:
+
+| Turno con imagen | Tokens | CPU | GPU |
+|---|---|---|---|
+| 448×448 (conversación de referencia) | 1057 | 30.9 / 29.9 s | 3.4-3.6 s |
+| Captura 1920×1080 | 2078 | 102.8 s | 7.7 s |
+| 2048×2048, tope del proyector | 4134 | 381.2 s | 14.6 s |
+
+- **Memoria:** MemAvailable tras cargar 47.0 GiB con el encoder en CPU y 47.1 GiB en GPU, 44.7 y 44.9 tras las
+  imágenes: los pesos se mudan de la RAM del proceso a la GPU y el buffer de cómputo no pesa más que el de CPU.
+- **Respuestas:** la conversación de referencia da las mismas respuestas greedy en CPU y en GPU, y entre
+  repeticiones de cada una. Las dos imágenes grandes se leen bien en ambos casos (la barra "RAM 43.7 GB ... UPTIME
+  3d 04h", "ORDER #7731 SHIPPED", las figuras y sus colores); cambia solo el formato de la respuesta.
+- **Anillo de la GPU:** cero timeouts en el log del kernel durante la ventana; la imagen más grande que acepta el
+  proyector completa en 14.6 s con el server sano.
+- **Producción** (recargada con el encoder en GPU solo porque el rig pasó): turno con la imagen de 448×448 en
+  4.1 s (antes 30.9), las mismas respuestas que el rig, probe de texto idéntico a las builds anteriores,
+  MemAvailable 35 GiB tras cargar y 34 tras la imagen.
+
+Solo se midió qwen38flash; el default cambia para todas las familias con mmproj del launcher, y el gate de
+memoria del launcher suma ahora el mmproj en todos los modelos. El encoder ya es una parte chica del turno: para la
+imagen de 448×448, 3.4 s totales menos ~2 s del LLM al ritmo de texto y ~0.5 s de decode dejan ~1 s para el ViT.
+Hipótesis, sin separar todavía: el resto es el prefill del LLM sobre los tokens de imagen, más lento que en texto
+por los ubatches partidos en los cortes de imagen y la agrupación QSA por rango. `--image-min-tokens 1024` es un
+requisito de grounding de Qwen-VL, no una perilla de rendimiento.
+
+El log del kernel es legible para este usuario (122 líneas de amdgpu en el arranque), así que el cero de timeouts
+de la ventana es una medida y no una ausencia de acceso. El mismo log muestra tres resets de la cola de cómputo del
+día a las 15:46, 16:20 y 16:53, todos de `test-backend-ops perf -o FLASH_ATTN_EXT` (cadenas v17, v17b y v17c) en el
+caso MLA heredado de upstream (hsk=576, hsv=512, kv=32768), que corrió después de los casos de qwen4exp: sus
+números de la sección 21 valen, y esa suite ya no se corre completa (regla en CLAUDE.md).
+
+### 24.3 Palancas nuevas y re-valoradas
+
+Decode, milisegundos por paso a 40k:
+
+| Palanca | Estado | Costo hoy | Ahorro estimado | Procedencia |
+|---|---|---|---|---|
+| Agrupación QSA en CPU incremental (D7) | nueva | ~1 ms, GPU parada | ~1 ms, crece con n_kv | set_inputs medido 1.8 ms; el ~1 ms sale del comentario del código a 33k (`llama-memory-hybrid-idx.cpp`) |
+| Hueco tras el hook del draft (D8) | nueva | 2.07 ms | hasta 2 ms | medido; causa sin atribuir. El muestreo en GPU del server (`--backend-sampling`) se apaga con gramática o presupuesto de razonamiento, así que no sirve para tráfico de agentes |
+| Fusiones z+alfa+beta, gate/up del shexp, router+gate del shexp (fila 17) | nueva | ~220 dispatches pequeños | ~0.5 ms | dispatches × ~2.5 µs |
+| Expertos IQ3_S en el lote de verificación (D2) | re-valorada | 10.8 ms a ~172 GB/s | −2 ms si llegan a 220 GB/s | perf logger |
+| Mezcladores hc (vía 10) | re-valorada | 3.2 ms a 104-124 GB/s | ~−1.5 ms | perf logger |
+| Router f32 (vía 13, D3) | re-valorada | 2.55 ms a 99 GB/s | ~−1 ms | perf logger; el bf16 de igual forma del mismo grafo va a 165 GB/s |
+| Estado GDN (vía 14, D4) | re-valorada | 2.5 ms | parcial | perf logger |
+| Cabeza del draft (vía 9, aplazada por el Director) | re-valorada | 3.2 ms | ~−2 ms | perf logger |
+| FA del target (vía 7, D5), TOPK_QSA (vía 19), FA densa del draft (vía 16) | re-valoradas | 3.8, 1 y 1.5 ms | crecen con n_kv | perf logger, build 404 |
+
+Las tasas del perf logger son cotas superiores (serializa cada nodo). La comparación del router vale porque f32 y
+bf16 de igual forma están en el mismo grafo; la de los grafos del draft no, porque sus pesos quedan en la MALL
+entre pasos.
+
+Prefill: poco nuevo a 40k. Filas 15 (indexador QSA fusionado, −0.7 s serializado), 16 (máscara QSA sin construir,
+−0.4 s serializado) y 17 (fusiones de pesos, −0.5 s) de la sección 13. Las dos primeras salen de contar bytes
+sobre el perfil, no de formas de nodo, y por lo aprendido con el concat (sección 20.2) el ahorro real será una
+fracción: −0.5 a −1.2 s a 40k entre las tres; las dos primeras crecen de forma cuadrática con la profundidad del
+prefill.
+
+No cubierto: ejecución paralela con dos slots (NP=2).
