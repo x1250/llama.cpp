@@ -1647,7 +1647,7 @@ por paso medidos de punta a punta, base primero y último, nunca por la aritmét
 | Palanca | Costo medido hoy | Ahorro | Estado |
 |---|---|---|---|
 | Modo de potencia del paquete (BIOS o límites PPT) | GPU a ~2.48 GHz y fclk ~1.67 GHz bajo SPPT, en decode y prefill | desconocido sin cambiar el modo | decisión del Director; la re-medida es esta misma cadena más el prefill, con los contadores térmicos |
-| GPU parada antes del primer submit de la verificación | 5.6 ms (set_inputs 1.8 + scheduler 3.4 + primer lote 0.4) | hasta ~5 ms | sección 28.6: los 3.4 ms del scheduler son del split de CPU (embeddings y filas PLE de la tabla lazy); sospecha: fallos de página en la tabla PLE |
+| GPU parada antes del primer submit de la verificación | 5.6 ms (set_inputs 1.8 + scheduler 3.4 + primer lote 0.4) | hasta ~3 ms del scheduler | sección 28.6: 29 sincronizaciones por entrada del split de Vulkan; una por split basta (cadena v30) |
 | Grafos del draft reconstruidos (hook y primer paso) | ~1.3 ms (build + alloc de dos grafos) | ~1.3 ms | reutilizar dos grafos en el contexto del draft; hoy `gf_res_prev` guarda uno |
 | Mezcladores hc a 107 GB/s | 3.37 ms | ~1.7 ms a 210 GB/s | 324 filas × k 10240 dan 81 workgroups; candidato split-k. El microbench no sirve (tensores en la MALL, sección 26.1) |
 | Expertos gate/up a ~160 GB/s | 11.2 ms | ~2.5 ms a 210 GB/s | D2; sin ganancia por forma de kernel (sección 26.1) |
@@ -1681,15 +1681,23 @@ corrió (el launcher rechazó las cargas por una descarga activa, regla del free
 lote de submit no es el problema. La GPU parada son 5.6 ms por paso, todos antes del primer submit.
 
 El grafo del target tiene 2 splits con batch chico (`graph splits = 6 (with bs=2048), 2 (with bs=1)`): el primero es de
-CPU, con los `get_rows` de `token_embd` (capa de entrada en CPU) y de `per_layer_token_embd`, la tabla PLE de 27 GiB
-que se lee lazy por mmap. Las filas PLE salen de un hash de n-gramas, así que en decode caen en páginas dispersas de la
-tabla; `set_inputs` solo encola su lectura (`posix_madvise`), y el `get_rows` del split de CPU espera las que no
-están residentes. Hipótesis a medir en la ventana siguiente: los 3.4 ms son fallos de página mayores en la tabla PLE
-(`power_sampler.py` cuenta ahora `majflt` y `minflt` del server por segundo). Si se confirma, la palanca es exacta y de
-host: pedir las filas PLE de cada token apenas se conoce (el último muestreado antes del hook, cada token del draft al
-salir), con el mismo mecanismo del hint del server de la sección 20.1, para que estén residentes al llegar la
-verificación. Lo que sí está medido: son 3.4 ms de host con la GPU parada en cada paso, fuera de la GPU y del
-set_inputs.
+CPU (los `get_rows` de `token_embd` y de la tabla PLE lazy) y el segundo el de Vulkan. La primera hipótesis, fallos de
+página en la tabla PLE, quedó refutada en la cadena v29: el server tiene 0.01-0.05 fallos mayores por paso durante el
+decode (`power_sampler.py` cuenta `majflt`), y la tabla está residente.
 
-El microbench del muestreo no compiló (la firma de `llama_sampler_init_penalties` cambió); corregido para la ventana
-siguiente.
+El mecanismo, en la traza cruda de la cadena v29: antes de cada `graph_compute` de la verificación, el contexto Vulkan
+del target recibe **29 `synchronize`, 15 de ellos con trabajo grabado** (submit y espera del fence, 50-190 µs cada uno) y
+los demás vacíos (~30 µs). Los emite `ggml_backend_sched_compute_splits` (`ggml/src/ggml-backend.cpp`): las entradas
+del grafo se asignan al backend de CPU (regla `1.inp` del scheduler), cada una es una entrada del split de Vulkan, y
+sin eventos (sin pipeline parallel) el scheduler llama a `ggml_backend_synchronize(split_backend)` antes de copiar
+**cada** entrada. En Vulkan cada una envía la copia asíncrona anterior y espera su fence, con la GPU parada. Upstream
+tiene el mismo bucle. Con una sola copia de las entradas basta una sincronización antes de la primera copia (nada de
+lo que se envía entre copias lee las copias de entrada) y otra después de la última copia asíncrona, para que ninguna
+quede pendiente cuando el split de CPU del ubatch siguiente reescriba su origen; el código actual deja pendiente la
+última. Ese cambio se mide en la cadena v30.
+
+Muestreo del target: el microbench de CPU (`sampler_bench.cpp`, cadena v29) da 0.14 ms por posición para el llenado de
+248320 candidatos y la cadena de samplers del launcher (0.077 + 0.063 ms), frente a 0.42 ms por posición que mide
+`LLAMA_SPEC_TIMING` en el server (1.27 ms por 3 posiciones). Los ~0.85 ms restantes por paso están fuera de la cadena
+del microbench (samplers del server que el microbench no incluye, como el logit bias de tokens suprimidos o el
+presupuesto de razonamiento, y el clon y el accept); sin atribuir.
