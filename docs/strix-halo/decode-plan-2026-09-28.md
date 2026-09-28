@@ -139,7 +139,9 @@ sección 5 de este plan.
 | + SP5 | 50.3-54.3 | 42-46 | +14-23 % |
 | + SP6 | 47.3-52.8 | 44-49 | +17-30 % |
 
-Todo bajo el límite de potencia (sección 28.4): quitar tiempo ocioso de la GPU sube la potencia media y el SMU baja
+Estimaciones hechas en el régimen de 85 W; desde el 2026-09-28 el paquete corre a 117-130 W y el paso base mide 55.4 ms
+(sección 30 del documento de costos), así que los ms absolutos de esta tabla quedan corridos. Todo bajo el límite de
+potencia (sección 28.4): quitar tiempo ocioso de la GPU sube la potencia media y el SMU baja
 relojes, así que cada SP puede recuperar menos de lo que quita; solo cuentan los ms medidos de punta a punta. El SP2
 gana más con la profundidad. Las palancas de aceptación (draft muestreado con la regla p/q, lookup en la ronda MTP,
 aceptación typical) multiplican estos números por el cambio en tokens por paso.
@@ -151,7 +153,7 @@ registra su medición.
 
 | Orden | SP | Días | Condición | Estado |
 |---|---|---|---|---|
-| 1 | SP1 | 2-3 | — | hecho el 2026-09-28 en un día (e579358ba, sección 30 del documento de costos): −1.17 ms por paso en greedy y −0.90 con muestreo a 40k; NP=2 sin cambio medible |
+| 1 | SP1 | 2-3 | — | hecho el 2026-09-28 en un día (e579358ba, sección 30 del documento de costos): −1.17 ms por paso en greedy y −0.90 con muestreo a 40k; NP=2 sin cambio medible, con la reutilización de NP=2 pendiente de medir |
 | 2 | SP2 | 2-3 | — | pendiente |
 | 3 | SP3 | 2 | — | pendiente |
 | 4 | SP4 | 4-6 | una fusión por día | pendiente |

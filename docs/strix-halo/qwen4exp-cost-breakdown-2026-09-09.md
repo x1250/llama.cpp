@@ -12,8 +12,9 @@
   sección 27).
 - Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **70.4 s (561 t/s)**,
   re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s (61.7 ms por paso sin instrumentar tras el cambio del scheduler de
-  la sección 28.7, antes 63.9; los tokens por paso dependen del texto). La ventana del SP1 (sección 30, GPU a ~2.8 GHz
-  en vez de ~2.45) midió 55.4 → 54.2 ms por paso en greedy. Turno con una
+  la sección 28.7, antes 63.9; los tokens por paso dependen del texto). Desde el 2026-09-28 el paquete ya no corre
+  limitado a 85 W (117-130 W, sección 30): con el mismo código el paso bajó a 55.4 ms y el prefill de producción a
+  590 t/s, y el SP1 lo llevó a 54.2 ms en greedy. Turno con una
   imagen de 448×448 en producción 4.1 s (antes 30.9). Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13 (prefill), sección 25 (encoder, imágenes, ejecución paralela, con la
@@ -1909,6 +1910,8 @@ Obstáculos:
    y los TFLOPS de expertos por nodo. Decide si el camino de 29.6 existe en Vulkan y cuánta memoria cuesta.
 2. Modo de potencia: todos los GB/s y relojes de 29.4 y 29.6 son bajo SPPT (sección 28.4) y es la única palanca que
    mueve los dos techos. Cambio del Director en el BIOS; re-medida de decode y prefill con los contadores térmicos.
+   **Observado el 2026-09-28 (sección 30)**: el paquete corre a 117-130 W; decode −10 % y prefill −7.2 % sin cambio de
+   código.
 3. Host del camino crítico y fusiones del decode: subproyectos SP1-SP6 de `decode-plan-2026-09-28.md` (el replay
    de command buffers queda descartado, 29.4).
 4. N-gram + MTP con entrada ~8 y ventana ~7 y las reglas de sushi (29.8: regla de línea, a lo sumo 8 drafts, ronda
@@ -2000,9 +2003,23 @@ primero y último:
 
 (*) Turno perturbado: misma aceptación, reloj medio de 2868 MHz y 4.1 ms más que la primera base; como en la sección
 28.7, se descarta. Ganancia: **−1.17 ms por paso en greedy (−2.1 %, +2.2 % de t/s) y −0.90 ms con el muestreo de
-producción (−1.6 %)**, la estimación del plan (−1.2 ms). El reloj medio de la GPU estuvo en 2.82-2.89 GHz en todas las
-cargas, frente a 2.41-2.53 GHz en la cadena v32: por eso la base mide 55.4 ms y no los 61.7 de la sección 28.9. La
-causa del reloj más alto no está identificada.
+producción (−1.6 %)**, la estimación del plan (−1.2 ms).
+
+**El límite de potencia del paquete cambió entre el 2026-09-23 y el 2026-09-28** (qué lo cambió no consta aquí). Los
+contadores que `decode_budget.py` muestrea con `amdgpu_top`, mediana de cada turno:
+
+| Medida | v27, v30, v32 (2026-09-23) | v33 (2026-09-28) |
+|---|---|---|
+| Potencia del paquete | 85.1-85.3 W, plana | 117-130 W (máximo 142 W) |
+| Potencia de la GPU | 30-36 W | 50.7-51.2 W |
+| Residencia SPPT por turno | 29000-95000 | 0-6600 |
+| fclk | 1.65-1.69 GHz | 1.78-1.89 GHz |
+| gfxclk | 2.38-2.51 GHz | 2.82-2.89 GHz |
+
+Con el mismo código (la base de esta cadena es la build de la v32), el paso de decode a 40k bajó de 61.7-62.0 a 55.4 ms
+(−10 %) y el prefill de producción de ~39.5k con NP=2 (`np2_rig.py`, calentamiento del prefijo A) de 72.2 s (547 t/s,
+v30) a 67.0 s (590 t/s, −7.2 %). Es la ventana 2 de la sección 29.7, observada sin cambio de código: la máquina ya no
+corre limitada a 85 W (sección 28.4), y todas las cifras anteriores a esta sección son del régimen de 85 W.
 
 Cargas con `LLAMA_INPUT_TIMING` (384 tokens por turno; greedy / producción):
 
@@ -2033,7 +2050,10 @@ Producción (NP=2, contexto nativo) con la nueva: probe idéntico a `probe-v26.o
 | Slot que genera mientras llega un prompt de 15k, chunks/s antes / durante / después | 41.2 / 15.9 / 40.7 | 41.9 / 16.5 / 40.2 |
 
 La salida con NP=2 varía entre cargas (A aceptó 205/354 en la base y 213/340 en la nueva), así que estas diferencias
-quedan dentro del ruido: sin regresión y sin ganancia medible con dos slots.
+quedan dentro del ruido: sin regresión y sin ganancia medible con dos slots. Pendiente: la reutilización con NP=2 no se
+midió (solo las cargas NP=1 corrieron con `LLAMA_INPUT_TIMING`), y en el log de `-lv 4` cada contexto asignó slots para
+más formas chicas que sus 4 slots (1, 2, 3, 4, 6 y 8 filas): la hipótesis es que con dos slots el LRU desaloja formas
+estables. El paso siguiente es una carga NP=2 con timing que cuente la reutilización antes de tocar el número de slots.
 
 Memoria: producción recién cargada, 35 / 24 GiB (MemAvailable / MemFree) con la base y con la nueva. Buffers de los
 slots medidos con `-lv 4` en producción después del rig NP=2 (prefijos de ~39k por slot): hasta ~31 MiB por slot del
