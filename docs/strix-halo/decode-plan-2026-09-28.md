@@ -144,13 +144,16 @@ relojes, así que cada SP puede recuperar menos de lo que quita; solo cuentan lo
 gana más con la profundidad. Las palancas de aceptación (draft muestreado con la regla p/q, lookup en la ronda MTP,
 aceptación typical) multiplican estos números por el cambio en tokens por paso.
 
-## 6. Orden y calendario
+## 6. Orden, calendario y estado
 
-| Orden | SP | Días | Condición |
-|---|---|---|---|
-| 1 | SP1 | 2-3 | — |
-| 2 | SP2 | 2-3 | — |
-| 3 | SP3 | 2 | — |
-| 4 | SP4 | 4-6 | una fusión por día |
-| 5 | SP5 | 2 de spike + 5-8 | decisión del Director tras el spike |
-| 6 | SP6 | 3-4 | opcional |
+El estado se actualiza al cerrar la ventana de cada SP, con el commit y la subsección del documento de costos que
+registra su medición.
+
+| Orden | SP | Días | Condición | Estado |
+|---|---|---|---|---|
+| 1 | SP1 | 2-3 | — | pendiente |
+| 2 | SP2 | 2-3 | — | pendiente |
+| 3 | SP3 | 2 | — | pendiente |
+| 4 | SP4 | 4-6 | una fusión por día | pendiente |
+| 5 | SP5 | 2 de spike + 5-8 | decisión del Director tras el spike | pendiente |
+| 6 | SP6 | 3-4 | opcional | pendiente |
