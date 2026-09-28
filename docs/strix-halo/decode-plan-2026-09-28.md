@@ -151,7 +151,7 @@ registra su medición.
 
 | Orden | SP | Días | Condición | Estado |
 |---|---|---|---|---|
-| 1 | SP1 | 2-3 | — | pendiente |
+| 1 | SP1 | 2-3 | — | hecho el 2026-09-28 en un día (e579358ba, sección 30 del documento de costos): −1.17 ms por paso en greedy y −0.90 con muestreo a 40k; NP=2 sin cambio medible |
 | 2 | SP2 | 2-3 | — | pendiente |
 | 3 | SP3 | 2 | — | pendiente |
 | 4 | SP4 | 4-6 | una fusión por día | pendiente |

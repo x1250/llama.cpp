@@ -1,8 +1,9 @@
 # qwen4exp en Strix Halo: dónde va el tiempo y vías de optimización (2026-09-09, actualizado 2026-09-16)
 
-## Estado actual (2026-09-23)
+## Estado actual (2026-09-28)
 
-- Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410), las listas de la FA sparse desde la selección QSA (sección 21, build 413), la carga IQ3_S de 16 valores por hilo (sección 22, build 415), los tiles de expertos que saltan las columnas vacías (sección 23, build 416) y los quick wins de la sección 26: la marca del caché QSA agrupado por rango y el orden por counting sort (decode tras una imagen +12 %), y `--decode-share 0.4` con `--no-cache-idle-slots` para varios agentes a la vez.
+- Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410), las listas de la FA sparse desde la selección QSA (sección 21, build 413), la carga IQ3_S de 16 valores por hilo (sección 22, build 415), los tiles de expertos que saltan las columnas vacías (sección 23, build 416) y los quick wins de la sección 26: la marca del caché QSA agrupado por rango y el orden por counting sort (decode tras una imagen +12 %), y `--decode-share 0.4` con `--no-cache-idle-slots` para varios agentes a la vez; desde el 2026-09-28, los grafos de
+  los ubatches chicos en slots con su propio scheduler (SP1 del plan de decode, sección 30).
   Producción: `strix load qwen38flash`
   (NP=2, `-c 524288` = 262144 × 2 slots, batch = ubatch 2048, KV q8_0, lazy mode auto, draft MTP IQ4_NL
   n-max 2, mmproj con el encoder de visión en la GPU desde el 2026-09-22 (sección 24), `--ctx-checkpoints 8`,
@@ -11,7 +12,8 @@
   sección 27).
 - Rendimiento a 40k de profundidad (rig `mtp_depth.sh`, MTP on): prefill de 39.5k **70.4 s (561 t/s)**,
   re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s (61.7 ms por paso sin instrumentar tras el cambio del scheduler de
-  la sección 28.7, antes 63.9; los tokens por paso dependen del texto). Turno con una
+  la sección 28.7, antes 63.9; los tokens por paso dependen del texto). La ventana del SP1 (sección 30, GPU a ~2.8 GHz
+  en vez de ~2.45) midió 55.4 → 54.2 ms por paso en greedy. Turno con una
   imagen de 448×448 en producción 4.1 s (antes 30.9). Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13 (prefill), sección 25 (encoder, imágenes, ejecución paralela, con la
@@ -1972,3 +1974,73 @@ Lo que no transfiere:
   misma familia que la vía 9 descartada por el Director (sección 27.2).
 - GDN en un dispatch (−0.33 a −0.45 ms por pasada) y claves QSA agrupadas en un kernel (~1 %): el orden de las fusiones
   de la fila 17 de la sección 3.
+
+## 30. SP1 del plan de decode: grafos de ubatches chicos en slots (2026-09-28, cadena v33)
+
+Cambio (e579358ba, `src/llama-context.{h,cpp}`): el contexto guardaba un solo grafo previo (`gf_res_prev`), y el
+contexto del draft, que alterna el hook sobre las filas verificadas (3 por slot que genera) y el paso de 1 fila,
+reconstruía y reasignaba los dos grafos en cada paso (0 de 482 reutilizados, sección 28.2). Los ubatches de hasta 32
+tokens van ahora a un LRU de 4 slots, cada uno con su `llm_graph_result` y su `ggml_backend_sched`; los mayores siguen
+en el scheduler principal con la reserva del peor caso. El scheduler que computó un ubatch ubica sus salidas, construye
+el callback de su grafo y corre su compute; los slots se resetean donde se resetea el grafo previo (reserva del
+scheduler y actualización de la memoria). Alternativas descartadas en el diseño: unificar las topologías del hook y del
+paso (3 filas sin salidas frente a 1 fila con muestreo en el backend) y compartir la memoria entre dos contextos del
+draft (`ctx_other` solo existe para Gemma4). El LRU cubre las formas de NP=2 sin enumerarlas.
+
+Ventana bajo `gate.py` (clase pesada, huella 66 GiB, la caída medida de esta configuración en v32): NP=1, ctx 57344, MTP
+n-max 2, dos turnos de 1024 tokens con `ignore_eos` sobre el prefijo de 39.5k, base (cda30216f, `bin-v33base`)
+primero y último:
+
+| Carga | Greedy, ms por paso | Producción, ms por paso | t/s greedy / producción |
+|---|---|---|---|
+| Base (primera) | 55.35 | 54.85 | 39.58 / 38.69 |
+| **Nueva** | **54.18** | **53.95** | **40.43 / 39.34** |
+| Nueva (seguida de `depth_repeat`) | 54.19 | 53.95 | 40.43 / 39.34 |
+| Base (última) | 55.38 | 58.98 (*) | 39.56 / 35.98 |
+
+(*) Turno perturbado: misma aceptación, reloj medio de 2868 MHz y 4.1 ms más que la primera base; como en la sección
+28.7, se descarta. Ganancia: **−1.17 ms por paso en greedy (−2.1 %, +2.2 % de t/s) y −0.90 ms con el muestreo de
+producción (−1.6 %)**, la estimación del plan (−1.2 ms). El reloj medio de la GPU estuvo en 2.82-2.89 GHz en todas las
+cargas, frente a 2.41-2.53 GHz en la cadena v32: por eso la base mide 55.4 ms y no los 61.7 de la sección 28.9. La
+causa del reloj más alto no está identificada.
+
+Cargas con `LLAMA_INPUT_TIMING` (384 tokens por turno; greedy / producción):
+
+| Tramo, ms por paso | Base | Nueva |
+|---|---|---|
+| Hook del draft | 0.98 / 0.95 | 0.59 / 0.58 |
+| Paso del draft (media de los dos) | 3.19 / 3.04 | 3.03 / 2.81 |
+| Verificación del target | 46.89 / 46.67 | 46.76 / 46.63 |
+| Paso | 55.9 / 55.2 | 55.0 / 54.3 |
+
+Grafos del contexto del draft reutilizados: hooks 0 → 356 de 360, pasos 360 → 716 de 721; build y alloc del draft en
+la carga, 194 → 3.5 ms. La verificación del target ya se reutilizaba (356 y 358 de 360).
+
+Exactitud: respuestas idénticas en greedy y en muestreo entre las dos bases, entre las dos cargas nuevas, entre la
+nueva y la base, y entre las cargas con timing; la misma aceptación del draft en las seis cargas (556/931 y 541/961;
+205/354 y 200/366); `depth_repeat` a 40k idéntico en los dos caminos; `graph_diff4` con la partición del server 72 de
+12048 nodos, y con colas chicas que corren en los slots (`GD_SPLIT=2048,2048,512,3,3,1,1`) 569 de 32296 nodos en la
+nueva y en la base, con la misma lista (las vistas SET_ROWS del caché) y la misma distribución; cero timeouts de
+anillo.
+
+Producción (NP=2, contexto nativo) con la nueva: probe idéntico a `probe-v26.out`, conversación texto → imagen → texto
+5/5, imagen de 2048×2048 en 12.7 s. Rig NP=2 (`np2_rig.py` con s2), base → nueva:
+
+| Medida | Base | Nueva |
+|---|---|---|
+| Un slot solo, A / B, t/s | 38.5 / 38.9 | 40.3 / 39.6 |
+| Dos slots generando, agregado, t/s | 44.9 / 45.2 | 44.1 / 45.6 |
+| Slot que genera mientras llega un prompt de 15k, chunks/s antes / durante / después | 41.2 / 15.9 / 40.7 | 41.9 / 16.5 / 40.2 |
+
+La salida con NP=2 varía entre cargas (A aceptó 205/354 en la base y 213/340 en la nueva), así que estas diferencias
+quedan dentro del ruido: sin regresión y sin ganancia medible con dos slots.
+
+Memoria: producción recién cargada, 35 / 24 GiB (MemAvailable / MemFree) con la base y con la nueva. Buffers de los
+slots medidos con `-lv 4` en producción después del rig NP=2 (prefijos de ~39k por slot): hasta ~31 MiB por slot del
+target y 3-5 MiB por slot del draft, ~145 MiB en total. Crecen con n_kv (máscaras y listas de la atención); con los
+dos slots a 262k se estiman bajo ~0.5 GiB (estimación, no medida). La reserva del peor caso del scheduler principal no
+cambia. El aviso "compute buffer size ... does not match expectation" al cerrar el server ya aparecía en ventanas
+anteriores (`srvlog-p40-mtp.log`, `srvlog-gu-base1.log`); no viene de este cambio.
+
+Adoptado en producción (build del árbol e579358ba). Fuentes: `~/dbg/merge/chain_v33.{sh,out}`, `budget-v33*.txt`,
+`gd-v33*.log`, `np2-v33p{b,n}.out`, `~/dbg/depth/srvlog-v33*.log`, `repeat-v33n2.log`.
