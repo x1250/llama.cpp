@@ -14,7 +14,8 @@
   re-prefill de 2k 4.11-4.20 s, decode 35-41 t/s (61.7 ms por paso sin instrumentar tras el cambio del scheduler de
   la sección 28.7, antes 63.9; los tokens por paso dependen del texto). Desde el 2026-09-28 el paquete ya no corre
   limitado a 85 W (117-130 W, sección 30): con el mismo código el paso bajó a 55.4 ms y el prefill de producción a
-  590 t/s, y el SP1 lo llevó a 54.2 ms en greedy. Turno con una
+  590 t/s, y el SP1 lo llevó a 54.2 ms en greedy. Desde el 2026-09-28 el lookup en la ronda MTP (sección 31) acelera
+  los turnos que copian o editan texto un 29-45 %. Turno con una
   imagen de 448×448 en producción 4.1 s (antes 30.9). Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13 (prefill), sección 25 (encoder, imágenes, ejecución paralela, con la
@@ -1916,7 +1917,8 @@ Obstáculos:
    de command buffers queda descartado, 29.4).
 4. N-gram + MTP con entrada ~8 y ventana ~7 y las reglas de sushi (29.8: regla de línea, a lo sumo 8 drafts, ronda
    elegida contra el costo medido), sobre un turno de edición y uno de prosa, base primero y último, con
-   `repeat_probe` y `depth_repeat`.
+   `repeat_probe` y `depth_repeat`. **Hecho y adoptado el 2026-09-28 (sección 31.3)** con clave y ventana de 7, sin la
+   regla de línea ni la compuerta de costo, que quedan pendientes.
 5. Draft MTP muestreado con la regla p/q (29.8): exacto; tokens por paso con el muestreo de producción, greedy sin
    cambios, base primero y último.
 6. Aceptación "typical" (29.8): solo si el Director acepta que cambie la distribución de salida, con una compuerta de
@@ -2064,3 +2066,102 @@ anteriores (`srvlog-p40-mtp.log`, `srvlog-gu-base1.log`); no viene de este cambi
 
 Adoptado en producción (build del árbol e579358ba). Fuentes: `~/dbg/merge/chain_v33.{sh,out}`, `budget-v33*.txt`,
 `gd-v33*.log`, `np2-v33p{b,n}.out`, `~/dbg/depth/srvlog-v33*.log`, `repeat-v33n2.log`.
+
+## 31. Presupuesto con la potencia nueva, NP=2 y lookup en la ronda MTP adoptado (2026-09-28, cadenas v34-v38)
+
+### 31.1 El paso de decode a 40k con el paquete a 117-130 W (cadena v34)
+
+Build del SP1, NP=1, ctx 57344, MTP n-max 2, dos turnos de 1024 tokens: 54.72 / 54.48 ms por paso (greedy /
+producción) con `LLAMA_INPUT_TIMING` y `LLAMA_SPEC_TIMING`; perf logger concurrente y serial en cargas aparte
+(`vk_family.py v34c v34s v34a`, `~/dbg/merge/family-v34.txt`).
+
+| Tramo | ms por paso |
+|---|---|
+| Verificación del target (pared) | 46.6 |
+| · expertos gate/up / down | 11.0 / 5.5 |
+| · FA sparse | 3.6 |
+| · mezcladores hc | 3.3 |
+| · copias y filas (CPY, CONT, GET/SET_ROWS) | 3.2 |
+| · GDN attn_qkv / elementwise / cabeza | 3.1 / 2.7 / 2.3 |
+| Draft: dos pasos de 1 token + hook (GPU) | 5.9 (cabeza del draft 1.6 por paso) |
+| Host en serie: set_inputs 0.93, muestreo 0.56, huecos 0.98, post 0.12 | ~2.6 |
+
+Con la potencia nueva el host dejó de pesar (set_inputs bajó de 1.81 a 0.93 ms: la CPU también corre más rápido); lo
+que queda del paso es GPU: ~47 ms de la verificación y ~6 del draft. Las tasas por familia del perf logger quedan
+cerca de las de la sección 28.3, que son cotas superiores (el logger serializa).
+
+### 31.2 Reutilización de grafos con NP=2 (cadena v34)
+
+NP=2, ctx 114688, `LLAMA_INPUT_TIMING`, el rig NP=2 con los dos slots generando y un prompt de 15k que llega mientras
+el otro genera. Grafos de hasta 8 filas por contexto:
+
+| Contexto | Forma | Reutilizados |
+|---|---|---|
+| Target | verificación de 3 / 6 filas | 806 de 820 / 351 de 363 |
+| Draft | paso de 1 / 2 filas | 1639 de 1657 / 709 de 719 |
+| Draft | hook de 3 / 6 filas | 800 de 815 / 356 de 364 |
+
+Solo se reconstruye en las transiciones: el LRU de 4 slots alcanza y la hipótesis de desalojo de la sección 30 queda
+refutada.
+
+### 31.3 Lookup de prompt en la ronda MTP
+
+`ngram-simple` del fork junto a `draft-mtp` (`--spec-type ngram-simple`): cuando los últimos k tokens ya aparecieron en
+el contexto, la ronda propone los tokens que les siguieron (tiene prioridad sobre la cabeza MTP; el hook del MTP
+procesa las filas verificadas sea cual sea el draft). Rig `~/dbg/merge/lookup_rig.py`: una función de ~700 tokens
+(`common_ngram_simple_draft`) en el prompt y las tareas de sushi (copiarla, renombrar una variable, corregir un bug
+plantado, tool call `write_file`, código nuevo, prosa, y el renombrado detrás del texto de ~39k), sin pensamiento, en
+greedy y con el muestreo de producción; A = solo MTP, B = MTP + lookup, A B B A.
+
+- **Ventana de 8 (verificación de 9 filas, cadena v34): pierde 11-16 %.** Con 9 filas Vulkan sale de los mat-vec
+  (`mul_mat_vec_max_cols = 8` en los densos, `ggml_vk_use_mul_mat_vec_id` hasta 8 tokens en los expertos) y el paso
+  sube de 47.8 a 114-143 ms.
+- **Ventana de 7 (8 filas) con 2 slots de rollback (cadena v35):** copiar +35-38 %, corregir +34-35 %, renombrar
+  detrás de 40k +31-32 %, renombrar +25-28 %, `write_file` +27 %; código nuevo −5 %, prosa −5 % / −1 %.
+- **Los slots de rollback del estado recurrente** seguían el n_max de la cabeza MTP (2, `need_n_rs_seq`): cada ronda
+  de lookup guardaba un checkpoint del estado y cada rollback de más de 2 tokens lo restauraba y volvía a decodificar
+  las filas aceptadas (`server-context.cpp:3161`, `:4046`). Desde 353c25248 los slots cubren el draft más largo de
+  cualquier tipo configurado (`common_speculative_n_max`); con solo MTP no cambia nada. Costo: el estado recurrente
+  pasa de 0.68 GiB (medido con `-lv 4`, 108 MiB por copia) a ~1.75 GiB (calculado) con NP=2.
+- **Ventana de 7 con 7 slots (cadena v37, la medida de adopción):** el render de Blender que bajó los relojes en la
+  cadena v36 (solo CPU, pero comparte la potencia del paquete: GPU de ~2.84 a ~2.3 GHz; v36 descartada) terminó al
+  inicio de la carga A1; CPU ocupada 3-4 % y GPU a 2.82-2.89 GHz en las cuatro cargas.
+
+| Tarea | Greedy, A → B (t/s) | Producción, A → B (t/s) | Cambio |
+|---|---|---|---|
+| Copiar | 62.7 → 91.2 | 63.2 → 91.9 | **+45.5 %** |
+| Renombrar detrás de 40k | 54.3 → 76.8 | 55.0 → 78.8 | **+41 a +43 %** |
+| Corregir el bug | 63.0 → 87.1 | 62.7 → 86.0 | **+37 a +38 %** |
+| Renombrar | 63.0 → 85.5 | 63.3 → 85.5 | **+35 a +36 %** |
+| `write_file` | 62.2 → 81.3 | 61.9 → 79.6 | **+29 a +31 %** |
+| Código nuevo | 58.8 → 57.0 | 57.9 → 57.7 | −3.0 / −0.2 % |
+| Prosa | 50.5 → 50.2 | 47.7 → 46.1 | −0.6 / −3.3 % |
+
+Exactitud: respuestas de B idénticas byte a byte a las de A en copiar, corregir, código nuevo, el renombrado detrás
+de 40k y el renombrado en greedy (el lookup cambia el número de filas de la verificación y los mat-vec de hasta 8
+columnas dieron los mismos bits en estos textos; en prosa y en el renombrado con muestreo el texto diverge);
+`depth_repro` + `depth_repeat` con el lookup activo idénticos en los dos caminos. El `depth_repeat` fallido de la
+cadena v35 corrió sin el prefijo en caché (la corrida 1 hizo el prefill completo), un error de orden de la prueba.
+
+Producción (cadena v38, NP=2, contexto nativo, lookup encendido por el launcher): probe idéntico a `probe-v26.out`,
+conversación texto → imagen → texto 5/5, imagen de 2048×2048 en 12.8 s, cero timeouts de anillo. Rig NP=2: un slot
+solo 39.1 / 39.3 t/s; dos slots generando prosa 43.3 / 43.9 t/s agregados (44.1-45.6 sin lookup en la cadena v33, una
+baja de ~2-4 % dentro de la variación de NP=2); el slot que genera mientras llega un prompt de 15k, 16.45 chunks/s
+durante (16.49 antes). Memoria recién cargada 33 / 23 GiB (MemAvailable / MemFree), 1 GiB menos que sin lookup (34 /
+24). Adoptado: `strix-halo/run-server.sh` agrega `--spec-type ngram-simple --spec-ngram-simple-size-n 7
+--spec-ngram-simple-size-m 7` a qwen38flash con MTP (`LOOKUP=0` lo apaga) y `config.ini` sube `kv_gb` de 6 a 7.
+
+Pendiente del lookup: la regla de línea y la compuerta de costo de sushi (sección 29.8) contra las entradas falsas en
+código nuevo y prosa (−3 a 0 % hoy), y una clave más larga que la ventana, que `ngram-simple` no admite
+(`copy_max < n_draft_min`).
+
+### 31.4 Orden de trabajo con el presupuesto nuevo
+
+1. Fusiones en la verificación (SP4): copias y filas 3.2 ms, elementwise 2.7, estado GDN, normas; con la potencia
+   nueva lo que se quita de GPU se convierte en tiempo casi completo.
+2. Tasa de los pesos (SP6): mezcladores hc a ~107 GB/s (3.3 ms, split-k), expertos gate/up a ~160 GB/s (11 ms).
+3. Draft dentro de la verificación (SP5): el draft es 5.9 ms de GPU por paso (11 %).
+4. SP2 y SP3 al final: el host en serie es ~2.6 ms por paso.
+
+Fuentes: `~/dbg/merge/chain_v3{4,5,7,8}.{sh,out}`, `lookup-v3{4,5,7}*.jsonl`, `family-v34.txt`, `np2-v38pl.out`,
+`~/dbg/depth/srvlog-v3{4,5,7}*.log`, `repeat-v37B1.log`, `power-v3{5,6,7}.log`, `cpu-v37.log`.

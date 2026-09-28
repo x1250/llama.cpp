@@ -148,12 +148,14 @@ aceptación typical) multiplican estos números por el cambio en tokens por paso
 
 ## 6. Orden, calendario y estado
 
+Orden revisado el 2026-09-28 con el presupuesto medido a 117-130 W (sección 31.4 del documento de costos): SP4, SP6, SP5 y, al final, SP2 y SP3, porque el host en serie bajó a ~2.6 ms por paso. El lookup en la ronda MTP (fila 4 de la sección 29.7) quedó adoptado antes que estos SP.
+
 El estado se actualiza al cerrar la ventana de cada SP, con el commit y la subsección del documento de costos que
 registra su medición.
 
 | Orden | SP | Días | Condición | Estado |
 |---|---|---|---|---|
-| 1 | SP1 | 2-3 | — | hecho el 2026-09-28 en un día (e579358ba, sección 30 del documento de costos): −1.17 ms por paso en greedy y −0.90 con muestreo a 40k; NP=2 sin cambio medible, con la reutilización de NP=2 pendiente de medir |
+| 1 | SP1 | 2-3 | — | hecho el 2026-09-28 en un día (e579358ba, sección 30 del documento de costos): −1.17 ms por paso en greedy y −0.90 con muestreo a 40k; NP=2 sin cambio medible; con NP=2 los grafos se reutilizan (sección 31.2) |
 | 2 | SP2 | 2-3 | — | pendiente |
 | 3 | SP3 | 2 | — | pendiente |
 | 4 | SP4 | 4-6 | una fusión por día | pendiente |
