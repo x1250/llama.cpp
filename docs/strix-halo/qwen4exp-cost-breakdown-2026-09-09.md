@@ -15,7 +15,8 @@
   imagen de 448×448 en producción 4.1 s (antes 30.9). Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13 (prefill), sección 25 (encoder, imágenes, ejecución paralela, con la
-  ventana v21 del 2026-09-23) y sección 28 (presupuesto del decode). Desglose por nodo vigente: sección 2. Las
+  ventana v21 del 2026-09-23), sección 28 (presupuesto del decode) y sección 29 (techo físico del decode, camino al
+  2× del prefill y referencias externas del 2026-09-26). Desglose por nodo vigente: sección 2. Las
   secciones 5-12 son el registro de cada ventana de medición, en orden cronológico.
 
 Cronología del prefill de 39.5k a 40k (misma máquina, mismo rig):
@@ -584,7 +585,8 @@ Cerradas (no volver sin un dato nuevo):
 - IQ4_NL en la lista f16-B (vía 11): neutro (sección 11).
 - Loader integer-dot para IQ3_S: correcto, −2.1 % (sección 7).
 - Tile por filas por experto (`GGML_VK_MMID_SMALLN`), `DENSE_WAVE32`, `MMID_WAVE32`, `MMID_WG256`: neutros (sección 8).
-- Ubatch 4096: −9 % y checkpoints de 4096 (sección 8).
+- Ubatch 4096: −9 % y checkpoints de 4096 (sección 8). **Reabierta (2026-09-26, sección 29.6)**: se midió en la build
+  375, antes del hoisting de ids y del salto de columnas vacías en el kernel de expertos, que son el dato nuevo.
 - `LLAMA_QSA_QUERY_BLOCK=8` como proxy de la FA por token: mide ocupación, no geometría (sección 9).
 - Suma sobre expertos dentro del MUL_MAT_ID: atómicos u orden por planificación, rompe el determinismo (sección 10).
 - Vía 12, encolado del prefetch PLE: `process_madvise` por lotes, reparto en 4/8 hilos, batch 8192 con
@@ -1770,3 +1772,137 @@ a `probe-v26.out`, conversación con imagen 5/5 y la imagen de 2048×2048 en 14.
 
 Lo que queda del optimizador (0.60 ms por paso) es `is_src_of` y la ventana de 20 nodos por candidato, en cada uno de
 los dos grafos del draft que se reconstruyen por paso; la palanca completa es no reconstruirlos (sección 28.5).
+
+## 29. Techo físico del decode, camino al 2× del prefill y referencias externas (2026-09-26, sin carga)
+
+Revisión sin GPU ni carga de modelo: dos motores externos que corren este mismo modelo (TensorFold en MLX y Strata en
+CUDA), los cuants GSQ-RCO de ISTA-DASLab y el drafter DFlash publicado para Flash Next, contrastados con el
+presupuesto de la sección 28 y con el código del fork. Fuentes consultadas el 2026-09-26. Las cifras marcadas como
+estimación salen de aritmética sobre datos medidos: la sección 28.4 impide ordenar palancas con esa aritmética, y aquí
+solo responde si un 2× es físicamente posible.
+
+### 29.1 Censo de bytes por paso de verificación y los cuants GSQ-RCO
+
+`~/dbg/merge/quant_census.py` lee solo el header del GGUF de producción (formas y tipos) y aplica a esas formas los
+tipos por tensor que ISTA-DASLab publica en `tensor-allocation/*.rco-allocation.txt`
+(https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF; copias en `~/dbg/merge/gsq-rco/`). Gate + up y
+hc down + inject, fusionados en nuestro archivo, se reparten por número de elementos. Los expertos cuentan ~27
+distintos por capa de 512 para 3 tokens, la estimación de la sección 24.1 que usa también la 28.3, así que en los
+expertos el censo no es una verificación independiente; las familias densas coinciden con los bytes exactos de la
+28.3 (hc 0.36 GB, cabeza 0.52 GB). GB por paso de verificación de 3 tokens:
+
+| Archivo | Expertos | hc | Cabeza | Resto denso | Total | Promedio de tareas (BF16: 93.12) |
+|---|---|---|---|---|---|---|
+| Producción (`nl3s-hcdi-gu-rq8-oproj8`) | 3.03 | 0.36 | 0.52 | 1.97 | **5.88** | — (PPL holdout 1.5919) |
+| GSQ-RCO IQ3_S (83.6 GB) | 2.65 | 1.28 | 0.52 | 2.31 | **6.76** (+15 %) | 93.26 |
+| GSQ-RCO IQ3_XXS (75.8 GB) | 2.26 | 1.28 | 0.44 | 2.06 | **6.04** (+3 %) | 92.57 |
+| GSQ-RCO Q2_0 (66.4 GB) | 1.79 | 1.28 | 0.44 | 1.62 | **5.14** (−13 %) | 89.07 |
+
+La calidad es la de su tarjeta (AIME25, GPQA-Diamond, LiveCodeBench v6), no comparable con nuestra PPL. Sus 290
+tensores de hyper-connections van en BF16 (los nuestros en IQ4_NL) y anulan el ahorro en expertos: IQ3_S e IQ3_XXS
+leen más o lo mismo que producción. Q2_0 lee menos, pero pierde ~4 puntos (LiveCodeBench 87.43 → 81.14). Ninguno
+trae las transformaciones del fork (hc inject fusionado, gate_up, router Q8_0). Idea sin medir: injertar solo los
+expertos IQ3_XXS en nuestro archivo, 5.11 GB por paso (−13 %). Incógnitas: la calidad de la mezcla (su asignación RCO
+se optimizó para el archivo completo) y la tasa real en Vulkan de sus tipos por capa (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+IQ3_S, Q2_0, IQ4_NL); nuestros expertos IQ3_S corren a ~160 GB/s frente a ~213 de IQ4_NL (sección 28.3). El backend
+Vulkan del fork tiene mat-vec y mat-vec-id para Q2_0 (`ggml-vulkan.cpp:5923`, `:6009`).
+
+### 29.2 Drafts n-gram junto al MTP ("copy windows"): soportado en el código, nunca ejecutado
+
+TensorFold (https://github.com/ashhart/TensorFold, receta `docs/recipes/qwen3.8-flash-next.md`; M3 Ultra, MLX, 4
+bits, T 1.0 / top-k 20 / top-p 0.95, pensamiento activo) sirve el mismo modelo con 1-3 drafts MTP y "copy windows":
+cuando el contexto contiene el texto que se escribe, una ronda verifica hasta 7 tokens copiados; la entrada exige 8
+tokens coincidentes, porque con coincidencias cortas fallaron 56 de 70 tokens copiados y el total perdió un 5 %. Una
+edición de archivo decodifica a 190 t/s, frente a 105-107 de una respuesta corta y 103-115 de su prompt de agente de
+23k: la ganancia es solo de los turnos que copian texto.
+
+Lectura del código del fork, sin ejecutar:
+
+- `--spec-type` acepta una lista separada por comas (`common/arg.cpp:4292-4298`).
+- Las implementaciones se crean con los tipos n-gram antes que los drafts por modelo
+  (`common/speculative.cpp:2730-2737`) y en cada paso gana la primera que produce un draft (`:2923-2960`).
+- El hook del MTP procesa el lote verificado completo, sea quien sea el que lo propuso, con un batch del tamaño del
+  `n_batch` del contexto del draft (`:1469-1470`, `:1595-1690`), y su `accept` ignora `is_other` (`:1846`).
+- Los defaults no sirven para este uso: ngram-mod con `n_match` 24 y drafts de 48-64 tokens, ngram-map con `size_n` 12
+  y `size_m` 48 (`common/common.h:355-366`). Habría que llevarlos a una entrada de ~8 tokens y una ventana de ~7.
+
+Costo de las filas extra en este MoE: 8 tokens consecutivos eligen ~40 expertos distintos por capa en sus 80 plazas
+(medido por TensorFold en el mismo modelo), así que una verificación de 8 filas leería ~7.3 GB frente a los 5.88 de la
+de 3 (estimación con el censo de 29.1). Su política de profundidad por umbrales de aceptación (1 draft bajo 80 %, 2
+bajo 90 %, 3 en otro caso) dio 91.1 t/s frente a 86.8 con un tope fijo de 1; es otro controlador que nuestro
+`--spec-draft-adaptive` (EMA calibrado para DFlash), que perdió con esta cabeza (`strix-halo/run-server.sh`,
+comentario del MTP de qwen38flash).
+
+### 29.3 Drafters publicados para Flash Next
+
+https://huggingface.co/PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash: drafter DFlash de 498M parámetros en BF16, bloque 7,
+entrenado sobre el target NVFP4. τ 2.88 con bloque 5; frente al MTP nativo con k=4, +3.9 % agregado (matemática +28 %,
+código +0.4 %, chat −5.9 %), en greedy, sin pensamiento, contexto de 8k, vLLM TP2 sobre dos DGX Spark; los autores
+advierten que la varianza entre arranques es del tamaño del efecto. No es comparable con producción (pensamiento y
+muestreo), pero no muestra un salto de aceptación sobre el MTP: hoy no hay un drafter que llene ventanas anchas en
+este modelo. Como referencia de aceptación, Strata (greedy, hasta 4 tokens por ventana, drafts mientras p ≥ 0.5)
+mide 2.42-3.63 tokens por ventana sobre un prompt de revisión de código; producción, 2.19-2.46 con muestreo y n-max 2.
+
+### 29.4 Techo físico del decode a 40k
+
+Paso de verificación de 3 tokens con MTP n-max 2 y los bytes del censo:
+
+| Componente | ms |
+|---|---|
+| Pesos, 5.88 GB a 227 GB/s (mejor tasa medida, sección 3, fila 3) / 256 GB/s (teórica) | 25.9 / 23.0 |
+| FA sparse + top-k QSA (medido, sección 28.3) | 4.8 |
+| Draft: dos pasos de 1 token + hook (GPU, sección 28.2) | 6.3 |
+| **Paso mínimo, sin host ni ops chicos** | **37 / 34** |
+| Paso medido hoy (secciones 28.7 y 28.9) | 61.7 |
+
+Con ~2.3 tokens por paso, el techo es 62-67 t/s frente a ~37 hoy: 1.7-1.8×. El 2× solo aparece en el límite teórico
+y reduciendo además la atención y el draft. La estructura del motor (replay de command buffers, fusión por capa, draft
+dentro de la pasada de verificación) ataca los ~25 ms que separan el paso de hoy del mínimo, sobre todo ~9.5 ms de
+host en serie (sección 28.2 menos la 28.7) y 8.9 ms de ops chicos (sección 28.3), y por la sección 28.4 recupera
+menos de lo que quita. Escenarios estimados: 54 / 49 / 42 ms por paso, 43 / 47 / 55 t/s (1.15 / 1.27 / 1.5×). Pasar
+el techo exige más tokens por lectura de pesos (29.2, 29.3) o menos bytes: la parte densa son 2.85 de los 5.88 GB
+(wqkv q5_K, cabeza q6_K, oproj q8_0), y bajarla es una decisión de calidad.
+
+### 29.5 El reparto CPU/GPU de Strata no aplica aquí
+
+Strata (https://github.com/Niko1221/Strata, paper en `docs/paper/Strata-Paper.pdf`): RTX 5070 de 12 GB (672 GB/s) y
+64 GB de DDR5-5200 (41-52 GB/s). Deja en VRAM la parte densa (~3.5 GB por token en su Q2_0) y los ~4,500 expertos más
+usados (acierto 0.71-0.78), y la CPU calcula el resto en paralelo. Sin MTP da 47-57 t/s a 4K, frente a los ~15 del
+llama.cpp con expertos en la CPU que cita su autor: casi toda la ganancia es ese reparto, que no existe en una memoria
+unificada. Su v1 atiende una petición a la vez, solo en greedy y sin caché de prompts. Lo transferible es el censo de
+sus cuants (29.1).
+
+### 29.6 Camino al 2× del prefill
+
+Existencia en esta máquina: pwilkin, HIP, 1086 t/s (llama-bench, bloque de 16384 a profundidad 40000, ubatch 16384,
+sin MTP ni mmproj; sección 6) frente a 561 t/s nuestros (server, 39.5k desde 0, con MTP y visión). Las condiciones
+difieren; la brecha de ~1.9× tiene una causa identificada: con ubatch 2048 cada experto recibe ~40 filas y los
+MUL_MAT_ID corren a 6.4-7.3 TFLOPS frente a 18-23 de los densos (sección 2), unos 24 de los 70.4 s (estimación: los
+26.3 s del perfil de la sección 2 menos 2.6 s de las secciones 22 y 23). Con ubatch 16384 recibirían ~320. Que el lote
+grande los lleve a la tasa de los densos en Vulkan es una hipótesis: el tile por filas por experto salió neutro
+(sección 8), y el −9 % de ubatch 4096 se midió antes del hoisting y del salto de columnas vacías.
+
+Estimación del camino: expertos a la tasa de los densos, ~24 → ~9 s (−15 s); atención sin máscara y FA más eficiente
+(pwilkin midió 1.48× en su camino sin máscara), ~−5 s; fusiones del residual ancho y host, ~−5 s. Total ~45 s (~880
+t/s, 1.55×); el techo de ~62-64 s de la sección 13 suponía ubatch 2048, otro régimen. El re-prefill de 2k de cada
+turno de agente no gana con el lote grande (un bloque de 2048 ya es un ubatch), solo con la atención y las fusiones.
+
+Obstáculos:
+
+1. Memoria: compute buffer de 4.3 GiB con ubatch 2048 (sección 6; ~3.9 GiB a n_ctx 135168 NP=1 con la regla de
+   split-on-inputs del scheduler) y ~22 GiB libres con producción cargada. Cuánto crece con el ubatch y qué tensores
+   lo dominan no está medido: `-lv 4` en dos tamaños de ubatch antes de nombrar qué lo hace caber.
+2. Los checkpoints están atados al ubatch y cada turno re-procesa desde el último: un lote grande exige guardar el
+   estado GDN cada 2048 tokens dentro del lote.
+3. Kernels de expertos a eficiencia WMMA (coopmat) en Vulkan con este modelo: no hay referencia publicada. Cada dispatch
+   queda lejos del tope de 2 s del anillo (gate/up: 9.5 ms a 2048, ~76 ms a 16384 a la tasa de hoy).
+
+### 29.7 Ventanas propuestas, en orden
+
+1. Prefill: ubatch 2048, 4096 y 8192 en la build actual, NP=1, producción descargada, con el compute buffer (`-lv 4`)
+   y los TFLOPS de expertos por nodo. Decide si el camino de 29.6 existe en Vulkan y cuánta memoria cuesta.
+2. Modo de potencia: todos los GB/s y relojes de 29.4 y 29.6 son bajo SPPT (sección 28.4) y es la única palanca que
+   mueve los dos techos. Cambio del Director en el BIOS; re-medida de decode y prefill con los contadores térmicos.
+3. Prototipo de replay del grafo de verificación: mide cuánto de los ~18 ms de host y ops chicos vuelve de verdad.
+4. N-gram + MTP con entrada ~8 y ventana ~7, sobre un turno de edición y uno de prosa, base primero y último, con
+   `repeat_probe` y `depth_repeat`.
