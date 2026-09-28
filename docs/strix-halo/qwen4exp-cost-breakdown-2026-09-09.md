@@ -16,7 +16,8 @@
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13 (prefill), sección 25 (encoder, imágenes, ejecución paralela, con la
   ventana v21 del 2026-09-23), sección 28 (presupuesto del decode) y sección 29 (techo físico del decode, camino al
-  2× del prefill y referencias externas del 2026-09-26). Desglose por nodo vigente: sección 2. Las
+  2× del prefill y referencias externas del 2026-09-26); plan del camino de decode por subproyectos en
+  `decode-plan-2026-09-28.md`. Desglose por nodo vigente: sección 2. Las
   secciones 5-12 son el registro de cada ventana de medición, en orden cronológico.
 
 Cronología del prefill de 39.5k a 40k (misma máquina, mismo rig):
@@ -1857,12 +1858,14 @@ Paso de verificación de 3 tokens con MTP n-max 2 y los bytes del censo:
 | Paso medido hoy (secciones 28.7 y 28.9) | 61.7 |
 
 Con ~2.3 tokens por paso, el techo es 62-67 t/s frente a ~37 hoy: 1.7-1.8×. El 2× solo aparece en el límite teórico
-y reduciendo además la atención y el draft. La estructura del motor (replay de command buffers, fusión por capa, draft
-dentro de la pasada de verificación) ataca los ~25 ms que separan el paso de hoy del mínimo, sobre todo ~9.5 ms de
-host en serie (sección 28.2 menos la 28.7) y 8.9 ms de ops chicos (sección 28.3), y por la sección 28.4 recupera
-menos de lo que quita. Escenarios estimados: 54 / 49 / 42 ms por paso, 43 / 47 / 55 t/s (1.15 / 1.27 / 1.5×). Pasar
-el techo exige más tokens por lectura de pesos (29.2, 29.3) o menos bytes: la parte densa son 2.85 de los 5.88 GB
-(wqkv q5_K, cabeza q6_K, oproj q8_0), y bajarla es una decisión de calidad.
+y reduciendo además la atención y el draft. Entre el paso de hoy y el mínimo hay ~9 ms de host en serie con la GPU
+(sección 28.2 menos la 28.7) y 8.9 ms de ops chicos (sección 28.3). **Corrección (2026-09-28)**: la primera versión
+contaba el replay de command buffers y estimaba 43 / 47 / 55 t/s; el replay no recupera tiempo, porque desde el primer
+submit la GPU no espera al host y la grabación termina 35 ms antes (sección 28.6). El plan por subproyectos
+(`decode-plan-2026-09-28.md`) estima 42-46 t/s (+14-23 %) con el host del camino crítico, las fusiones y el draft
+dentro de la verificación, y 44-49 t/s sumando la tasa de los pesos; por la sección 28.4 recupera menos de lo que
+quita. Pasar el techo exige más tokens por lectura de pesos (29.2, 29.3) o menos bytes: la parte densa son 2.85 de los
+5.88 GB (wqkv q5_K, cabeza q6_K, oproj q8_0), y bajarla es una decisión de calidad.
 
 ### 29.5 El reparto CPU/GPU de Strata no aplica aquí
 
@@ -1904,7 +1907,8 @@ Obstáculos:
    y los TFLOPS de expertos por nodo. Decide si el camino de 29.6 existe en Vulkan y cuánta memoria cuesta.
 2. Modo de potencia: todos los GB/s y relojes de 29.4 y 29.6 son bajo SPPT (sección 28.4) y es la única palanca que
    mueve los dos techos. Cambio del Director en el BIOS; re-medida de decode y prefill con los contadores térmicos.
-3. Prototipo de replay del grafo de verificación: mide cuánto de los ~18 ms de host y ops chicos vuelve de verdad.
+3. Host del camino crítico y fusiones del decode: subproyectos SP1-SP6 de `decode-plan-2026-09-28.md` (el replay
+   de command buffers queda descartado, 29.4).
 4. N-gram + MTP con entrada ~8 y ventana ~7 y las reglas de sushi (29.8: regla de línea, a lo sumo 8 drafts, ronda
    elegida contra el costo medido), sobre un turno de edición y uno de prosa, base primero y último, con
    `repeat_probe` y `depth_repeat`.
