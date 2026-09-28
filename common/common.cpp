@@ -1779,7 +1779,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    // one rollback slot per token of the longest draft any configured type proposes: an n-gram window next to an
+    // MTP head drafts more tokens than the head, and a rollback past the slots falls back to a checkpoint restore
+    cparams.n_rs_seq          = params.speculative.needs_rs_seq() ? common_speculative_n_max(&params.speculative) : 0;
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
