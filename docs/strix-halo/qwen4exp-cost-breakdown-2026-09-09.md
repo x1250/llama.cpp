@@ -1814,7 +1814,8 @@ bits, T 1.0 / top-k 20 / top-p 0.95, pensamiento activo) sirve el mismo modelo c
 cuando el contexto contiene el texto que se escribe, una ronda verifica hasta 7 tokens copiados; la entrada exige 8
 tokens coincidentes, porque con coincidencias cortas fallaron 56 de 70 tokens copiados y el total perdió un 5 %. Una
 edición de archivo decodifica a 190 t/s, frente a 105-107 de una respuesta corta y 103-115 de su prompt de agente de
-23k: la ganancia es solo de los turnos que copian texto.
+23k: la ganancia es solo de los turnos que copian texto. sushi midió la misma idea en el mismo modelo, con reglas de
+entrada más finas, tarea por tarea (29.8).
 
 Lectura del código del fork, sin ejecutar:
 
@@ -1904,5 +1905,66 @@ Obstáculos:
 2. Modo de potencia: todos los GB/s y relojes de 29.4 y 29.6 son bajo SPPT (sección 28.4) y es la única palanca que
    mueve los dos techos. Cambio del Director en el BIOS; re-medida de decode y prefill con los contadores térmicos.
 3. Prototipo de replay del grafo de verificación: mide cuánto de los ~18 ms de host y ops chicos vuelve de verdad.
-4. N-gram + MTP con entrada ~8 y ventana ~7, sobre un turno de edición y uno de prosa, base primero y último, con
+4. N-gram + MTP con entrada ~8 y ventana ~7 y las reglas de sushi (29.8: regla de línea, a lo sumo 8 drafts, ronda
+   elegida contra el costo medido), sobre un turno de edición y uno de prosa, base primero y último, con
    `repeat_probe` y `depth_repeat`.
+5. Draft MTP muestreado con la regla p/q (29.8): exacto; tokens por paso con el muestreo de producción, greedy sin
+   cambios, base primero y último.
+6. Aceptación "typical" (29.8): solo si el Director acepta que cambie la distribución de salida, con una compuerta de
+   calidad que no sea solo el NLL del texto emitido.
+
+### 29.8 sushi (MLX): la ventaja es el hardware; lo transferible está en la aceptación (2026-09-28)
+
+https://github.com/beamivalice/sushi (motor en Zig sobre MLX, fork de mlx-serve; `docs/perf-baselines.md`,
+`docs/engine-mtp.md`, `docs/engine-exl3-experts.md`, `docs/quality-kld.md`, `src/mtp_acceptance.zig`, consultados el
+2026-09-28). Sirve este modelo con los expertos en formato EXL3 (trellis) y el resto en afín.
+
+Dónde está su ventaja: en el M5 Max (~540 GB/s entregados y unidades de matriz NAX, ~55 TFLOPS emitidos) decodifica a
+93-98 t/s con MTP y hace prefill a 1670-1960 t/s. El mismo motor en un M2 Max de 64 GB (400 GB/s, sin NAX; celda
+reportada por un usuario, greedy, pensamiento activo) da 38.6 t/s de decode a 2k, 37.8 a 16k y 399-413 t/s de
+prefill. Eficiencia de una pasada completa: su M2 Max lee 5.58 GB por token en 33-36 ms (155-167 GB/s, ~40 % de 400);
+nuestra verificación, 5.88 GB en 47.6 ms de GPU (124 GB/s, ~48 % de 256). Es la misma clase. Su decode también está
+limitado por los huecos entre dispatches (~860 kernels por token en el M5 Max, ~7 µs por frontera, 9.8 ms de kernels
+en ~18 ms), el mismo diagnóstico de la sección 28; nuestra verificación tiene 3269 nodos y 2327 sincronizaciones.
+
+Lo que transfiere, en orden:
+
+1. Draft muestreado con la regla p/q (exacto; sin medir aquí). Su modo `exact` muestrea el draft de su distribución q
+   y lo acepta con probabilidad min(1, p/q), remuestreando el residuo al rechazar. El fork toma el argmax del draft
+   (`common/speculative.cpp:1776`) y el server acepta cuando la muestra del target coincide
+   (`common/sampling.cpp:692`): equivale a la regla p/q con q concentrada en un token, y la aceptación es p(argmax),
+   donde un draft muestreado obtendría Σ min(p, q), mayor en las posiciones de alta entropía. El fork ya tiene el
+   camino del residuo (`common/sampling.cpp:722`) y el campo `dists` en los parámetros del draft
+   (`common/speculative.h:79`), pero nada lo llena y el server no lo usa (`tools/server/server-context.cpp:4033`; el
+   otro camino de ese punto, `server_sample_and_accept_synth`, es la aceptación sintética para benchmarks). No cambia
+   la distribución de salida y greedy no se ve afectado.
+2. Aceptación "typical" (con pérdida; decisión del Director). Acepta el draft si p(draft) > min(ε, δ·exp(−H(p))), con
+   δ 0.2, ε 1 y H la entropía de la distribución filtrada del target, sin moneda aleatoria. Medido en su Sushi-4bpw a
+   T 1.0 / top-k 20 / top-p 0.95, 16 prompts × 512, 2 semillas: 69.2 / 63.3 → 80.0 / 76.6 t/s (2.1-2.2 → 2.4-2.6
+   tokens por ronda), NLL del texto emitido 0.7819 frente a 0.7805, dentro del ruido de semilla. Con la "cola greedy"
+   (drafts de profundidad ≥ 1 por argmax), +24-29 % sobre `exact` en su 2.6bpw, pero el NLL cae de 0.680 a 0.603
+   porque el texto se acerca al argmax: su proxy de calidad no ve la pérdida de diversidad. Cambia la distribución de
+   salida y se midió a T 1.0; producción muestrea a 0.7, donde el target está más concentrado y la ganancia sería
+   menor.
+3. Lookup dentro de la ronda MTP (29.2), medido en el mismo modelo (Sushi-3bpw, M5 Max, greedy / muestreo 0.6, 0.95,
+   20): copiar el archivo +21 % / +19 %, renombrar en él +21 % / +17 %, corregir un bug +16 % / +17 %, tool call
+   write_file +9 % / +11 %; renombrar detrás de ~32k / ~64k de contexto +24 % / +18 %; diff unificado, código nuevo y
+   prosa dentro del ruido. Reglas: los últimos 3 tokens confirmados más el siguiente coinciden antes en el prompt o la
+   salida y concuerdan hacia atrás 8+ tokens; una coincidencia corta (sufijo < 32) debe concordar pasado el inicio de
+   una línea (sin esa regla el diff perdía 4.8 % en greedy y 11.5 % en muestreo); a lo sumo 8 drafts; la ronda se
+   elige contra el costo medido de la ronda MTP. Los tipos n-gram del fork no tienen la regla de línea ni la compuerta
+   de costo.
+
+Lo que no transfiere:
+
+- EXL3 en los expertos: mejor calidad por bit (Sushi-4bpw, 63.68 GiB, KLD 0.0632 frente a 0.0818 del afín 4/8 de
+  70.13 GiB; Sushi-3bpw, 49.33 GiB, 0.1047 frente a 0.1444 del afín q3 de 54.94 GiB), pero en su propio hardware el
+  GEMV de decode está limitado por ALU (~313 GB/s frente a ~600 del afín), así que en esta GPU su efecto en velocidad
+  puede ser nulo o negativo. Es una palanca de calidad y memoria, y exige un tipo ggml nuevo, shaders Vulkan de decode
+  y prefill y un conversor.
+- Lectura de las hyper-connections agrupada por filas (+3 % en su verificación): el mat-vec de Vulkan ya comparte la
+  lectura de pesos entre columnas (`NUM_COLS`, `vulkan-shaders/mul_mat_vec_base.glsl`).
+- Shortlist del draft sobre una copia gruesa de la cabeza con re-puntuación exacta: baja la eficacia del draft, la
+  misma familia que la vía 9 descartada por el Director (sección 27.2).
+- GDN en un dispatch (−0.33 a −0.45 ms por pasada) y claves QSA agrupadas en un kernel (~1 %): el orden de las fusiones
+  de la fila 17 de la sección 3.
