@@ -11,6 +11,7 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <array>
 #include <map>
 #include <vector>
 
@@ -248,7 +249,8 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    // sched_graph is the scheduler that allocated gf (nullptr: the main scheduler of the context)
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched_graph = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -261,9 +263,18 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                    ggml_backend_sched_t   sched_graph) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_graph) const;
+
+    struct graph_slot;
+
+    // the least recently used graph slot, with its graph result and scheduler created on first use
+    graph_slot & graph_slot_lru();
+
+    // discard the graphs of the slots, so that none of them is reused
+    void graph_slots_reset();
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -348,6 +359,26 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // graphs of small ubatches (token generation, speculative verification, MTP hook and draft steps), each with its
+    // own scheduler: a context that alternates between a few such shapes reuses every one of them instead of
+    // rebuilding the graph it last replaced. The main scheduler keeps the larger ubatches and the worst-case reserve.
+    struct graph_slot {
+        llm_graph_result_ptr   res;
+        ggml_backend_sched_ptr sched;
+
+        uint64_t last_use = 0;
+        size_t   buf_size = 0; // compute buffers of the scheduler, reported when they grow
+    };
+
+    static constexpr uint32_t GRAPH_SLOT_MAX_TOKENS = 32;
+
+    std::array<graph_slot, 4> graph_slots;
+
+    uint64_t graph_slot_uses = 0;
+
+    // the scheduler that computed the last ubatch: its tensor assignments locate the outputs of that ubatch
+    ggml_backend_sched_t sched_cur = nullptr;
 
     bool sched_need_reserve = true;
 
