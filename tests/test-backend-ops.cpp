@@ -4817,6 +4817,99 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET + VIEW + CPY: the state snapshots copied into the rows of a recurrent cache, one row per
+// sequence and a block of mem_size rows per rollback slot, as the delta-net models write their rollback slots
+struct test_gdn_snapshots : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const bool    kda;
+    const int64_t K;
+    const int64_t mem_size;
+    const int64_t kv_head;
+
+    ggml_tensor * cpy  = nullptr;
+    ggml_tensor * attn = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR8(head_count, head_size, n_seq_tokens, n_seqs, kda, K, mem_size, kv_head);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_SNAPSHOTS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy, attn }; }
+
+    test_gdn_snapshots(int64_t head_count, int64_t head_size, int64_t n_seq_tokens, int64_t n_seqs, bool kda,
+            int64_t K, int64_t mem_size, int64_t kv_head)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), kda(kda), K(K),
+          mem_size(mem_size), kv_head(kv_head) {
+        GGML_ASSERT(kv_head + n_seqs <= mem_size);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kda ? head_size : 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, head_count, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        ggml_set_name(state, "state");
+
+        const int64_t D         = head_size * head_size * head_count;
+        const int64_t n_written = std::min(n_seq_tokens, K);
+
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, mem_size * K);
+        ggml_set_name(cache, "cache");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+
+        const int64_t attn_elems = head_size * head_count * n_seq_tokens * n_seqs;
+        ggml_tensor * snap = ggml_view_3d(ctx, out, D, n_seqs, n_written,
+                ggml_row_size(out->type, D), ggml_row_size(out->type, D * n_seqs), ggml_row_size(out->type, attn_elems));
+        ggml_tensor * dst  = ggml_view_3d(ctx, cache, D, n_seqs, n_written,
+                cache->nb[1], mem_size * cache->nb[1], kv_head * cache->nb[1]);
+        cpy = ggml_cpy(ctx, snap, dst);
+        ggml_set_name(cpy, "cpy");
+
+        // the copy right after the op, as the models build it; the scores are read after it
+        ggml_build_forward_expand(gf, cpy);
+
+        attn = ggml_view_4d(ctx, out, head_size, head_count, n_seq_tokens, n_seqs,
+                ggml_row_size(out->type, head_size), ggml_row_size(out->type, head_size * head_count),
+                ggml_row_size(out->type, head_size * head_count * n_seq_tokens), 0);
+        ggml_set_name(attn, "attn");
+        return attn;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -11081,6 +11174,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+
+    // snapshots into cache rows: fewer tokens than slots (a verification), more (a prefill), two sequences, KDA,
+    // the final state alone (K = 1), and the qwen4exp head size
+    test_cases.emplace_back(new test_gdn_snapshots(4,  64,  3, 1, false, 8, 3, 1));
+    test_cases.emplace_back(new test_gdn_snapshots(4,  64,  3, 2, false, 8, 4, 1));
+    test_cases.emplace_back(new test_gdn_snapshots(4,  64, 16, 2, false, 4, 3, 1));
+    test_cases.emplace_back(new test_gdn_snapshots(4,  64,  3, 2, true,  4, 4, 2));
+    test_cases.emplace_back(new test_gdn_snapshots(4,  64,  5, 2, false, 1, 3, 1));
+    test_cases.emplace_back(new test_gdn_snapshots(8, 128,  3, 1, false, 8, 2, 1));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

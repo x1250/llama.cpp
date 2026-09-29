@@ -702,6 +702,8 @@ static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_pattern     { G
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_rope_view_set_rows_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 static constexpr std::initializer_list<ggml_op> rms_norm_view_set_rows_pattern { GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 static constexpr std::initializer_list<ggml_op> rope_view_set_rows_pattern { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+static constexpr std::initializer_list<ggml_op> gdn_view_cpy_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
+static constexpr std::initializer_list<ggml_op> gdn_view_cpy_short_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_CPY };
 
 //node #978 (  SOFT_MAX):     ffn_moe_probs-15 (   0K) [Vulka         ] use=2:    ffn_moe_logits-15 (   0K) [Vulka         ]
 //node #979 (   RESHAPE): ffn_moe_probs-15 (re (   0K) [Vulka         ] use=1:     ffn_moe_probs-15 (   0K) [Vulka         ]
@@ -826,6 +828,17 @@ static constexpr std::initializer_list<std::array<int, 3>> rms_norm_mul_rope_vie
 static constexpr std::initializer_list<std::array<int, 3>> rms_norm_view_set_rows_edges {
     { 1, 0, 0 }, // view->src[0]     == rms_norm
     { 2, 0, 1 }, // set_rows->src[0] == view
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> gdn_view_cpy_edges {
+    { 1, 0, 0 }, // view of the snapshots->src[0] == gated_delta_net
+    { 3, 0, 1 }, // cpy->src[0]                   == view of the snapshots
+    { 3, 1, 2 }, // cpy->src[1]                   == view of the destination
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> gdn_view_cpy_short_edges {
+    { 1, 0, 0 }, // view of the snapshots->src[0] == gated_delta_net
+    { 2, 0, 1 }, // cpy->src[0]                   == view of the snapshots
 };
 
 static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
@@ -2121,13 +2134,15 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t H;
     uint32_t n_tokens;
     uint32_t n_seqs;
-    uint32_t s_off;
     uint32_t sq1, sq2, sq3;
     uint32_t sv1, sv2, sv3;
     uint32_t sb1, sb2, sb3;
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t snap_off;
+    uint32_t snap_seq_stride;
+    uint32_t snap_slot_stride;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -2703,6 +2718,8 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
+    // gated delta net writing its state snapshots through the copy that follows it
+    bool fused_gdn_snapshots {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER
@@ -6716,7 +6733,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
@@ -14202,7 +14219,8 @@ static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context&
         pc, {dispatch_x, dispatch_y, 1});
 }
 
-static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
@@ -14217,8 +14235,6 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const uint32_t K = (uint32_t)ggml_get_op_params_i32(dst, 0);
 
-    const uint32_t s_off = S_v * H * n_tokens * n_seqs;
-
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
 
@@ -14228,6 +14244,21 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     vk_subbuffer src_buf[6] = {};
     for (int i = 0; i < 6; i++) {
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+    }
+
+    // the snapshots go after the attention scores of the op's own output, slot after slot, or, fused, straight into
+    // the rows of the copy's destination
+    const uint32_t D = S_v * S_v * H;
+    vk_subbuffer snap_buf = dst_buf;
+    uint32_t snap_off         = S_v * H * n_tokens * n_seqs;
+    uint32_t snap_seq_stride  = D;
+    uint32_t snap_slot_stride = D * n_seqs;
+    if (ctx->fused_gdn_snapshots) {
+        const ggml_tensor * cpy = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+        snap_buf         = ggml_vk_tensor_subbuffer(ctx, cpy, true);
+        snap_off         = get_misalign_bytes(ctx, cpy) / sizeof(float);
+        snap_seq_stride  = (uint32_t)(cpy->nb[1] / sizeof(float));
+        snap_slot_stride = (uint32_t)(cpy->nb[2] / sizeof(float));
     }
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
@@ -14245,17 +14276,18 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
 
     const float scale = 1.0f / sqrtf((float)S_v);
     const vk_op_gated_delta_net_push_constants pc = {
-        H, n_tokens, n_seqs, s_off,
+        H, n_tokens, n_seqs,
         sq1, sq2, sq3,
         sv1, sv2, sv3,
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        snap_off, snap_seq_stride, snap_slot_stride
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, snap_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -17539,7 +17571,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_GATED_DELTA_NET:
-        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+        ggml_vk_gated_delta_net(ctx, compute_ctx, cgraph, node_idx);
 
         break;
 
@@ -18857,6 +18889,59 @@ static bool ggml_vk_can_fuse_rms_norm_set_rows(ggml_backend_vk_context * ctx, co
     return true;
 }
 
+// Nodes after the gated delta net at node_idx that fuse with it, 0 if none: the op writes its state snapshots straight
+// into the destination of the copy that follows it (the recurrent cache rows of each rollback slot) and skips the
+// snapshot part of its own output; the attention scores still go to its output, which the rest of the graph reads.
+// The destination view has no inputs, so the graph optimizer may have emitted it earlier: then the fused nodes are the
+// view of the snapshots and the copy, else the destination view sits between them.
+static int ggml_vk_gdn_snapshots_fused_nodes(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (ctx->device->disable_fusion) {
+        return 0;
+    }
+    // the op's output and the copy are read elsewhere; the destination view looks into the cache, outside the graph
+    int n_extra = 0;
+    if (ggml_can_fuse_subgraph(cgraph, node_idx, gdn_view_cpy_short_pattern, { node_idx, node_idx + 2 }) &&
+        ggml_check_edges(cgraph, node_idx, gdn_view_cpy_short_edges)) {
+        n_extra = 2;
+    } else if (ggml_can_fuse_subgraph(cgraph, node_idx, gdn_view_cpy_pattern, { node_idx, node_idx + 2, node_idx + 3 }) &&
+               ggml_check_edges(cgraph, node_idx, gdn_view_cpy_edges)) {
+        n_extra = 3;
+    } else {
+        return 0;
+    }
+
+    const ggml_tensor * gdn  = cgraph->nodes[node_idx];
+    const ggml_tensor * snap = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * cpy  = cgraph->nodes[node_idx + n_extra];
+    const ggml_tensor * v    = gdn->src[2];
+
+    const int64_t S_v       = v->ne[0];
+    const int64_t H         = v->ne[1];
+    const int64_t n_tokens  = v->ne[2];
+    const int64_t n_seqs    = v->ne[3];
+    const int64_t K         = ggml_get_op_params_i32(gdn, 0);
+    const int64_t D         = S_v * S_v * H;
+    const int64_t n_written = std::min(n_tokens, K);
+    const size_t  f32       = sizeof(float);
+
+    // the copy reads exactly the snapshots the op writes: [D, n_seqs, n_written] past the attention scores
+    if (snap->type != GGML_TYPE_F32 || snap->view_src != gdn ||
+        snap->view_offs != (size_t) (S_v * H * n_tokens * n_seqs) * f32 ||
+        snap->ne[0] != D || snap->ne[1] != n_seqs || snap->ne[2] != n_written || snap->ne[3] != 1 ||
+        snap->nb[1] != (size_t) D * f32 || snap->nb[2] != (size_t) (D * n_seqs) * f32) {
+        return 0;
+    }
+
+    // an f32 destination with contiguous rows; slot and sequence strides are free
+    if (cpy->type != GGML_TYPE_F32 || !ggml_are_same_shape(cpy, snap) || cpy->nb[0] != f32 ||
+        cpy->nb[1] % f32 != 0 || cpy->nb[2] % f32 != 0 ||
+        get_misalign_bytes(ctx, cpy) + ggml_nbytes(cpy) > (size_t) UINT32_MAX * f32) {
+        return 0;
+    }
+
+    return n_extra;
+}
+
 // Pattern check for the 5-op Snake fusion: mul -> sin -> sqr -> mul -> add.
 // Verifies the chain shape, the closure x_in_add == x_in_mul0, and that
 // the broadcast operands a and inv_b share a [1, C] layout.
@@ -19209,6 +19294,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
+        ctx->fused_gdn_snapshots = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -19329,6 +19415,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // with a data dependency on that register. The overlap check still
                 // rejects partial overlaps (different base or size).
                 std::fill_n(op_srcs_fused_elementwise, 5, true);
+            } else if (int gdn_extra = ggml_vk_gdn_snapshots_fused_nodes(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = gdn_extra;
+                ctx->fused_gdn_snapshots = true;
+                // the op still writes its attention scores
+                ctx->fused_ops_write_mask |= 1 << 0;
+                fusion_string = "GDN_SNAPSHOTS";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops, false);
+                // the copy writes its destination view element for element
+                op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = true;
             } else if (ggml_vk_can_fuse_topk_qsa(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = topk_qsa_pattern.size() - 1;
                 ctx->fused_topk_qsa = true;
@@ -19451,6 +19546,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
+                ctx->fused_gdn_snapshots = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
             }
         }
@@ -19624,6 +19720,18 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
             return true;
         };
 
+        // GATED_DELTA_NET + VIEW + VIEW + CPY, the rollback snapshots copied into the cache: the destination view has no
+        // inputs, so an earlier set may already have emitted it with its views; the rest of the pattern stays together
+        auto const &match_gdn_snapshots = [&](int start) -> bool {
+            if (start + (int) gdn_view_cpy_pattern.size() > graph->n_nodes) {
+                return false;
+            }
+            ggml_tensor * const * n = graph->nodes + start;
+            return n[0]->op == GGML_OP_GATED_DELTA_NET && n[1]->op == GGML_OP_VIEW && n[2]->op == GGML_OP_VIEW &&
+                   n[3]->op == GGML_OP_CPY && n[1]->src[0] == n[0] && n[3]->src[0] == n[1] && n[3]->src[1] == n[2] &&
+                   !used[start] && !used[start + 1] && !used[start + 3];
+        };
+
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (match_pattern(pattern, first_unused)) {
                 for (size_t j = 0; j < pattern.size(); ++j) {
@@ -19676,6 +19784,19 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (keep_pattern(rope_view_set_rows_pattern)) {
             continue;
         }
+        if (match_gdn_snapshots(first_unused)) {
+            for (int j = 0; j < (int) gdn_view_cpy_pattern.size(); ++j) {
+                if (!used[first_unused + j]) {
+                    new_order.push_back(graph->nodes[first_unused + j]);
+                    used_node_set.insert(graph->nodes[first_unused + j]);
+                    used[first_unused + j] = true;
+                }
+            }
+            while (first_unused < graph->n_nodes && used[first_unused]) {
+                first_unused++;
+            }
+            continue;
+        }
 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
@@ -19715,7 +19836,8 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(rms_norm_mul_add_pattern, j) ||
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
-                match_pattern(rope_view_set_rows_pattern, j)) {
+                match_pattern(rope_view_set_rows_pattern, j) ||
+                match_gdn_snapshots(j)) {
                 continue;
             }
             bool ok = true;
