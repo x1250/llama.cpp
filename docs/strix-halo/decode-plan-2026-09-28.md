@@ -69,17 +69,25 @@ sección 5 de este plan.
 
 ### SP2. Entradas del paso incrementales
 
-- Evidencia: `set_input_qsa` cuesta 1.20 ms por paso a 40k con la GPU parada (28.8); recorre todas las celdas en cada
-  ubatch y por stream (`src/llama-memory-hybrid-idx.cpp:442`, el comentario del código mide ~865 µs a 33k). La máscara
-  de la atención densa del draft cuesta 0.51 ms por paso (28.8).
+- Evidencia (85 W): `set_input_qsa` cuesta 1.20 ms por paso a 40k con la GPU parada (28.8); recorre todas las celdas
+  en cada ubatch y por stream (`src/llama-memory-hybrid-idx.cpp:442`, el comentario del código mide ~865 µs a 33k). La
+  máscara de la atención densa del draft cuesta 0.51 ms por paso (28.8).
+- Evidencia con la potencia nueva (sección 32 del documento de costos, cadena v39): las entradas de la verificación
+  cuestan 0.88 ms por paso a 40k y 2.20 a 125k; las de los tres grafos del draft, 0.19 y 0.53. La parte que crece con
+  la profundidad (QSA y máscaras KQ del target y del draft, sin reparto medido en el decode) es 0.77 ms por paso a 40k
+  (1.4 %) y 2.43 a 125k (3.8 %): la cota superior del SP2, +1.4 % de t/s a 40k y hasta +4 % a 125k.
 - Opciones de diseño: agrupación por bloques persistente entre ubatches, actualizada solo en las celdas que cambian
-  (filas nuevas, rollback del draft, `seq_rm`, celdas de imagen en orden de rango); máscara del draft escrita solo en
-  las columnas nuevas. La máscara desaparece si entra la vía 16 (IndexShare) o el SP5: no se cuenta dos veces.
+  (filas nuevas, rollback del draft, `seq_rm`, celdas de imagen en orden de rango); máscaras KQ del target y del draft
+  escritas solo en las columnas nuevas. La máscara del draft desaparece si entra la vía 16 (IndexShare) o el SP5: no se
+  cuenta dos veces.
 - Archivos: `src/llama-memory-hybrid-idx.cpp`, `src/llama-graph.cpp`, `src/llama-kv-cache.cpp`.
-- Hecho: set_inputs medido antes y después a 40k y a ~126k (rig de profundidad `mtp_depth.sh` con `depth_repeat`, MTP
-  y visión cargados); compuertas del protocolo con énfasis en texto → imagen → texto y NP=2.
-- Estimación: −1.2 a −1.7 ms por paso a 40k; crece lineal con la profundidad (~3× a 126k, estimado). Riesgo medio:
-  la agrupación QSA tuvo defectos con imágenes (`n_dirty < n_dirty_max`, 2026-09-04). 2-3 días.
+- Día 1: separar en el decode el costo de la agrupación QSA y el de las máscaras (medición por entrada en los
+  ubatches chicos, o `perf` si el Director baja `kernel.perf_event_paranoid` a 2) para elegir qué se hace incremental.
+- Hecho: set_inputs medido antes y después a 40k y a 125k con el rig de la cadena v39 (`decode_budget.py` con
+  `DEPTH_PROMPT=depth_prompt125.txt`, MTP, lookup y visión cargados), más `depth_repeat`; compuertas del protocolo con
+  énfasis en texto → imagen → texto y NP=2.
+- Estimación: hasta −0.77 ms por paso a 40k y −2.43 a 125k (medido como cota, sección 32). Riesgo medio: la
+  agrupación QSA tuvo defectos con imágenes (`n_dirty < n_dirty_max`, 2026-09-04). 2-3 días.
 
 ### SP3. Muestreo y huecos de host del server
 
@@ -150,14 +158,16 @@ aceptación typical) multiplican estos números por el cambio en tokens por paso
 
 Orden revisado el 2026-09-28 con el presupuesto medido a 117-130 W (sección 31.4 del documento de costos): SP4, SP6, SP5 y, al final, SP2 y SP3, porque el host en serie bajó a ~2.6 ms por paso. El lookup en la ronda MTP (fila 4 de la sección 29.7) quedó adoptado antes que estos SP.
 
+Revisado el 2026-09-29 con la cota del SP2 medida a 40k y a 125k (sección 32.3): SP4, SP6, SP2, SP5 y SP3. El SP2 pasa delante del SP5 porque su ganancia está medida y crece con el contexto de los agentes (hasta +4 % a 125k), cuesta 2-3 días y no necesita decisión del Director; el SP5 es un spike de riesgo alto con estimaciones del régimen de 85 W.
+
 El estado se actualiza al cerrar la ventana de cada SP, con el commit y la subsección del documento de costos que
 registra su medición.
 
 | Orden | SP | Días | Condición | Estado |
 |---|---|---|---|---|
 | 1 | SP1 | 2-3 | — | hecho el 2026-09-28 en un día (e579358ba, sección 30 del documento de costos): −1.17 ms por paso en greedy y −0.90 con muestreo a 40k; NP=2 sin cambio medible; con NP=2 los grafos se reutilizan (sección 31.2) |
-| 2 | SP2 | 2-3 | — | pendiente |
-| 3 | SP3 | 2 | — | pendiente |
-| 4 | SP4 | 4-6 | una fusión por día | pendiente |
+| 2 | SP4 | 4-6 | una fusión por día | pendiente |
+| 3 | SP6 | 3-4 | opcional | pendiente |
+| 4 | SP2 | 2-3 | — | pendiente; cota medida el 2026-09-29 (sección 32): −0.77 ms por paso a 40k, −2.43 a 125k |
 | 5 | SP5 | 2 de spike + 5-8 | decisión del Director tras el spike | pendiente |
-| 6 | SP6 | 3-4 | opcional | pendiente |
+| 6 | SP3 | 2 | — | pendiente |

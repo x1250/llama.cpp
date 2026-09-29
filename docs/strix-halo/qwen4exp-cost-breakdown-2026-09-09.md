@@ -15,7 +15,8 @@
   la sección 28.7, antes 63.9; los tokens por paso dependen del texto). Desde el 2026-09-28 el paquete ya no corre
   limitado a 85 W (117-130 W, sección 30): con el mismo código el paso bajó a 55.4 ms y el prefill de producción a
   590 t/s, y el SP1 lo llevó a 54.2 ms en greedy. Desde el 2026-09-28 el lookup en la ronda MTP (sección 31) acelera
-  los turnos que copian o editan texto un 29-45 %. Turno con una
+  los turnos que copian o editan texto un 29-45 %. A 125k (sección 32): prefill de 124.9k en 244 s (511 t/s) y
+  decode 33.3-34.0 t/s con instrumentación (37.8-39.9 a 40k en la misma ventana). Turno con una
   imagen de 448×448 en producción 4.1 s (antes 30.9). Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13 (prefill), sección 25 (encoder, imágenes, ejecución paralela, con la
@@ -2165,3 +2166,99 @@ código nuevo y prosa (−3 a 0 % hoy), y una clave más larga que la ventana, q
 
 Fuentes: `~/dbg/merge/chain_v3{4,5,7,8}.{sh,out}`, `lookup-v3{4,5,7}*.jsonl`, `family-v34.txt`, `np2-v38pl.out`,
 `~/dbg/depth/srvlog-v3{4,5,7}*.log`, `repeat-v37B1.log`, `power-v3{5,6,7}.log`, `cpu-v37.log`.
+
+## 32. Entradas del paso a 125k: dimensionamiento del SP2 (2026-09-29, cadena v39)
+
+Ventana sin cambios de código (build de producción 1ea4ce5d8 en `build/bin`, archivo rq8, draft IQ4_NL), paquete a
+117-130 W. Tres cargas NP=1 con `LLAMA_INPUT_TIMING` y `LLAMA_SPEC_TIMING`, MTP n-max 2, el lookup en la ronda MTP
+(default del launcher desde la sección 31.3) y el mmproj cargado: 40k (ctx 57344, prompt de 39.5k), 125k (ctx 131072,
+prompt de 124.9k: los primeros 530944 caracteres de wikitext-2 test, el corpus del prompt de 40k,
+`~/dbg/merge/depth_prompt125.txt`) y otra vez 40k. Cada carga hace el prefill una vez y dos turnos de 1024 tokens con
+`ignore_eos` (greedy y muestreo de producción) sobre el prefijo en caché (`decode_budget.py`, que toma el prompt de
+`DEPTH_PROMPT`). Entradas por contexto y tamaño de ubatch con `input_depth_parse.py` (medianas sobre todos los ubatches
+del turno). Huella de la carga de 125k: 68 GiB calculados, 69 medidos (MemAvailable 110 → 41). Mínimos del guard
+(MemAvailable / MemFree): 43 / 30, 40 / 29 y 45 / 37 GiB; cero timeouts de anillo; CPU ocupada 5 % (mediana), sin render;
+gfxclk 2.76-2.88 GHz en las tres cargas. Las cifras llevan la instrumentación (~1-2 ms por paso más que sin ella,
+sección 28.1); las comparaciones valen solo dentro de esta ventana (la sección 31.1 corrió sin lookup).
+
+### 32.1 El paso a 40k y a 125k
+
+| Carga | Greedy: t/s, ms por paso | Producción: t/s, ms por paso |
+|---|---|---|
+| 40k (primera) | 39.92, 55.83 | 37.78, 55.60 |
+| **125k** | **33.95, 64.11** | **33.30, 63.47** |
+| 40k (última) | 39.51, 56.42 | 38.15, 55.06 |
+
+Los tokens por paso casi no cambian (2.23 / 2.10 a 40k, 2.18 / 2.12 a 125k): la baja de 12-15 % en t/s es el paso,
+8.0-8.3 ms más largo. Reparto (`LLAMA_SPEC_TIMING` en todos los intervalos; set_inputs de `input_depth_parse.py`):
+
+| Tramo, ms por paso | 40k | 125k | Δ |
+|---|---|---|---|
+| Verificación del target (pared) | 47.97 | 53.75 | +5.78 |
+| · set_inputs (GPU parada) | 0.88 | 2.20 | +1.32 |
+| · cómputo del grafo y espera de la GPU | 46.70 | 50.75 (*) | +4.05 |
+| Draft: hook y dos pasos | 6.03 | 8.09 | +2.06 |
+| · set_inputs de los tres grafos | 0.19 | 0.53 | +0.34 |
+| Muestreo, post y huecos | 1.66 | 2.12 | +0.47 |
+| **Paso** | **55.67** | **64.01** | **+8.34** |
+
+(*) De la línea de tiempo de `budget_parse.py`, que a 125k cubre solo los pasos posteriores a la última verificación
+de más de 3 filas (131 y 324 pasos): las verificaciones del lookup (4 y 8 filas) cortan su secuencia. Los pasos del
+draft pasan de 2.9 a 3.9 ms y el hook de 0.63 a 0.79 ms en ese tramo: la atención densa del draft lee todo el KV.
+
+### 32.2 Entradas por contexto
+
+Medianas por ubatch, en ms:
+
+| Entrada | 40k (primera / última carga) | 125k | Pendiente por 1k celdas |
+|---|---|---|---|
+| Verificación del target, 3 filas | 0.865-0.922 / 0.845-0.901 | 2.168-2.230 | 0.0154 |
+| Hook del draft, 3 filas | 0.077-0.078 / 0.076-0.084 | 0.207 | 0.0015 |
+| Paso del draft, 1 fila | 0.054-0.056 / 0.053-0.060 | 0.161-0.166 | 0.0013 |
+
+Con una recta por los dos puntos, las entradas del target tienen ~0.27 ms fijos y el resto crece con las celdas: 0.61
+ms a 40k y 1.93 a 125k. Las del draft son casi todas proporcionales: 0.16 ms por paso a 40k y 0.50 a 125k. En total, la
+parte que crece con la profundidad es **0.77 ms por paso a 40k (1.4 %) y 2.43 ms a 125k (3.8 %)**. La máscara del
+draft ya no pesa lo que medía la sección 28.8 (0.51 ms por paso con el paquete a 85 W y los grafos reconstruidos):
+hoy es 0.19 ms a 40k.
+
+Qué contiene cada una: la verificación llena la agrupación QSA (`set_input_qsa`, `src/llama-memory-hybrid-idx.cpp:442`:
+cada celda a su bloque, sobre n_kv), la memoria híbrida (índices de K y V, máscara KQ de 3 filas × n_kv y copias del
+estado recurrente, `src/llama-graph.cpp:1091`) y las filas PLE; el draft llena el embedding del target y la máscara KQ
+de su atención densa. El reparto del decode entre QSA y máscaras no está medido: `LLAMA_INPUT_TIMING` detalla por
+entrada solo los ubatches de 512 tokens o más, y `perf` no está disponible (`kernel.perf_event_paranoid=4`). En el
+prefill sí (ms por ubatch de 2048 tokens):
+
+| Entrada | 40k (ubatches 17-19) | 125k (ubatches 58-60) |
+|---|---|---|
+| QSA del target | 15.6-20.0 | 49.6-65.9 |
+| Memoria híbrida del target (máscara KQ, índices) | 10.5-13.7 | 25.6-34.2 |
+| PLE del target | 12.3-15.4 | 13.5-17.4 |
+| Máscara KQ densa del draft | 11.4-15.3 | 26.2-36.0 |
+
+En el prefill las entradas suman 1.1-1.4 s de 69 s a 40k y 5.5 s de 244 s a 125k (2.2 %). El prefill de 124.9k dura
+**244.4 s (511 t/s)**, frente a 69.0-69.4 s (569-572 t/s) a 40k.
+
+### 32.3 Techo del SP2 y orden
+
+Si el SP2 quitara toda la parte de las entradas que crece con la profundidad (una cota superior: una agrupación
+incremental sigue costando algo en cada paso, y el reparto entre QSA y máscaras en el decode no está medido):
+
+| Profundidad | ms por paso | Greedy, t/s | Producción, t/s |
+|---|---|---|---|
+| 40k | −0.77 (−1.4 %) | 39.7 → 40.3 | 38.0 → 38.5 |
+| 125k | −2.43 (−3.8 %) | 33.95 → 35.3 | 33.30 → 34.6 |
+
+La estimación del plan (−1.2 a −1.7 ms a 40k, ~3× a 126k) venía del régimen de 85 W; con la potencia nueva la cota es
+la mitad a 40k. De los 8.3 ms que suma el paso entre 40k y 125k, las entradas son 1.7 ms (20 %); el resto es sobre
+todo GPU: +4.05 ms en la verificación (sin desglose por familia a 125k) y ~+1.7 ms en los grafos del draft, cuya
+atención densa lee todo el KV.
+
+Orden (sección 6 del plan): el SP2 pasa delante del SP5. Su ganancia quedó medida y acotada (+1.4 % a 40k, hasta +4 %
+a 125k, creciente con el contexto de los agentes), cuesta 2-3 días y no necesita decisión del Director; el SP5 sigue
+siendo un spike de riesgo alto con estimaciones del régimen de 85 W. SP4 y SP6 siguen primero: aplican a cualquier
+profundidad y valen más por día.
+
+Fuentes: `~/dbg/merge/chain_v39.{sh,out}`, `budget-v39{a,d,a2}.txt`, `inputs-v39{a,d,a2}.txt`, `input_depth_parse.py`,
+`depth_prompt125.txt`; `~/dbg/depth/budget-v39{a,d,a2}.jsonl`, `srvlog-v39{a,d,a2}.log`, `guard-v39*.log`,
+`power-v39.log`, `cpu-v39.log`.
