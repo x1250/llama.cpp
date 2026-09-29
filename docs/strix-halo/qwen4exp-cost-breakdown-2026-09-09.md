@@ -2336,3 +2336,43 @@ al abrir la ventana y quedó descargada.
 Fuentes: `~/dbg/merge/chain_v40.{sh,out}`, `budget-v40*.txt`, `inputs-v40{nx,bx,db,dn}.txt`, `np2-v40p{b,n}.out`,
 `probe-v40.out`, `img-v40-prod.out`, `imgbig-v40-prod.out`, `gd-v40n.log`, `sp2/` (arnés de CPU); `~/dbg/depth/`
 `budget-v40*.jsonl`, `srvlog-v40*.log`, `repeat-v40n2.log`, `power-v40.log`, `cpu-v40.log`.
+
+## 34. Día 1 del SP3: qué corre el host con la GPU parada (2026-09-29, cadena v41)
+
+Sin cambios de código (build de producción con el SP2). `kernel.perf_event_paranoid=2` puesto por el Director. Una
+carga NP=1 a 40k (ctx 57344) con `LLAMA_INPUT_TIMING`, que fuerza la espera de la GPU al final de cada ubatch, así que
+entre ubatches la GPU está parada, y `LLAMA_SPEC_TIMING`. Tras el prefill, un turno greedy y uno con muestreo de
+producción de 1024 tokens bajo `perf record -e cycles:u --call-graph dwarf,16384 -F 999 -k monotonic`: el reloj de
+`ggml_time_us`. `gap_fold.py` ubica cada muestra del hilo principal en su ubatch o en su hueco de la línea de tiempo
+del paso: 950 pasos, 24430 muestras. El paso con la instrumentación, 55.5 / 54.8 ms (greedy / muestreo).
+
+| Hueco (GPU parada) | ms por paso | Qué corre |
+|---|---|---|
+| Tras el hook | 0.98 | muestreo del target: llenado de los 248320 candidatos 0.23 y top-k (`partial_sort`, `__heap_select`) 0.18; copia de los candidatos en `common_sampler_clone` 0.14 (el clon del server antes de aceptar, `server-context.cpp:4026`, copia el vector de 3 MB); limpieza del command pool de Vulkan 0.13; `seq_rm` de lo rechazado 0.105; lookup n-gram 0.03; resto de la ronda especulativa ~0.1 |
+| Tras la verificación | 0.33 | espera de la lectura de logits 0.09, Vulkan 0.06, la ronda especulativa 0.05, preparación de `llama_decode` 0.04 |
+| Tras el último draft | 0.20 | espera de lectura 0.05, server 0.05, `llama_decode` 0.03, `seq_rm` y `find_slot` 0.04 |
+| Entre los pasos del draft | 0.13 | espera de la lectura de la salida del draft 0.07 |
+| **Total** | **1.64** | 3 % del paso |
+
+`seq_rm` recorre todas las celdas del stream (`llama_kv_cache::seq_rm`, `src/llama-kv-cache.cpp:405`) para las
+posiciones del draft rechazado, en la atención y en el indexador del target y en el caché del draft, aunque no haya
+nada que borrar: su costo sigue al tamaño del KV, no a la profundidad. Las cargas de prueba usan ctx 57344; producción
+usa 262144 celdas por slot, así que ahí cuesta ~4.6 veces más (~0.4 ms por paso, estimado a escala; una pasada aislada
+en la CPU cuesta 0.016 ms a 57k celdas y 0.074 a 262k, `~/dbg/merge/sp2/seqrm_bench.cpp`, y en el server la caché de CPU
+llega fría).
+
+Candidatos del SP3, todos con la misma salida:
+
+| Cambio | Estimación a ctx 57k | En producción (262k por slot) |
+|---|---|---|
+| El clon del sampler sin el vector de candidatos (se reescribe en cada muestreo) | −0.14 ms | −0.14 ms |
+| `seq_rm` por el índice de posiciones de la secuencia en vez de recorrer todas las celdas | −0.09 ms | ~−0.4 ms |
+| Llenado y top-k del muestreo en una pasada, con el mismo orden de empates que `partial_sort` | −0.2 a −0.3 ms | igual |
+| La limpieza del command pool de Vulkan fuera del camino crítico | −0.10 a −0.13 ms | igual |
+| **Total** | **~0.55-0.65 ms (+1.0-1.2 %)** | **~0.85-1.0 ms (+1.5-1.8 %)** |
+
+Las esperas de lectura dentro de los huecos (~0.2 ms) son trabajo de la GPU (copias a host), no del host. La
+restricción del muestreo sigue: mismos candidatos y mismo orden de empates, o el probe cambia.
+
+Fuentes: `~/dbg/merge/chain_v41.{sh,out}`, `gap_fold.py`, `gap-v41p.txt`, `perf-v41-fold.txt`, `budget-v41p.txt`;
+`~/dbg/depth/perf-v41.data`, `perf-v41.script`, `srvlog-v41p.log`, `budget-v41{w,p}.jsonl`.

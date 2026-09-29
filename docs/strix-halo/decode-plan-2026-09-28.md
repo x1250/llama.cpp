@@ -100,7 +100,13 @@ sección 5 de este plan.
 - Opciones: logits en memoria host cacheada; llenado y top-k más baratos con el mismo orden de empates; clon evitado;
   split de CPU del scheduler más corto.
 - Restricción: el muestreo debe quedar bit-idéntico (mismos candidatos, mismo orden de empates) o el probe cambia.
-- Estimación: −1 a −1.5 ms por paso. Riesgo bajo. 2 días.
+- Atribución hecha el 2026-09-29 (sección 34 del documento de costos, perf con la línea de tiempo del paso): 1.64 ms
+  de huecos de host por paso a 40k. Cambios: el clon del sampler sin el vector de candidatos (−0.14 ms), `seq_rm` por
+  el índice de posiciones de la secuencia (−0.09 ms con ctx 57k, ~−0.4 en producción con 262k celdas por slot), llenado
+  y top-k del muestreo en una pasada con el mismo orden de empates (−0.2 a −0.3), la limpieza del command pool de
+  Vulkan fuera del camino crítico (−0.10 a −0.13).
+- Estimación: −0.55 a −0.65 ms por paso con ctx 57k (+1.0-1.2 %) y −0.85 a −1.0 en producción (+1.5-1.8 %). Riesgo
+  bajo salvo el top-k (orden de empates). 2 días.
 
 ### SP4. Fusiones en el grafo de verificación
 
