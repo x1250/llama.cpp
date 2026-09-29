@@ -3,7 +3,8 @@
 ## Estado actual (2026-09-28)
 
 - Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410), las listas de la FA sparse desde la selección QSA (sección 21, build 413), la carga IQ3_S de 16 valores por hilo (sección 22, build 415), los tiles de expertos que saltan las columnas vacías (sección 23, build 416) y los quick wins de la sección 26: la marca del caché QSA agrupado por rango y el orden por counting sort (decode tras una imagen +12 %), y `--decode-share 0.4` con `--no-cache-idle-slots` para varios agentes a la vez; desde el 2026-09-28, los grafos de
-  los ubatches chicos en slots con su propio scheduler (SP1 del plan de decode, sección 30).
+  los ubatches chicos en slots con su propio scheduler (SP1 del plan de decode, sección 30) y las entradas del paso
+  sin recorridos caros (SP2, sección 33).
   Producción: `strix load qwen38flash`
   (NP=2, `-c 524288` = 262144 × 2 slots, batch = ubatch 2048, KV q8_0, lazy mode auto, draft MTP IQ4_NL
   n-max 2, mmproj con el encoder de visión en la GPU desde el 2026-09-22 (sección 24), `--ctx-checkpoints 8`,
@@ -16,7 +17,8 @@
   limitado a 85 W (117-130 W, sección 30): con el mismo código el paso bajó a 55.4 ms y el prefill de producción a
   590 t/s, y el SP1 lo llevó a 54.2 ms en greedy. Desde el 2026-09-28 el lookup en la ronda MTP (sección 31) acelera
   los turnos que copian o editan texto un 29-45 %. A 125k (sección 32): prefill de 124.9k en 244 s (511 t/s) y
-  decode 33.3-34.0 t/s con instrumentación (37.8-39.9 a 40k en la misma ventana). Turno con una
+  decode 33.3-34.0 t/s con instrumentación (37.8-39.9 a 40k en la misma ventana); con el SP2, 34.4-35.1 t/s a 125k
+  (+3.8 %) y +0.9 % a 40k. Turno con una
   imagen de 448×448 en producción 4.1 s (antes 30.9). Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13 (prefill), sección 25 (encoder, imágenes, ejecución paralela, con la
@@ -2262,3 +2264,73 @@ profundidad y valen más por día.
 Fuentes: `~/dbg/merge/chain_v39.{sh,out}`, `budget-v39{a,d,a2}.txt`, `inputs-v39{a,d,a2}.txt`, `input_depth_parse.py`,
 `depth_prompt125.txt`; `~/dbg/depth/budget-v39{a,d,a2}.jsonl`, `srvlog-v39{a,d,a2}.log`, `guard-v39*.log`,
 `power-v39.log`, `cpu-v39.log`.
+
+## 33. SP2 del plan de decode: entradas del paso sin recorridos caros (2026-09-29, cadena v40)
+
+Dos cambios de host, mismos valores que antes, sin tocar el grafo:
+
+- **Agrupación QSA** (`set_input_qsa`, `src/llama-memory-hybrid-idx.cpp`, 100f88835). Con una secuencia por stream
+  (todo ubatch de decode del server) un bloque tiene un solo grupo, que toma el número del bloque: sin cadenas ni
+  inserciones por bloque. El bloque y el slot de un índice salen por desplazamiento cuando el ratio es potencia de
+  dos (4 en qwen4exp), los slots del bloque quedan en un registro mientras las celdas consecutivas lo comparten, el
+  camino pooled guarda solo las celdas de los bloques sucios (antes llenaba una tabla del tamaño del caché) y, si todas
+  las celdas usadas llevan la secuencia de la consulta (`llama_kv_cells::seq_in_all_cells`), el sesgo por bloque se
+  llena por rangos en vez de probar la pertenencia bloque a bloque. Los demás layouts siguen por las cadenas.
+- **Primera fila de la máscara KQ de cada secuencia** (`src/llama-kv-cache.cpp`, b3e7e2b3f), en el target y en el
+  draft. Con todas las celdas usadas en la secuencia del token y sin ventana deslizante, la fila son las celdas usadas
+  con posición <= la del token: una pasada vectorizada sobre las posiciones (`fill_used_pos_le`). Las celdas que el
+  bucle registraba para los tokens siguientes salen del índice de posiciones de la secuencia (`seq_cells_from`) y solo
+  a ellas se les aplica la prueba completa, que conserva la regla M-RoPE en la posición de la consulta.
+
+La atribución previa se hizo en la CPU, sin GPU, con las celdas reales (`llama_kv_cells`) y copias exactas del código
+anterior (`~/dbg/merge/sp2/`): a 125k celdas la agrupación QSA costaba 1.03-1.22 ms por ubatch de decode y la máscara
+0.09-0.1 ms por fila; la agrupación era el 75-80 % de las entradas de la verificación. Equivalencia bit a bit con el
+código anterior: 21 layouts × 20 semillas para la agrupación (celdas de imagen en orden de rango, huecos, celdas
+desordenadas, dos secuencias en un stream, una celda usada sin secuencia, ratios 3, 4, 5 y 8, caminos pooled y
+recompute) y 9 × 20 para la máscara. En el arnés: agrupación 1.03 → 0.41 ms a 125k celdas (2.5×) y 0.33 → 0.13 a 40k;
+máscara 5-7× por fila de decode.
+
+Cadena v40 (NP=1, MTP n-max 2, lookup y visión cargados; base = build de producción 1ea4ce5d8 por
+`LD_LIBRARY_PATH`, verificada en `/proc/<pid>/maps`). A 40k sin instrumentar, base, nueva, nueva, base:
+
+| Carga | Greedy: ms por paso (t/s) | Producción: ms por paso (t/s) |
+|---|---|---|
+| Base (primera) | 55.37 (40.25) | 54.89 (38.27) |
+| Nueva | 55.05 (40.49) | 54.46 (38.57) |
+| Nueva | 54.93 (40.58) | 54.44 (38.59) |
+| Base (última) | 55.53 (40.14) | 54.95 (38.23) |
+
+**40k: −0.46 ms por paso (−0.8 %), 40.20 → 40.54 t/s en greedy y 38.25 → 38.58 con muestreo (+0.9 %).** A 125k,
+cargas con `LLAMA_INPUT_TIMING` y `LLAMA_SPEC_TIMING` (el prompt de 124.9k de la sección 32):
+
+| Carga | Greedy: ms por paso (t/s) | Producción: ms por paso (t/s) |
+|---|---|---|
+| Base | 64.47 (33.76) | 63.82 (33.12) |
+| **Nueva** | **62.05 (35.08)** | **61.48 (34.38)** |
+
+**125k: −2.4 ms por paso (−3.7 %), +3.8-3.9 % de t/s**, toda la cota de la sección 32.3 (2.43 ms). Entradas, medianas
+por ubatch en ms:
+
+| Entrada | 40k base → nueva | 125k base → nueva |
+|---|---|---|
+| Verificación del target, 3 filas | 0.97 / 0.96 → 0.53 / 0.52 | 2.25 / 2.23 → 0.96 / 0.94 |
+| Hook del draft, 3 filas | 0.072 / 0.069 → 0.023 / 0.024 | 0.209 / 0.210 → 0.053 / 0.054 |
+| Paso del draft, 1 fila | 0.056 / 0.055 → 0.010 / 0.010 | 0.172 / 0.173 → 0.023 / 0.023 |
+| **Por paso (verificación, hook y dos pasos)** | **1.15 → 0.57** | **2.80 → 1.05** |
+
+A 125k el paso baja más que las entradas (2.4 frente a 1.75 ms): la verificación de pared cae 1.8 ms y sus entradas
+1.29, el draft 0.4 y los huecos 0.2; los ~0.5 ms restantes quedan sin atribuir. Lo que queda de las entradas de la
+verificación a 125k (0.95 ms) es ~0.27 fijo (PLE, índices) y la agrupación.
+
+Exactitud: respuestas de la build nueva idénticas byte a byte a las de la base en greedy y con muestreo a 40k (1024
+tokens, `ignore_eos`) y a 125k, base contra base y nueva contra nueva también; misma aceptación del draft;
+`depth_repro` + `depth_repeat` idénticos; `graph_diff4` con el split del server, 72 nodos (los conocidos). Producción
+(NP=2, contexto nativo): probe idéntico a `probe-v26.out`, conversación texto → imagen → texto 5/5, imagen de
+2048×2048 en 12.8 s, cero timeouts de anillo. Rig NP=2 base → nueva: un slot solo 38.7 → 38.7-38.9 t/s, dos slots
+44.1-44.6 → 43.4-44.1 t/s agregados, el slot que genera mientras llega un prompt de 15k 16.05 → 16.44 chunks/s: sin
+cambio medible (el rig corre a poca profundidad). Adoptado: la build queda en `build/bin`; producción estaba descargada
+al abrir la ventana y quedó descargada.
+
+Fuentes: `~/dbg/merge/chain_v40.{sh,out}`, `budget-v40*.txt`, `inputs-v40{nx,bx,db,dn}.txt`, `np2-v40p{b,n}.out`,
+`probe-v40.out`, `img-v40-prod.out`, `imgbig-v40-prod.out`, `gd-v40n.log`, `sp2/` (arnés de CPU); `~/dbg/depth/`
+`budget-v40*.jsonl`, `srvlog-v40*.log`, `repeat-v40n2.log`, `power-v40.log`, `cpu-v40.log`.
