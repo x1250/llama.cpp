@@ -394,6 +394,33 @@ public:
         return seq_pos[seq_id].size() == used.size();
     }
 
+    // append to dst the cells below n that carry seq_id at a position >= p0, in position order
+    void seq_cells_from(llama_seq_id seq_id, llama_pos p0, uint32_t n, std::vector<uint32_t> & dst) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+
+        for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end(); ++it) {
+            if (it->second < n) {
+                dst.push_back(it->second);
+            }
+        }
+    }
+
+    // dst[i] = keep for the used cells of [0, n) at a position <= p_max, drop for the others. One pass over
+    // the positions with no per-cell branch, so the compiler vectorizes it
+    template <typename T>
+    void fill_used_pos_le(T * dst, uint32_t n, llama_pos p_max, T keep, T drop) const {
+        assert(n <= pos.size());
+        assert(p_max >= 0);
+
+        for (uint32_t i = 0; i < n; ++i) {
+            // an empty cell holds -1, which as unsigned is above any position
+            dst[i] = (uint32_t) pos[i] <= (uint32_t) p_max ? keep : drop;
+        }
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());

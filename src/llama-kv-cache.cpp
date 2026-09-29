@@ -1634,6 +1634,19 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     idxs.reserve(ubatch->n_tokens + n_swa + 32);
 
                     seq_srct[seq_id] = i;
+
+                    // one sequence in the stream and no window: a cell is kept when it is used and not in the
+                    // future, a test the row takes in one vectorized pass. The cells the loop below would record
+                    // for the next tokens are the sequence's from the same position on, read from its position
+                    // index; the loop then applies the full test to them only, which covers the M-RoPE rule at
+                    // the query's own position
+                    if (!swa && cells.seq_in_all_cells(seq_id)) {
+                        cells.fill_used_pos_le(data + idst, (uint32_t) n_kv,
+                                causal ? p1 : std::numeric_limits<llama_pos>::max(), mask_keep, mask_drop);
+                        cells.seq_cells_from(seq_id, seq_pos_min[seq_id] - (int32_t) (n_swa + 32), (uint32_t) n_kv, idxs);
+
+                        prev = true;
+                    }
                 }
             }
 
