@@ -394,14 +394,14 @@ public:
         return seq_pos[seq_id].size() == used.size();
     }
 
-    // append to dst the cells below n that carry seq_id at a position >= p0, in position order
-    void seq_cells_from(llama_seq_id seq_id, llama_pos p0, uint32_t n, std::vector<uint32_t> & dst) const {
+    // append to dst the cells below n that carry seq_id at a position in [p0, p1), in position order
+    void seq_cells_in(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint32_t n, std::vector<uint32_t> & dst) const {
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);
 
         const auto & sp = seq_pos[seq_id];
 
-        for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end(); ++it) {
+        for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end() && it->first < p1; ++it) {
             if (it->second < n) {
                 dst.push_back(it->second);
             }

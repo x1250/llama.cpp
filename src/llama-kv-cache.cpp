@@ -402,15 +402,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
+        // the sequence's cells in [p0, p1) come from its position index: the server removes the rejected draft
+        // tokens on every decode step, and a scan of every cell costs as much as the whole cache, used or not
+        std::vector<uint32_t> idxs;
+        cells.seq_cells_in(seq_id, p0, p1, cells.size(), idxs);
 
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
+        for (const uint32_t i : idxs) {
+            if (cells.seq_rm(i, seq_id)) {
+                new_head = std::min(new_head, i);
             }
         }
 
@@ -1643,7 +1642,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     if (!swa && cells.seq_in_all_cells(seq_id)) {
                         cells.fill_used_pos_le(data + idst, (uint32_t) n_kv,
                                 causal ? p1 : std::numeric_limits<llama_pos>::max(), mask_keep, mask_drop);
-                        cells.seq_cells_from(seq_id, seq_pos_min[seq_id] - (int32_t) (n_swa + 32), (uint32_t) n_kv, idxs);
+                        cells.seq_cells_in(seq_id, seq_pos_min[seq_id] - (int32_t) (n_swa + 32), std::numeric_limits<llama_pos>::max(),
+                                (uint32_t) n_kv, idxs);
 
                         prev = true;
                     }
