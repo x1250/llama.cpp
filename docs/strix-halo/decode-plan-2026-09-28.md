@@ -176,4 +176,4 @@ registra su medición.
 | 3 | SP6 | 3-4 | opcional | pendiente |
 | 4 | SP2 | 2-3 | — | hecho el 2026-09-29 en un día (100f88835, b3e7e2b3f; sección 33 del documento de costos): −0.46 ms por paso a 40k (+0.9 % t/s, bajo su cota de 0.77) y −2.0 a −2.4 ms a 125k (+3.2-3.9 %); salidas idénticas; NP=2 sin cambio medible |
 | 5 | SP5 | 2 de spike + 5-8 | decisión del Director tras el spike | pendiente |
-| 6 | SP3 | 2 | — | pendiente |
+| 6 | SP3 | 2 | — | hecho el 2026-09-29 (f5149b386, 2ed7aac92, 7b0e8cf98; sección 35 del documento de costos): NP=1 a 40k −0.93 ms por paso (+1.7 %), producción a 40k −1.4 a −1.9 ms (+2.6-3.6 %); salidas idénticas a la base. Abierto: el SP1 hace que la salida dependa de la historia del servidor (sección 35.1) |

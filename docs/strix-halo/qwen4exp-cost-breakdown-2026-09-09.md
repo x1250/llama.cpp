@@ -3,8 +3,9 @@
 ## Estado actual (2026-09-28)
 
 - Árbol: master con el hint del server, la conv sin concat, el guard de columnas y BK_STEP 2 del MMQ (sección 20, build 410), las listas de la FA sparse desde la selección QSA (sección 21, build 413), la carga IQ3_S de 16 valores por hilo (sección 22, build 415), los tiles de expertos que saltan las columnas vacías (sección 23, build 416) y los quick wins de la sección 26: la marca del caché QSA agrupado por rango y el orden por counting sort (decode tras una imagen +12 %), y `--decode-share 0.4` con `--no-cache-idle-slots` para varios agentes a la vez; desde el 2026-09-28, los grafos de
-  los ubatches chicos en slots con su propio scheduler (SP1 del plan de decode, sección 30) y las entradas del paso
-  sin recorridos caros (SP2, sección 33).
+  los ubatches chicos en slots con su propio scheduler (SP1 del plan de decode, sección 30), las entradas del paso
+  sin recorridos caros (SP2, sección 33) y los huecos de host del paso (SP3, sección 35). Abierto: con el SP1 la salida
+  depende de la historia del servidor (sección 35.1).
   Producción: `strix load qwen38flash`
   (NP=2, `-c 524288` = 262144 × 2 slots, batch = ubatch 2048, KV q8_0, lazy mode auto, draft MTP IQ4_NL
   n-max 2, mmproj con el encoder de visión en la GPU desde el 2026-09-22 (sección 24), `--ctx-checkpoints 8`,
@@ -2376,3 +2377,80 @@ restricción del muestreo sigue: mismos candidatos y mismo orden de empates, o e
 
 Fuentes: `~/dbg/merge/chain_v41.{sh,out}`, `gap_fold.py`, `gap-v41p.txt`, `perf-v41-fold.txt`, `budget-v41p.txt`;
 `~/dbg/depth/perf-v41.data`, `perf-v41.script`, `srvlog-v41p.log`, `budget-v41{w,p}.jsonl`.
+
+## 35. SP3 del plan de decode: huecos de host del paso (2026-09-29, cadenas v42-v46)
+
+Tres cambios de la atribución de la sección 34, mismos valores que antes:
+
+- **Clon del sampler sin candidatos** (`common/sampling.cpp`, f5149b386). El server clona el sampler del target antes de
+  aceptar un draft en cada paso, y el clon copiaba el vector de candidatos del último muestreo (248320 entradas, 3 MB).
+  Cada muestreo lo rellena (`set_logits`), así que el clon y la copia llevan solo el estado (samplers, gramática,
+  presupuesto de razonamiento, historia, rng). Nadie lee los candidatos de un clon ni de un sampler restaurado antes de
+  muestrear con él (el restore del checkpoint del server, los ejemplos de speculative).
+- **`seq_rm` por el índice de posiciones de la secuencia** (`src/llama-kv-cache.cpp`, 2ed7aac92). Recorría todas las
+  celdas del stream (262144 por slot en producción) para borrar los tokens rechazados del draft, en la atención y el
+  indexador del target y en el caché del draft. Ahora toma las celdas de la secuencia en [p0, p1) de su índice
+  (`llama_kv_cells::seq_cells_in`, el accessor de la primera fila de la máscara del SP2 generalizado a un rango). Mismas
+  celdas, mismos conjuntos de secuencias y mismo head que el recorrido en 1500 borrados al azar
+  (`~/dbg/merge/sp2/seqrm_equiv.cpp`).
+- **Pool de comandos de Vulkan reseteado durante la espera siguiente** (`ggml-vulkan.cpp`, 7b0e8cf98). Cada contexto de
+  backend tiene dos pools usados por turno: la limpieza tras la espera retira el actual y el grafo siguiente graba en el
+  otro; el retirado se resetea al comienzo de la próxima espera del fence, con la GPU trabajando.
+
+Descartado: el llenado de candidatos y el top-k en una pasada. Solo es exacto si los samplers anteriores al top-k no
+cambian nada (logit bias, penalizaciones, gramática, presupuesto de razonamiento), una condición que depende de cada
+pedido: frágil, fuera del SP3.
+
+Cadena v42, NP=1 a 40k (ctx 57344), base (build del SP2) por `LD_LIBRARY_PATH`:
+
+| Carga | Greedy: ms por paso (t/s) | Producción: ms por paso (t/s) |
+|---|---|---|
+| Base (primera) | 54.79 (40.68) | 54.53 (38.52) |
+| Nueva | 54.12 (41.18) | 53.73 (39.09) |
+| Nueva | 54.09 (41.20) | 53.70 (39.12) |
+| Base (última) | 55.29 (40.31) | 54.83 (38.31) |
+
+**NP=1 a 40k: −0.93 ms por paso, 40.50 → 41.19 t/s en greedy y 38.42 → 39.11 con muestreo (+1.7-1.8 %).** Huecos de host
+del paso (carga con timing, turno con muestreo): 1.71 → 1.20 ms; tras el hook 0.98 → 0.60, tras la verificación
+0.35 → 0.31, tras el último draft 0.24 → 0.16.
+
+**Producción (NP=2, 262144 celdas por slot) a 40k, servidor recién cargado: 56.04 / 55.72 → 54.20 / 53.81 ms por paso,
+39.77 → 41.12 t/s en greedy y 37.70 → 39.04 con muestreo (+3.4-3.6 %).** Con la misma historia previa en el servidor
+(probe, conversación con imagen, imagen de 2048×2048), 55.78 / 54.99 → 54.36 / 54.25 ms (+2.6 / +1.4 %). En producción
+rinde más que en NP=1 porque el `seq_rm` recorría un KV 4.6 veces mayor. Rig NP=2: un slot solo 39.7 / 38.7 → 39.8 /
+39.7 t/s, dos slots 44.5-44.6 → 44.5-45.2 t/s agregados, el slot que genera mientras llega un prompt de 15k 15.85 → 16.62
+chunks/s.
+
+Exactitud: respuestas idénticas a la base en NP=1 (greedy y muestreo, también en las cargas con timing), base contra base
+y nueva contra nueva; `depth_repro` + `depth_repeat` idénticos; `graph_diff4` 72 nodos; probe idéntico a `probe-v26`,
+conversación texto → imagen → texto 5/5, imagen de 2048×2048 en 12.9 s, cero timeouts de anillo. En producción, con la
+misma historia la nueva y la base dan lo mismo (cadena v43: A == B), y recién cargadas también (C == v42pb). Adoptado:
+build en `build/bin`, producción descargada como estaba.
+
+### 35.1 Defecto de determinismo que introdujo el SP1: la salida depende de la historia del servidor (abierto)
+
+Apareció en la compuerta de producción del SP3 y se aisló en las cadenas v43-v51 (producción NP=2, contexto nativo,
+pedidos fijados a un slot con `id_slot`). La misma petición (el decode greedy de 1024 tokens sobre el prompt de 39.5k)
+da respuestas distintas según lo que el servidor procesó antes:
+
+- Con el servidor recién cargado la respuesta es la misma en el slot 0 y en el slot 1, y la misma en los builds de
+  antes del SP1 (cda30216f), con SP1 (1ea4ce5d8), con SP2 y con SP3 (cadena v45, lookup apagado).
+- Tras una imagen de 2048×2048 (4096 tokens) en el otro slot, el decode en el slot 0 diverge entre los caracteres 1100 y
+  2200, con MTP y lookup y también sin ellos (cadena v46; con MTP apagado, en el carácter 1147). Una conversación con
+  una imagen de 448×448 no lo produce, y borrar el slot 1 antes del decode no lo evita. La divergencia se repite byte a
+  byte con la misma historia, y el probe (la distribución de la primera posición) sigue idéntico.
+- El build anterior al SP1 no tiene el defecto (cadena v48); el build con SP1 y sin SP2 sí, con las mismas salidas que
+  el SP3 (cadena v49). SP2 y SP3 no cambian ninguna salida: con la misma historia, base y nueva coinciden (v43).
+
+Hipótesis descartadas: (1) la disposición de memoria que el asignador de un slot reutiliza del grafo anterior cuando la
+topología coincide (`ggml_gallocr_needs_realloc`): con cada grafo de slot planificado para sus propias formas, el
+defecto sigue (v50); (2) restos en los buffers de cómputo del slot: con un scheduler y buffers nuevos para cada grafo de
+slot, el defecto sigue (v51). En ambos casos la salida con el servidor recién cargado no cambió y el probe siguió
+idéntico a `probe-v26`. El canal es otro estado que el SP1 modifica (qué grafos corren en el scheduler principal, qué
+grafos se reutilizan, el orden de las reconstrucciones). Pendiente: comparar nodo a nodo el decode del servidor recién
+cargado con el del que procesó la imagen para localizar el primer nodo que difiere, y corregir la causa. Revertir el SP1
+lo elimina (el build anterior no lo tiene) a un costo de ~1.2 ms por paso; no se revirtió.
+
+Fuentes: `~/dbg/merge/chain_v4{2,3,4,5,6,7,8,9}.{sh,out}`, `chain_v50.out`, `chain_v50b.out`, `chain_v51.out`,
+`sp2/seqrm_equiv.cpp`; `~/dbg/depth/budget-v4{2,3,4,5,6,7,8,9}*.jsonl`, `budget-v5{0,1}*.jsonl`, `srvlog-v4*.log`;
+el parche descartado de la hipótesis 1 en el scratchpad de la sesión (`discard_layout.patch`).
