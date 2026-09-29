@@ -2448,8 +2448,11 @@ defecto sigue (v50); (2) restos en los buffers de cómputo del slot: con un sche
 slot, el defecto sigue (v51). En ambos casos la salida con el servidor recién cargado no cambió y el probe siguió
 idéntico a `probe-v26`. El canal es otro estado que el SP1 modifica (qué grafos corren en el scheduler principal, qué
 grafos se reutilizan, el orden de las reconstrucciones). Pendiente: comparar nodo a nodo el decode del servidor recién
-cargado con el del que procesó la imagen para localizar el primer nodo que difiere, y corregir la causa. Revertir el SP1
-lo elimina (el build anterior no lo tiene) a un costo de ~1.2 ms por paso; no se revirtió.
+cargado con el del que procesó la imagen para localizar el primer nodo que difiere, y corregir la causa. El build
+anterior al SP1 no lo tiene con MTP y lookup apagados (v48; con la configuración de producción no se probó); revertir el
+SP1 costaría ~1.2 ms por paso y no se revirtió. Las cargas de diagnóstico v43-v51 usaron el tamaño de producción (NP=2,
+262144 celdas por slot) bajo la compuerta registrada con huella 66 GiB: debieron correr con contexto reducido (NP=2, ctx
+114688, huella 68) como pide la regla de pruebas.
 
 Fuentes: `~/dbg/merge/chain_v4{2,3,4,5,6,7,8,9}.{sh,out}`, `chain_v50.out`, `chain_v50b.out`, `chain_v51.out`,
 `sp2/seqrm_equiv.cpp`; `~/dbg/depth/budget-v4{2,3,4,5,6,7,8,9}*.jsonl`, `budget-v5{0,1}*.jsonl`, `srvlog-v4*.log`;
