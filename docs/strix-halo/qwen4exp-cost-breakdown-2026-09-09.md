@@ -2525,3 +2525,57 @@ ninguna entrada nueva al grafo y ningún cambio de vecindad junto a las cadenas 
 
 Fuentes: `~/dbg/merge/chain_v5{2,3,4,5}.{sh,out}`, `sp2/conv_tail_test.cpp`; `~/dbg/depth/budget-v5{2,3,4,5}*.jsonl`,
 `srvlog-v55{b,n}.log`.
+
+### 36.3 Fusión 3: los snapshots del GDN escritos directo en el caché (adoptada, 1d7cd0d16)
+
+Perfil serializado del grafo de verificación por forma de nodo (cadena v56, build de diagnóstico con la forma en el
+nombre del perf logger): el camino del estado GDN es el mayor bloque de ops chicas. El CPY de los snapshots cuesta 36 ×
+25.6 µs = 0.92 ms por verificación (9.4 MB por capa: 3 snapshots de 128×128×48 f32) y el gather del estado 36 × 17.1 µs
+= 0.62 ms. Techo medido antes de implementar (cadena v57: la misma binaria con y sin el CPY en el grafo, A B A,
+`LLAMA_INPUT_TIMING`): el `gpu_wait` del ubatch de verificación baja de 39.03 / 39.00 a 37.74 ms (−1.27 ms).
+
+Fusión del backend Vulkan GDN_SNAPSHOTS (GATED_DELTA_NET + VIEW + [VIEW] + CPY): el shader escribe cada snapshot en las
+filas del destino del CPY por un binding nuevo, con los strides de slot y de secuencia del destino, y los scores de la
+atención siguen en la salida del op. Sin fusión, el mismo binding apunta a la salida del op pasados los scores, con la
+disposición de antes. El grafo del modelo no cambia (el de upstream), no agrega entradas y la referencia de CPU sigue
+igual. El optimizador de grafos de Vulkan saca las VIEW a una segunda pasada y la del destino (una vista del caché, sin
+dependencias) sale con las vistas de un set anterior: sin una regla propia los cuatro nodos nunca quedaban contiguos
+(cadena v58, dos corridas con 0 fusiones; v59, impresión de los nodos). La regla mantiene juntos el op, la vista de los
+snapshots y la copia, así que la secuencia fusionada tiene 3 nodos, o 4 si la vista del destino no salió antes.
+
+Pre-compuerta (v58, tercera corrida): 2952 dispatches fusionados (36 por grafo con GDN) y, con la fusión plegada en las
+ops que reemplaza, los conteos coinciden en las 290 sumisiones, incluidos los ubatches de prefill partidos.
+
+Cadena v60, NP=1 a 40k (ctx 57344), base (build de la fusión 1) por `LD_LIBRARY_PATH`:
+
+| Carga | Greedy: ms por paso (t/s) | Producción: ms por paso (t/s) |
+|---|---|---|
+| Base (primera) | 54.14 (41.16) | 53.63 (39.17) |
+| Nueva | 52.09 (42.79) | 51.49 (40.80) |
+| Nueva | 51.98 (42.88) | 51.48 (40.81) |
+| Base (última) | 54.26 (41.08) | 53.74 (39.09) |
+
+**−2.16 ms por paso en greedy y −2.20 con muestreo: 41.12 → 42.84 t/s (+4.2 %) y 39.13 → 40.81 (+4.3 %).** Cargas con
+timing: el `gpu_wait` de la verificación baja de 38.84 a 36.23 ms (−2.6 ms), el paso de 55.34 a 52.99 ms. La ganancia
+supera el techo de v57 y la diferencia no está explicada. El perfil serializado (v58) atribuye −0.94 ms a las copias y
+unos −1.4 ms a las matmuls del grafo de verificación (MUL_MAT_ID iq3_s −0.91, MUL_MAT_VEC iq4_nl −0.32, q8_0 −0.17);
+que sea por 36 × 9.4 MB menos de escritura sucia que desalojar del caché de la GPU es inferencia, sin verificar.
+
+**Producción (NP=2, 262144 celdas por slot, servidores recién cargados): 54.08 / 53.64 → 51.52 / 51.50 ms por paso,
+41.22 → 43.26 t/s en greedy (+4.9 %) y 39.16 → 40.79 con muestreo (+4.2 %).** Rig NP=2: un slot solo 41.2 / 41.0 →
+42.4 / 41.0 t/s, dos slots 43.2-44.3 → 46.5-47.8 t/s agregados, el slot que genera mientras llega un prompt de 15k
+16.64 → 17.68 chunks/s.
+
+Exactitud: respuestas y aceptación del draft idénticas a la base (base contra base, nueva contra nueva, nueva contra
+base, cargas con timing) y también con `GGML_VK_DISABLE_FUSION=1` en las dos (la ruta de escritura sin fusión,
+reescrita); `depth_repro` + `depth_repeat` idénticos; `graph_diff4` 72 de 11937 nodos (evalúa nodo por nodo, así que
+valida la ruta sin fusión); probe idéntico a `probe-v26`, conversación texto → imagen → texto 5/5, imagen de 2048×2048
+en 12.8 s, producción nueva contra base recién cargadas idéntica, cero timeouts de anillo. Con las formas del modelo
+(S_v 128, 16 cabezas q/k, 48 v, 8 slots; decode, dos secuencias y un ubatch de 2048) la salida fusionada, la sin fusión
+y la del build anterior son idénticas byte a byte (`~/dbg/merge/sp4/gdn_snap_test.cpp`); casos GDN_SNAPSHOTS nuevos en
+`test-backend-ops` (kv_head > 0, mem_size > n_seqs, n_tokens menor y mayor que K, dos secuencias, KDA, K = 1) y los 36
+casos GATED_DELTA_NET existentes, 42/42.
+
+Fuentes: `~/dbg/merge/chain_v5{6,7,8,9}.{sh,out}`, `chain_v60.{sh,out}`, `v56_verify_ops.txt`, `verify_wait.py`,
+`opcount_gate.py`, `sp4/gdn_snap_test.cpp`; `~/dbg/depth/srvlog-v5{6d,7a1,7b,7a2,8b,8n,9d}.log`,
+`budget-v60*.jsonl`.

@@ -172,7 +172,7 @@ registra su medición.
 | Orden | SP | Días | Condición | Estado |
 |---|---|---|---|---|
 | 1 | SP1 | 2-3 | — | hecho el 2026-09-28 en un día (e579358ba, sección 30 del documento de costos): −1.17 ms por paso en greedy y −0.90 con muestreo a 40k; NP=2 sin cambio medible; con NP=2 los grafos se reutilizan (sección 31.2) |
-| 2 | SP4 | 4-6 | una fusión por día | en curso (sección 36 del documento de costos): fusión 1 adoptada el 2026-09-29 (abc86e8be), −0.6 ms por paso a 40k (+1.1-1.2 %), salidas idénticas; fusión 2 (colas en un gather) descartada: ganancia dentro del ruido y agrega una entrada al grafo que mueve los cortes de sumisión del prefill profundo |
+| 2 | SP4 | 4-6 | una fusión por día | en curso (sección 36 del documento de costos): fusión 1 adoptada el 2026-09-29 (abc86e8be), −0.6 ms por paso a 40k (+1.1-1.2 %); fusión 2 (colas en un gather) descartada: ganancia dentro del ruido y agrega una entrada al grafo que mueve los cortes de sumisión del prefill profundo; fusión 3 (snapshots del GDN directo al caché, vía 14 lado de escritura) adoptada el 2026-09-29 (1d7cd0d16): −2.2 ms por paso a 40k (+4.2-4.3 %), producción +4.2-4.9 %; salidas idénticas |
 | 3 | SP6 | 3-4 | opcional | pendiente |
 | 4 | SP2 | 2-3 | — | hecho el 2026-09-29 en un día (100f88835, b3e7e2b3f; sección 33 del documento de costos): −0.46 ms por paso a 40k (+0.9 % t/s, bajo su cota de 0.77) y −2.0 a −2.4 ms a 125k (+3.2-3.9 %); salidas idénticas; NP=2 sin cambio medible |
 | 5 | SP5 | 2 de spike + 5-8 | decisión del Director tras el spike | pendiente |
