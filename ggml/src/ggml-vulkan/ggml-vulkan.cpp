@@ -321,6 +321,22 @@ struct vk_command_pool {
     }
 };
 
+// Two command pools a backend context uses in turn. When ggml_vk_graph_cleanup runs, the device has finished every
+// command buffer of the current pool: the next graph records into the other pool, and the retired one is reset during
+// the next fence wait, while the device works, instead of between two graphs with the device idle
+struct vk_command_pool_pair {
+    void init(vk_device& device, vk_queue *q);
+    void destroy(vk::Device& device);
+
+    vk_command_pool & current() { return pools[cur]; }
+
+    vk_command_pool pools[2];
+    uint32_t cur = 0;
+    bool idle_needs_reset = false; // pools[cur ^ 1] holds retired command buffers
+};
+
+static void ggml_vk_command_pool_pair_reset_idle(vk_device& device, vk_command_pool_pair& pp);
+
 static void ggml_vk_print_device_fault_info(const vk_device& device);
 static void ggml_vk_print_device_lost_info(const vk_device& device);
 
@@ -1242,6 +1258,19 @@ void vk_command_pool::destroy(vk::Device& device) {
     device.destroyCommandPool(pool);
     pool = nullptr;
     cmd_buffers.clear();
+}
+
+void vk_command_pool_pair::init(vk_device& device, vk_queue *q) {
+    pools[0].init(device, q);
+    pools[1].init(device, q);
+    cur = 0;
+    idle_needs_reset = false;
+}
+
+void vk_command_pool_pair::destroy(vk::Device& device) {
+    pools[0].destroy(device);
+    pools[1].destroy(device);
+    idle_needs_reset = false;
 }
 
 static void ggml_vk_print_device_fault_info(const vk_device& device) {
@@ -2660,8 +2689,8 @@ struct ggml_backend_vk_context {
     uint32_t descriptor_set_idx {};
     uint32_t pipeline_descriptor_set_requirements {};
 
-    vk_command_pool compute_cmd_pool;
-    vk_command_pool transfer_cmd_pool;
+    vk_command_pool_pair compute_cmd_pools;
+    vk_command_pool_pair transfer_cmd_pools;
 
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
@@ -2958,6 +2987,12 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
 
 // Wait for ctx->fence to be signaled.
 static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+    // the device is busy: reset the command pools a previous graph retired
+    ggml_vk_command_pool_pair_reset_idle(ctx->device, ctx->compute_cmd_pools);
+    if (ctx->device->async_use_transfer_queue) {
+        ggml_vk_command_pool_pair_reset_idle(ctx->device, ctx->transfer_cmd_pools);
+    }
+
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
     if (ctx->almost_ready_fence_pending) {
@@ -3767,6 +3802,26 @@ static void ggml_vk_command_pool_cleanup(vk_device& device, vk_command_pool& p) 
     for (auto& cmd_buffer : p.cmd_buffers) {
         cmd_buffer.in_use = false;
     }
+}
+
+static void ggml_vk_command_pool_pair_reset_idle(vk_device& device, vk_command_pool_pair& pp) {
+    if (pp.idle_needs_reset) {
+        ggml_vk_command_pool_cleanup(device, pp.pools[pp.cur ^ 1]);
+        pp.idle_needs_reset = false;
+    }
+}
+
+// the device has finished the current pool's command buffers: the next graph takes the other pool (reset now if no
+// fence wait has reset it yet) and this one waits for its reset
+static void ggml_vk_command_pool_pair_retire(vk_device& device, vk_command_pool_pair& pp) {
+    if (pp.current().buffers_in_use() == 0) {
+        return;
+    }
+
+    ggml_vk_command_pool_pair_reset_idle(device, pp);
+
+    pp.cur ^= 1;
+    pp.idle_needs_reset = true;
 }
 
 static void ggml_vk_queue_command_pools_cleanup(vk_device& device) {
@@ -8391,7 +8446,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->fence = ctx->device->device.createFence({});
     ctx->almost_ready_fence = ctx->device->device.createFence({});
 
-    ctx->compute_cmd_pool.init(ctx->device, ctx->device->compute_queue.get());
+    ctx->compute_cmd_pools.init(ctx->device, ctx->device->compute_queue.get());
     if (ctx->device->async_use_transfer_queue) {
         vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
         vk::SemaphoreCreateInfo ci{};
@@ -8399,7 +8454,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
         ctx->transfer_semaphore.s = ctx->device->device.createSemaphore(ci);
         ctx->transfer_semaphore.value = 0;
 
-        ctx->transfer_cmd_pool.init(ctx->device, ctx->device->transfer_queue.get());
+        ctx->transfer_cmd_pools.init(ctx->device, ctx->device->transfer_queue.get());
     }
 
     if (vk_perf_logger_enabled) {
@@ -8994,7 +9049,7 @@ static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
     if (!ctx->compute_ctx.expired()) {
         result = ctx->compute_ctx.lock();
     } else {
-        result = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+        result = ggml_vk_create_context(ctx, ctx->compute_cmd_pools.current());
 
         ctx->compute_ctx = result;
         ggml_vk_ctx_begin(ctx->device, result);
@@ -9013,7 +9068,7 @@ static vk_context ggml_vk_get_transfer_ctx(ggml_backend_vk_context * ctx) {
     if (!ctx->transfer_ctx.expired()) {
         result = ctx->transfer_ctx.lock();
     } else {
-        result = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
+        result = ggml_vk_create_context(ctx, ctx->transfer_cmd_pools.current());
 
         ctx->transfer_ctx = result;
         ggml_vk_ctx_begin(ctx->device, result);
@@ -16221,7 +16276,7 @@ static void ggml_vk_test_matmul(ggml_backend_vk_context * ctx, size_t m, size_t 
     ggml_vk_buffer_write(d_X, 0, x, sizeof(X_TYPE) * k * m * batch);
     ggml_vk_buffer_write(d_Y, 0, y, sizeof(Y_TYPE) * k * n * batch);
 
-    vk_context subctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+    vk_context subctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pools.current());
     ggml_vk_ctx_begin(ctx->device, subctx);
     for (size_t i = 0; i < num_it; i++) {
         ggml_vk_matmul(
@@ -16339,7 +16394,7 @@ static void ggml_vk_test_matmul(ggml_backend_vk_context * ctx, size_t m, size_t 
 
     free(d_chk);
 
-    ggml_vk_command_pool_cleanup(ctx->device, ctx->compute_cmd_pool);
+    ggml_vk_command_pool_cleanup(ctx->device, ctx->compute_cmd_pools.current());
 
     ggml_vk_destroy_buffer(d_X);
     ggml_vk_destroy_buffer(d_Y);
@@ -16428,7 +16483,7 @@ static void ggml_vk_test_dequant(ggml_backend_vk_context * ctx, size_t ne, ggml_
 
     ggml_vk_buffer_write(qx_buf, 0, qx, qx_sz);
 
-    vk_context subctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+    vk_context subctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pools.current());
     ggml_vk_ctx_begin(ctx->device, subctx);
     const std::vector<uint32_t> pc = { 1, (uint32_t)ne, (uint32_t)ne, (uint32_t)ne, (uint32_t)ne };
     ggml_vk_dispatch_pipeline(ctx, subctx, p, { vk_subbuffer{ qx_buf, 0, qx_sz }, vk_subbuffer{ x_buf, 0, x_sz_f16 } }, pc, { (uint32_t)ne, 1, 1});
@@ -16525,7 +16580,7 @@ static void ggml_vk_test_dequant(ggml_backend_vk_context * ctx, size_t ne, ggml_
 //
 //     ggml_vk_buffer_write(x_buf, 0, x, x_sz);
 //
-//     vk_context subctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+//     vk_context subctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pools.current());
 //     ggml_vk_ctx_begin(ctx->device, subctx);
 //     ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, x_buf), ggml_vk_subbuffer(ctx, qx_buf), ne);
 //     ggml_vk_ctx_end(subctx);
@@ -16696,7 +16751,7 @@ static void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m,
     ggml_vk_buffer_write(qx_buf, 0, qx, qx_sz);
     ggml_vk_buffer_write(y_buf, 0, y, y_sz);
 
-    vk_context subctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+    vk_context subctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pools.current());
     ggml_vk_ctx_begin(ctx->device, subctx);
     if (mmq) {
         for (size_t i = 0; i < num_it; i++) {
@@ -17608,9 +17663,9 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->unsynced_nodes_read.clear();
     ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
 
-    ggml_vk_command_pool_cleanup(ctx->device, ctx->compute_cmd_pool);
+    ggml_vk_command_pool_pair_retire(ctx->device, ctx->compute_cmd_pools);
     if (ctx->device->async_use_transfer_queue) {
-        ggml_vk_command_pool_cleanup(ctx->device, ctx->transfer_cmd_pool);
+        ggml_vk_command_pool_pair_retire(ctx->device, ctx->transfer_cmd_pools);
     }
 
     for (size_t i = 0; i < ctx->gc.semaphores.size(); i++) {
@@ -17674,11 +17729,11 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->descriptor_pools.clear();
     ctx->descriptor_sets.clear();
 
-    ctx->compute_cmd_pool.destroy(ctx->device->device);
+    ctx->compute_cmd_pools.destroy(ctx->device->device);
     if (ctx->device->async_use_transfer_queue) {
         ctx->device->device.destroySemaphore(ctx->transfer_semaphore.s);
 
-        ctx->transfer_cmd_pool.destroy(ctx->device->device);
+        ctx->transfer_cmd_pools.destroy(ctx->device->device);
     }
     if (vk_perf_logger_enabled) {
         ctx->perf_logger->print_timings(true);
@@ -18164,7 +18219,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
 
     bool do_transfer = !ctx->compute_ctx.expired();
-    vk_trace("synchronize ctx=%p pool=%p pending=%d compute_ctx=%d almost_ready_pending=%d", (void *) ctx, (void *) &ctx->compute_cmd_pool,
+    vk_trace("synchronize ctx=%p pool=%p pending=%d compute_ctx=%d almost_ready_pending=%d", (void *) ctx, (void *) &ctx->compute_cmd_pools.current(),
              (int) ctx->submit_pending, (int) do_transfer, (int) ctx->almost_ready_fence_pending);
 
     if (ggml_vk_submit_transfer_ctx(ctx)) {
@@ -18988,7 +19043,7 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    vk_trace("graph-compute ctx=%p pool=%p n_nodes=%d pending=%d almost_ready_pending=%d", (void *) ctx, (void *) &ctx->compute_cmd_pool, cgraph->n_nodes,
+    vk_trace("graph-compute ctx=%p pool=%p n_nodes=%d pending=%d almost_ready_pending=%d", (void *) ctx, (void *) &ctx->compute_cmd_pools.current(), cgraph->n_nodes,
              (int) ctx->submit_pending, (int) ctx->almost_ready_fence_pending);
 
     ctx->device->diag_cgraph = nullptr;
