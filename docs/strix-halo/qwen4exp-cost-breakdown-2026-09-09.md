@@ -18,7 +18,7 @@
   590 t/s, y el SP1 lo llevó a 54.2 ms en greedy. Desde el 2026-09-28 el lookup en la ronda MTP (sección 31) acelera
   los turnos que copian o editan texto un 29-45 %. A 125k (sección 32): prefill de 124.9k en 244 s (511 t/s) y
   decode 33.3-34.0 t/s con instrumentación (37.8-39.9 a 40k en la misma ventana); con el SP2, 34.4-35.1 t/s a 125k
-  (+3.8 %) y +0.9 % a 40k. Turno con una
+  (+3.2-3.9 %) y +0.9 % a 40k. Turno con una
   imagen de 448×448 en producción 4.1 s (antes 30.9). Residentes 56.5 GiB; MemAvailable ~35 GiB con producción
   cargada. Determinismo verificado (repeat_probe, graph_diff4, depth_repeat) tras cada cambio.
 - Lista de trabajo vigente: sección 13 (prefill), sección 25 (encoder, imágenes, ejecución paralela, con la
@@ -2288,7 +2288,8 @@ anterior (`~/dbg/merge/sp2/`): a 125k celdas la agrupación QSA costaba 1.03-1.2
 código anterior: 21 layouts × 20 semillas para la agrupación (celdas de imagen en orden de rango, huecos, celdas
 desordenadas, dos secuencias en un stream, una celda usada sin secuencia, ratios 3, 4, 5 y 8, caminos pooled y
 recompute) y 9 × 20 para la máscara. En el arnés: agrupación 1.03 → 0.41 ms a 125k celdas (2.5×) y 0.33 → 0.13 a 40k;
-máscara 5-7× por fila de decode.
+máscara 5-7× por fila de decode. La máscara también se verificó sin causalidad, en F32 y con dos streams (640 casos,
+`sp2/mask_equiv2.cpp`): el cambio vive en la función compartida por todos los modelos.
 
 Cadena v40 (NP=1, MTP n-max 2, lookup y visión cargados; base = build de producción 1ea4ce5d8 por
 `LD_LIBRARY_PATH`, verificada en `/proc/<pid>/maps`). A 40k sin instrumentar, base, nueva, nueva, base:
@@ -2308,8 +2309,9 @@ cargas con `LLAMA_INPUT_TIMING` y `LLAMA_SPEC_TIMING` (el prompt de 124.9k de la
 | Base | 64.47 (33.76) | 63.82 (33.12) |
 | **Nueva** | **62.05 (35.08)** | **61.48 (34.38)** |
 
-**125k: −2.4 ms por paso (−3.7 %), +3.8-3.9 % de t/s**, toda la cota de la sección 32.3 (2.43 ms). Entradas, medianas
-por ubatch en ms:
+**125k: −2.0 a −2.4 ms por paso, +3.2 a +3.9 % de t/s**: contra la base de esta cadena (64.47 / 63.82) y contra la
+de la cadena v39, misma build y configuración (64.11 / 63.47); a 125k no hubo base de cierre. A 40k la ganancia (0.46
+ms) quedó por debajo de su cota (0.77, sección 32.3). Entradas, medianas por ubatch en ms:
 
 | Entrada | 40k base → nueva | 125k base → nueva |
 |---|---|---|
@@ -2318,8 +2320,8 @@ por ubatch en ms:
 | Paso del draft, 1 fila | 0.056 / 0.055 → 0.010 / 0.010 | 0.172 / 0.173 → 0.023 / 0.023 |
 | **Por paso (verificación, hook y dos pasos)** | **1.15 → 0.57** | **2.80 → 1.05** |
 
-A 125k el paso baja más que las entradas (2.4 frente a 1.75 ms): la verificación de pared cae 1.8 ms y sus entradas
-1.29, el draft 0.4 y los huecos 0.2; los ~0.5 ms restantes quedan sin atribuir. Lo que queda de las entradas de la
+A 125k las entradas bajan 1.75 ms y el paso 2.0-2.4: contra la base de esta cadena la verificación de pared cae 1.8
+ms y sus entradas 1.29, el draft 0.4 y los huecos 0.2; el resto queda sin atribuir. Lo que queda de las entradas de la
 verificación a 125k (0.95 ms) es ~0.27 fijo (PLE, índices) y la agrupación.
 
 Exactitud: respuestas de la build nueva idénticas byte a byte a las de la base en greedy y con muestreo a 40k (1024

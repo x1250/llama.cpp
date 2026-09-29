@@ -168,6 +168,6 @@ registra su medición.
 | 1 | SP1 | 2-3 | — | hecho el 2026-09-28 en un día (e579358ba, sección 30 del documento de costos): −1.17 ms por paso en greedy y −0.90 con muestreo a 40k; NP=2 sin cambio medible; con NP=2 los grafos se reutilizan (sección 31.2) |
 | 2 | SP4 | 4-6 | una fusión por día | pendiente |
 | 3 | SP6 | 3-4 | opcional | pendiente |
-| 4 | SP2 | 2-3 | — | hecho el 2026-09-29 en un día (100f88835, b3e7e2b3f; sección 33 del documento de costos): −0.46 ms por paso a 40k (+0.9 % t/s) y −2.4 ms a 125k (+3.8 %), la cota completa de la sección 32; salidas idénticas; NP=2 sin cambio medible |
+| 4 | SP2 | 2-3 | — | hecho el 2026-09-29 en un día (100f88835, b3e7e2b3f; sección 33 del documento de costos): −0.46 ms por paso a 40k (+0.9 % t/s, bajo su cota de 0.77) y −2.0 a −2.4 ms a 125k (+3.2-3.9 %); salidas idénticas; NP=2 sin cambio medible |
 | 5 | SP5 | 2 de spike + 5-8 | decisión del Director tras el spike | pendiente |
 | 6 | SP3 | 2 | — | pendiente |
