@@ -386,6 +386,14 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    // true if every used cell carries seq_id: seq_has(i, seq_id) then holds for every non-empty cell
+    bool seq_in_all_cells(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_pos[seq_id].size() == used.size();
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());

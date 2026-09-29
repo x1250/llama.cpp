@@ -470,10 +470,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(pooled == (dirty_cells != nullptr && dirty_pos != nullptr && dirty_rows != nullptr));
     GGML_ASSERT(pooled || (blk_cells != nullptr && blk_pos != nullptr));
 
-    std::vector<int32_t> loc_blk_cells(pooled ? r*n_blocks : 0);
-
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
-    int32_t * dst_blk_cells = pooled ? loc_blk_cells.data() : (int32_t *) blk_cells->data;
+    int32_t * dst_blk_cells = pooled ? nullptr : (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = pooled ? nullptr : (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
 
@@ -485,11 +483,23 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(r <= 64);
     const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
 
-    // TODO: this runs per ubatch and is O(n_kv) per stream, about 865 us at 33k context. the cost
-    //       is the per-cell scan rather than these allocations, so hoisting them buys nothing
-    std::vector<int32_t>  blk_of(n_kv);
-    std::vector<int32_t>  cell_grp(n_kv);
-    std::vector<int32_t>  grp_head(n_blocks);
+    // this runs per ubatch with the GPU idle and walks every cell, so the block and the slot of an
+    // index take a shift for the power-of-two ratios the models use instead of a division per cell
+    int r_log2 = -1;
+    if ((r & (r - 1)) == 0) {
+        r_log2 = 0;
+        while ((int64_t(1) << r_log2) < r) {
+            r_log2++;
+        }
+    }
+    const auto idx_blk  = [r, r_log2](int64_t idx) { return r_log2 >= 0 ? idx >> r_log2 : idx/r; };
+    const auto idx_slot = [r, r_log2](int64_t idx) { return r_log2 >= 0 ? idx & (r - 1) : idx%r; };
+
+    // the groups of cells that share a block. With one sequence in the stream a block holds one
+    // group, which is then numbered by its block: no chain to walk and nothing to append per block
+    std::vector<int32_t>  blk_of(blk_bias ? 0 : n_kv);
+    std::vector<int32_t>  cell_grp(n_kv, -1);
+    std::vector<int32_t>  grp_head(n_blocks, -1);
     std::vector<int32_t>  grp_next;
     std::vector<int32_t>  grp_first;
     std::vector<int32_t>  grp_slot0;
@@ -498,6 +508,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
     std::vector<int32_t>  bid_idx;
     std::vector<int32_t>  bid_cell;
     std::vector<int32_t>  bid_slot0;
+
+    bid_idx  .reserve(n_blocks);
+    bid_cell .reserve(n_blocks);
+    bid_slot0.reserve(n_blocks);
+
+    // pooled path: the cells of the blocks this ubatch pools, the only ones the tables need
+    std::vector<int32_t> dirty_blk_cells;
 
     std::vector<int32_t> order;
     std::vector<int32_t> rank;
@@ -512,10 +529,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = get_mem_idx()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
-        int32_t * cur_blk_cells = pooled ? dst_blk_cells : dst_blk_cells + s*(r*n_blocks);
+        int32_t * cur_cell_blk  = dst_cell_blk + s*n_kv;
+        int32_t * cur_blk_cells = pooled ? nullptr : dst_blk_cells + s*(r*n_blocks);
 
-        std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
+        if (cur_blk_cells != nullptr) {
+            std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
+        }
 
         bid_idx  .clear();
         bid_cell .clear();
@@ -541,9 +560,69 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         auto group_cells = [&]() {
             // -1 means no usable block: an incomplete or short group cannot be pooled
-            std::fill(blk_of.begin(),   blk_of.end(),   -1);
             std::fill(cell_grp.begin(), cell_grp.end(), -1);
             std::fill(grp_head.begin(), grp_head.end(), -1);
+
+            oor = false;
+            dup = false;
+
+            if (one_seq) {
+                grp_next .assign(n_blocks, -1);
+                grp_first.assign(n_blocks, -1);
+                grp_slot0.assign(n_blocks, -1);
+                grp_slots.assign(n_blocks,  0);
+                grp_bid  .assign(n_blocks, -1);
+
+                // consecutive cells mostly share a block: its slots stay in a register until the block changes
+                int64_t  cur_pb    = -1;
+                uint64_t cur_slots = 0;
+
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    if (cells.is_empty(j)) {
+                        continue;
+                    }
+
+                    const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+                    const int64_t pb  = idx_blk(idx);
+
+                    if (pb >= n_blocks) {
+                        oor = true;
+                        continue;
+                    }
+
+                    if (pb != cur_pb) {
+                        if (cur_pb >= 0) {
+                            grp_slots[cur_pb] = cur_slots;
+                        }
+
+                        cur_pb    = pb;
+                        cur_slots = grp_slots[pb];
+
+                        if (grp_first[pb] < 0) {
+                            grp_first[pb] = (int32_t) j;
+                            grp_head [pb] = (int32_t) pb;
+                        }
+                    }
+
+                    const int64_t  slot = idx_slot(idx);
+                    const uint64_t bit  = uint64_t(1) << slot;
+
+                    dup |= (cur_slots & bit) != 0;
+
+                    cell_grp[j] = (int32_t) pb;
+                    cur_slots  |= bit;
+
+                    if (slot == 0) {
+                        grp_slot0[pb] = (int32_t) j;
+                    }
+                }
+
+                if (cur_pb >= 0) {
+                    grp_slots[cur_pb] = cur_slots;
+                }
+
+                return;
+            }
 
             grp_next .clear();
             grp_first.clear();
@@ -551,16 +630,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
             grp_slots.clear();
             grp_bid  .clear();
 
-            oor = false;
-            dup = false;
-
             for (int64_t j = 0; j < n_kv; ++j) {
                 if (cells.is_empty(j)) {
                     continue;
                 }
 
                 const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
-                const int64_t pb  = idx/r;
+                const int64_t pb  = idx_blk(idx);
 
                 if (pb >= n_blocks) {
                     oor = true;
@@ -570,7 +646,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 int32_t g = -1;
 
                 for (int32_t c = grp_head[pb]; c >= 0; c = grp_next[c]) {
-                    if (one_seq || cells.seq_get_all((uint32_t) grp_first[c]) == cells.seq_get_all((uint32_t) j)) {
+                    if (cells.seq_get_all((uint32_t) grp_first[c]) == cells.seq_get_all((uint32_t) j)) {
                         g = c;
                         break;
                     }
@@ -588,14 +664,15 @@ void llama_memory_hybrid_idx::set_input_qsa(
                     grp_head[pb] = g;
                 }
 
-                const uint64_t bit = uint64_t(1) << (idx%r);
+                const int64_t  slot = idx_slot(idx);
+                const uint64_t bit  = uint64_t(1) << slot;
 
                 dup |= (grp_slots[g] & bit) != 0;
 
                 cell_grp[j]   = g;
                 grp_slots[g] |= bit;
 
-                if (idx%r == 0) {
+                if (slot == 0) {
                     grp_slot0[g] = (int32_t) j;
                 }
             }
@@ -719,34 +796,54 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         }
 
+        // pooled path: the blocks from the watermark on are the ones this ubatch pools. The stream holds one
+        // sequence, so a block holds one group and the bids follow the block order: they are the bids from
+        // the first block at or past the watermark to the last
+        int64_t * w = pooled ? &pooled_valid(ratio, seq_of_stream) : nullptr;
+
+        const int32_t bid_dirty0 = !pooled ? n_bid : (int32_t) (std::lower_bound(bid_idx.begin(), bid_idx.end(), *w*r) - bid_idx.begin());
+
+        if (pooled) {
+            // rows are keyed per sequence, so a stream must hold exactly one; the graph checked it
+            GGML_ASSERT(one_seq);
+
+            dirty_blk_cells.assign((size_t) (n_bid - bid_dirty0)*r, 0);
+        }
+
         // unpooled cells all point at one spare block. a spare block exists only when some
         // cell is unpooled: n_bid == n_blocks means every cell sits in a full block.
         const bool     have_dead = n_bid < n_blocks;
         const int32_t  dead_bid  = have_dead ? n_bid : n_blocks - 1;
 
         for (int64_t j = 0; j < n_kv; ++j) {
-            const int32_t g = cell_grp[j];
+            const int32_t g   = cell_grp[j];
+            const int32_t blk = g < 0 ? -1 : grp_bid[g];
 
-            blk_of[j] = g < 0 ? -1 : grp_bid[g];
-
-            if (blk_of[j] >= 0) {
-                const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
-
-                cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
+            if (!blk_bias) {
+                blk_of[j] = blk;
             }
 
-            cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            if (blk >= 0) {
+                const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+
+                if (cur_blk_cells != nullptr) {
+                    cur_blk_cells[blk*r + idx_slot(idx)] = (int32_t) j;
+                } else if (blk >= bid_dirty0) {
+                    dirty_blk_cells[(blk - bid_dirty0)*r + idx_slot(idx)] = (int32_t) j;
+                }
+            }
+
+            cur_cell_blk[j] = blk < 0 ? dead_bid : blk;
         }
 
         if (pooled) {
-            // rows are keyed per sequence, so a stream must hold exactly one; the graph checked it
-            GGML_ASSERT(one_seq);
-
             // scoring reads one cache row per complete block; the rest read the dustbin
             int32_t * cur_blk_rows = (int32_t *) blk_rows->data + s*n_blocks;
 
+            const int64_t row0 = pooled_row(ratio, seq_of_stream, 0);
+
             for (int64_t b = 0; b < n_blocks; ++b) {
-                cur_blk_rows[b] = (int32_t) (b < n_bid ? pooled_row(ratio, seq_of_stream, bid_idx[b]/r) : dustbin);
+                cur_blk_rows[b] = (int32_t) (b < n_bid ? row0 + idx_blk(bid_idx[b]) : dustbin);
             }
 
             // the blocks completed since the watermark are pooled by this ubatch: cells, positions and rows.
@@ -755,34 +852,29 @@ void llama_memory_hybrid_idx::set_input_qsa(
             int32_t * cur_d_pos   = (int32_t *) dirty_pos->data;
             int64_t * cur_d_rows  = (int64_t *) dirty_rows->data + s*n_dirty_max;
 
-            int64_t & w = pooled_valid(ratio, seq_of_stream);
-
             pooled_ranked[seq_of_stream] = ranked;
 
             int64_t n_dirty = 0;
 
-            for (int32_t b = 0; b < n_bid; ++b) {
-                const int64_t pb = bid_idx[b]/r;
-                if (pb < w) {
-                    continue;
-                }
+            for (int32_t b = bid_dirty0; b < n_bid; ++b) {
+                const int64_t pb = idx_blk(bid_idx[b]);
 
                 GGML_ASSERT(n_dirty < n_dirty_max && "dirty tables sized at graph build, see qsa_pooled_n_dirty_max");
 
                 int32_t sec_pos[4];
                 block_sec_pos(b, sec_pos);
 
-                cur_d_rows[n_dirty] = pooled_row(ratio, seq_of_stream, pb);
+                cur_d_rows[n_dirty] = row0 + pb;
 
                 for (int64_t j = 0; j < r; ++j) {
-                    cur_d_cells[n_dirty*r + j] = cur_blk_cells[b*r + j];
+                    cur_d_cells[n_dirty*r + j] = dirty_blk_cells[(b - bid_dirty0)*r + j];
                 }
 
                 for (int64_t sec = 0; sec < 4; ++sec) {
                     cur_d_pos[sec*(n_dirty_max*n_ns) + s*n_dirty_max + n_dirty] = sec_pos[sec];
                 }
 
-                w = pb + 1;
+                *w = pb + 1;
                 n_dirty++;
             }
 
@@ -837,14 +929,24 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 // the caller adds the attention mask, which drops empty, foreign and future cells
                 float * cur_blk_bias = dst_bias + i*n_blocks;
 
-                for (int64_t b = 0; b < n_blocks; ++b) {
-                    if (b >= n_bid || !cells.seq_has((uint32_t) bid_cell[b], seq_id)) {
-                        cur_blk_bias[b] = -INFINITY;
-                        continue;
-                    }
+                if (cells.seq_in_all_cells(seq_id)) {
+                    // every complete block belongs to the query's sequence, and the bids follow the index
+                    // order: the blocks below the tail, the blocks in it, then the ones without a group
+                    const int64_t b_tail = std::lower_bound(bid_idx.begin(), bid_idx.end(), tail_start) - bid_idx.begin();
 
-                    // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+                    std::fill(cur_blk_bias,          cur_blk_bias + b_tail,   0.0f);
+                    std::fill(cur_blk_bias + b_tail, cur_blk_bias + n_bid,    1e9f);
+                    std::fill(cur_blk_bias + n_bid,  cur_blk_bias + n_blocks, -INFINITY);
+                } else {
+                    for (int64_t b = 0; b < n_blocks; ++b) {
+                        if (b >= n_bid || !cells.seq_has((uint32_t) bid_cell[b], seq_id)) {
+                            cur_blk_bias[b] = -INFINITY;
+                            continue;
+                        }
+
+                        // finite, so it can never meet a -inf and produce a nan
+                        cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+                    }
                 }
 
                 // the spare block holds the unpooled cells, which are the incomplete tail, so
