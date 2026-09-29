@@ -2218,9 +2218,9 @@ Medianas por ubatch, en ms:
 
 Con una recta por los dos puntos, las entradas del target tienen ~0.27 ms fijos y el resto crece con las celdas: 0.61
 ms a 40k y 1.93 a 125k. Las del draft son casi todas proporcionales: 0.16 ms por paso a 40k y 0.50 a 125k. En total, la
-parte que crece con la profundidad es **0.77 ms por paso a 40k (1.4 %) y 2.43 ms a 125k (3.8 %)**. La máscara del
-draft ya no pesa lo que medía la sección 28.8 (0.51 ms por paso con el paquete a 85 W y los grafos reconstruidos):
-hoy es 0.19 ms a 40k.
+parte que crece con la profundidad es **0.77 ms por paso a 40k (1.4 %) y 2.43 ms a 125k (3.8 %)**. Las entradas
+de los tres grafos del draft (su máscara KQ y el embedding del target) suman 0.19 ms por paso a 40k; la sección 28.8
+midió 0.51 ms para la máscara sola con `perf`, a 85 W (método distinto, diferencia no atribuida).
 
 Qué contiene cada una: la verificación llena la agrupación QSA (`set_input_qsa`, `src/llama-memory-hybrid-idx.cpp:442`:
 cada celda a su bloque, sobre n_kv), la memoria híbrida (índices de K y V, máscara KQ de 3 filas × n_kv y copias del
