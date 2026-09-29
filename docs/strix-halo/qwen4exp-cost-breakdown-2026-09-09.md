@@ -2457,3 +2457,71 @@ SP1 costaría ~1.2 ms por paso y no se revirtió. Las cargas de diagnóstico v43
 Fuentes: `~/dbg/merge/chain_v4{2,3,4,5,6,7,8,9}.{sh,out}`, `chain_v50.out`, `chain_v50b.out`, `chain_v51.out`,
 `sp2/seqrm_equiv.cpp`; `~/dbg/depth/budget-v4{2,3,4,5,6,7,8,9}*.jsonl`, `budget-v5{0,1}*.jsonl`, `srvlog-v4*.log`;
 el parche descartado de la hipótesis 1 en el scratchpad de la sesión (`discard_layout.patch`).
+
+## 36. SP4 del plan de decode: fusiones en la verificación (2026-09-29, cadenas v52-v55)
+
+Una fusión por commit y por medición, con la exactitud del protocolo común: respuestas idénticas a la base.
+
+### 36.1 Fusión 1: las colas del conv state sin CONT (adoptada, abc86e8be)
+
+`build_conv_state_at` escribía la cola de cada slot de rollback con un CONT (la vista con stride hecha contigua) y un
+CPY al caché. El CPY lee la vista con stride directamente: con el lookup en la ronda MTP el target guarda 8 slots, así
+que son 36 capas × 8 = 288 dispatches menos por verificación.
+
+Cadena v52, NP=1 a 40k (ctx 57344), base (build del SP3) por `LD_LIBRARY_PATH`:
+
+| Carga | Greedy: ms por paso (t/s) | Producción: ms por paso (t/s) |
+|---|---|---|
+| Base (primera) | 53.91 (41.34) | 53.44 (39.31) |
+| Nueva | 53.23 (41.87) | 52.89 (39.71) |
+| Nueva | 53.28 (41.83) | 52.89 (39.71) |
+| Base (última) | 53.92 (41.34) | 53.49 (39.27) |
+
+**−0.66 ms por paso en greedy y −0.58 con muestreo: 41.34 → 41.85 t/s (+1.2 %) y 39.29 → 39.71 (+1.1 %)**, ~2.2 µs
+por dispatch quitado. El mismo build midió 53.94 / 53.56 en la cadena v53, 30 minutos después: entre cadenas el paso se
+mueve ~0.7 ms, del orden del efecto, y solo vale la comparación dentro de una cadena con la base primero y última.
+
+Exactitud: respuestas idénticas (base contra base, nueva contra nueva, nueva contra base, también en las cargas con
+timing); `depth_repro` + `depth_repeat` idénticos; `graph_diff4` 72 de 11937 nodos; probe idéntico a `probe-v26`,
+conversación texto → imagen → texto 5/5, imagen de 2048×2048 en 12.8 s, cero timeouts de anillo. En producción (NP=2,
+servidores recién cargados) la nueva y la base dan la misma respuesta. El tiempo de producción no quedó medido: la
+carga base dio 80.25 / 82.09 ms por paso en sus dos turnos (reloj medio de 1226 MHz en el segundo), un valor atípico sin
+explicar, mientras el rig NP=2 sobre ese mismo servidor salió normal; la nueva dio 54.30 / 53.91. Rig NP=2, base →
+nueva: un slot solo 40.3 / 39.4 → 41.0 / 39.3 t/s, dos slots 45.3-46.0 → 45.4-45.9 t/s agregados, el slot que genera
+mientras llega un prompt de 15k 16.41 → 16.64 chunks/s: sin cambio medible.
+
+### 36.2 Fusión 2: las colas de los 8 slots en un gather y una copia (descartada)
+
+Las 8 colas de una capa salen de un GET_ROWS sobre `x` (o sobre la historia concatenada con `x` cuando el ubatch tiene
+menos de 10 tokens) con una tabla de índices por forma de ubatch, y un CPY permutado las escribe en los 8 slots: 36
+GET_ROWS y 36 CPY en lugar de 288 CPY por verificación. La operación es exacta: idéntica byte a byte a las copias por
+slot en CPU y en Vulkan, con decode y con prefill, 1 y 2 secuencias (`~/dbg/merge/sp2/conv_tail_test.cpp`).
+
+En el modelo las respuestas difieren de la base (cadena v53: aceptación 563/925 contra 564/917). Con
+`GGML_VK_DISABLE_FUSION=1` base y nueva dan lo mismo; con el optimizador de grafos apagado siguen distintas (v54). El
+perfil de Vulkan por sumisión (v55, 128 tokens) localiza la diferencia:
+
+- En el grafo de verificación solo cambian los conteos de las ops tocadas (CPY 336 → 84, GET_ROWS 145 → 181); las
+  fusiones del backend son las mismas.
+- Los ubatches de prefill de más de 32k de profundidad corren en tres sumisiones, y los cortes se mueven: 1157 / 1628 /
+  582 nodos → 1070 / 1564 / 580, MULTI_ADD 32 / 48 / 17 → 30 / 47 / 18. Dos cadenas de sumas quedan partidas en un
+  corte, cambia el orden de la suma, el caché del prefill difiere en redondeo y el decode diverge desde ahí.
+
+Mecanismo (inferido, no confirmado con la impresión de splits del scheduler): la tabla de índices es la única entrada
+nueva del grafo y vive en la CPU; el scheduler abre un split cuando las entradas del split llegan a su capacidad (30,
+`GGML_SCHED_MAX_SPLIT_INPUTS`, `ggml/src/ggml-backend.cpp:1341`), así que una entrada más adelanta los cortes, y una
+fusión del backend no cruza sumisiones.
+
+Ganancia dentro del ruido: pares de una carga en v53 (0.00 / −0.11 ms por paso) y en v54 con perillas de entorno
+(fusiones apagadas −0.84 / −0.25, optimizador apagado +0.04 / +0.29); en el perfil serializado la verificación baja
+0.25 ms (CPY −421 µs, GET_ROWS +190 µs), porque el CPY permutado y los gathers cuestan casi lo que las 288 copias
+chicas. Descartada: pagar una tabla construida en el grafo, o pedir que se acepte un cambio numérico, no se justifica sin
+ganancia. El parche quedó en el scratchpad de la sesión (`sp4_fusion2_conv_tails_gather.patch`).
+
+Pre-compuerta para las fusiones restantes del SP4: dos cargas cortas con `GGML_VK_PERF_LOGGER=1` (base y nueva, 128
+tokens a 40k) y el diff de los conteos de ops por tipo de grafo, incluidos los ubatches de prefill partidos; toda op
+fuera de las que la fusión toca debe coincidir antes de gastar la medición A B B A. Reglas de diseño que salen de aquí:
+ninguna entrada nueva al grafo y ningún cambio de vecindad junto a las cadenas MULTI_ADD y RMS_NORM_MUL.
+
+Fuentes: `~/dbg/merge/chain_v5{2,3,4,5}.{sh,out}`, `sp2/conv_tail_test.cpp`; `~/dbg/depth/budget-v5{2,3,4,5}*.jsonl`,
+`srvlog-v55{b,n}.log`.
