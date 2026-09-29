@@ -523,8 +523,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
         /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        /* .cur     = */ {},
+        /* .cur_p   = */ {},
         /* .speculative_seed = */ gsmpl->speculative_seed,
         /* .speculative_rng  = */ gsmpl->speculative_rng,
     };
@@ -544,9 +544,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
 
     dst->params     = src->params;
     dst->prev       = src->prev;
-    dst->cur        = src->cur;
-    dst->cur_p      = src->cur_p;
-    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->cur_p      = {}; // the next sample fills dst's own candidate buffer
     dst->speculative_seed = src->speculative_seed;
     dst->speculative_rng  = src->speculative_rng;
     dst->t_total_us = src->t_total_us;

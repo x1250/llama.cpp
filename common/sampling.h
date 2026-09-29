@@ -47,6 +47,8 @@ void common_sampler_free(struct common_sampler * gsmpl);
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
 void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
+// clone and copy carry the sampling state (samplers, grammar, reasoning budget, history, rng), not the candidates of
+// the last sample: every sample fills them anew, and at the vocabulary's size they are a large copy
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
 
