@@ -384,7 +384,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         const int64_t hc_lr = w_down_inject->ne[1] - hc;
         ggml_tensor * di = build_lora_mm(w_down_inject, xn);
         cb(di, "hc_down_inject", il);
-        lo      = ggml_cont(ctx0, ggml_view_2d(ctx0, di, hc_lr, nt, di->nb[1], 0));
+        // the scale below reads these padded rows in place: no copy
+        lo      = ggml_view_2d(ctx0, di, hc_lr, nt, di->nb[1], 0);
         *inject = ggml_view_2d(ctx0, di, hc, nt, di->nb[1], hc_lr * ggml_element_size(di));
         cb(*inject, "hc_inject", il);
     } else {

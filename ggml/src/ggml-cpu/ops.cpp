@@ -4700,8 +4700,9 @@ static void ggml_compute_forward_scale_f32(
 
     const ggml_tensor * src0 = dst->src[0];
 
-    GGML_ASSERT(ggml_is_contiguous(src0));
-    GGML_ASSERT(ggml_is_contiguous(dst));
+    // the rows may be padded (ggml_scale takes a padded 1d tensor): contiguous rows, one row stride
+    GGML_ASSERT(src0->nb[0] == sizeof(float) && src0->nb[2] == src0->nb[1]*src0->ne[1] && src0->nb[3] == src0->nb[2]*src0->ne[2]);
+    GGML_ASSERT(dst->nb[0]  == sizeof(float) && dst->nb[2]  == dst->nb[1]*dst->ne[1]    && dst->nb[3]  == dst->nb[2]*dst->ne[2]);
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
 
     float s; // scale factor
@@ -4740,7 +4741,7 @@ static void ggml_compute_forward_scale_f32(
         for (int i1 = ir0; i1 < ir1; i1++) {
             ggml_vec_mad1_f32(nc,
                 (float *) ((char *) dst->data  + i1*nb1),
-                (float *) ((char *) src0->data + i1*nb1),
+                (float *) ((char *) src0->data + i1*nb01),
                 s, b);
         }
     }

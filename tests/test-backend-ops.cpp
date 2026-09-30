@@ -3449,21 +3449,31 @@ struct test_scale : public test_case {
     float scale;
     float bias;
     bool inplace;
+    int64_t row_pad; // > 0: the source is a view of rows padded by row_pad elements
 
     std::string vars() override {
-        return VARS_TO_STR5(type, ne, scale, bias, inplace);
+        return VARS_TO_STR6(type, ne, scale, bias, inplace, row_pad);
     }
 
     test_scale(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {10, 10, 10, 10},
             float scale = 2.0f,
             float bias = 0.0f,
-            bool inplace = false)
-        : type(type), ne(ne), scale(scale), bias(bias), inplace(inplace) {}
+            bool inplace = false,
+            int64_t row_pad = 0)
+        : type(type), ne(ne), scale(scale), bias(bias), inplace(inplace), row_pad(row_pad) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_set_param(a);
+        ggml_tensor * a = nullptr;
+        if (row_pad > 0) {
+            // a padded 1d view, as ggml_scale allows: the leading ne[0] elements of wider rows
+            ggml_tensor * wide = ggml_new_tensor_4d(ctx, type, ne[0] + row_pad, ne[1], ne[2], ne[3]);
+            ggml_set_name(wide, "wide");
+            a = ggml_view_4d(ctx, wide, ne[0], ne[1], ne[2], ne[3], wide->nb[1], wide->nb[1]*ne[1], wide->nb[1]*ne[1]*ne[2], 0);
+        } else {
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_param(a);
+        }
         ggml_set_name(a, "a");
 
         ggml_tensor * out;
@@ -9850,6 +9860,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f));
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {100, 10, 10, 10}, 2.0f, 1.0f));
+    // padded rows, as the qwen4exp hc mixer's view of its joined down/inject matmul
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {320, 3, 1, 1}, 0.25f, 0.0f, false, 4));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, false, 3));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {100, 7, 3, 2}, 0.5f, 0.0f, false, 28));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
 
