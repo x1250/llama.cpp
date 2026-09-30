@@ -46,7 +46,10 @@ sección 5 de este plan.
   Producción es NP=2: los grafos del draft y las entradas QSA cambian de forma con dos slots.
 - Exactitud: respuestas idénticas a la base en greedy y en muestreo, misma aceptación del draft, probe idéntico a la
   referencia vigente, `graph_diff4` con los 72 nodos conocidos, `depth_repeat` a 40k, conversación texto → imagen →
-  texto, cero timeouts de anillo; `img_big.py` 2048×2048 solo si se toca el camino de visión.
+  texto, cero timeouts de anillo; `img_big.py` 2048×2048 solo si se toca el camino de visión. Compuerta de historia
+  (desde el 2026-09-30, sección 35.2 del documento de costos): a contexto reducido, el decode de 40k en el slot 0 con
+  log-probs da lo mismo en un servidor recién cargado que en uno que procesó antes la imagen de 2048×2048 en el slot 1,
+  con MTP y lookup apagados y con los de producción (`~/dbg/merge/history_gate.inc.sh`).
 - Producción recargada separada de la cadena (`setsid -f bash -c "./strix load qwen38flash"`, luego `/health`).
 - Un commit por cambio adoptado; una subsección del documento de costos por ventana; push a los dos repos al adoptar.
 
