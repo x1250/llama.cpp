@@ -2689,10 +2689,11 @@ vale poco (≈6 dispatches por capa en ubatches de ~4 s).
 
 **Cierre del SP4.** Adoptadas la fusión 1 (colas del conv state sin CONT, abc86e8be) y la fusión 3 (snapshots del GDN
 directo al caché, 1d7cd0d16); descartadas la fusión 2 (colas en un gather), la vía 14 del lado de lectura, la norma L2
-del GDN y el CONT de los mezcladores hc. NP=1 a 40k, desde el build del SP3: 53.91 → ~51.5 ms por paso, **41.34 →
-43.2 t/s en greedy (+4.5 %) y 39.29 → 41.2 con muestreo (+4.9 %)**; en producción NP=2 43.3 / 41.2 t/s. La meta
-del SP4 (44.2-44.5 t/s) no se alcanzó: las candidatas restantes no tenían techo o chocaban con la fragilidad de la
-disposición.
+del GDN y el CONT de los mezcladores hc. NP=1 a 40k, sumando lo medido dentro de cada cadena (entre cadenas el paso
+deriva ~0.7 ms, sección 36.1): **−0.66 (v52) − 2.16 (v60) ≈ −2.8 ms por paso**, desde ~41.3 a ~43.2 t/s en greedy y de
+~39.3 a ~41.2 con muestreo (niveles aproximados, de cadenas distintas); en producción NP=2, 43.4 / 41.2 t/s (v71). La
+meta del SP4 (44.2-44.5 t/s) no se alcanzó: las candidatas restantes no tenían techo o chocaban con la fragilidad de
+la disposición.
 
 Fuentes: `~/dbg/merge/chain_v7{6,7,8}.{sh,out}`, `opcount_gate.py` (ahora admite ops quitadas),
 `~/dbg/depth/srvlog-v78{b,n}.log`.
