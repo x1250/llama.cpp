@@ -2825,7 +2825,7 @@ a 0.0028; top-1 igual ~96 % frente a 98.5 %): el decode propaga el redondeo por 
 de los 4096 tokens. Re-medidos en ese modo, los dos cambios pasan: fc788ac4b (cadena v79q) KL 0.0016, top-1 99.59 %;
 el workgroup de 37.7 (cadena v82q) KL 0.0230 contra 0.0207 de referencia, top-1 96.21 % contra 96.04 %.
 
-### 37.7 El workgroup de 4 subgrupos: adoptado (cadenas v82 y v83, 9c63b0eda)
+### 37.7 El workgroup de 4 subgrupos: adoptado y revertido por neutro (cadenas v82-v84; 9c63b0eda, 2bfe97d00)
 
 En RDNA3, los mat-vec con m ≤ 1024 y k ≥ 8192 usan los pipelines de 4 subgrupos que ya existían (upstream solo los
 elige en NVIDIA e Intel). En qwen4exp afecta a los mezcladores hc 324×10240 y 320×10240 y a la inyección 4×10240.
@@ -2862,13 +2862,18 @@ de libertad):
 
 Sin ganancia medible por paso: con muestreo, cualquier efecto queda por debajo de 0.2 ms (0.4 %) en uno u otro
 sentido. Los t/s brutos de la cadena (+0.36 con muestreo, +0.60 en greedy) vienen del texto: el redondeo nuevo toma
-otro camino y su aceptación del draft salió algo mejor (269/484 contra 267/487); no se atribuyen al cambio. Queda
-adoptado como neutro: el kernel es más rápido aislado, pasó todas las compuertas y no pierde.
+otro camino y su aceptación del draft salió algo mejor (269/484 contra 267/487); no se atribuyen al cambio.
+
+Revertido por decisión del Director (2bfe97d00): una regla neutra en una heurística que upstream retoca seguido solo
+suma trabajo de merge. La librería Vulkan volvió a ser idéntica byte a byte a la del build adoptado con fc788ac4b
+(bin-v79new), así que no hubo compuertas nuevas; los casos de test-backend-ops de los mezcladores (324×10240 con 1 y
+3 tokens en ocho tipos, 320 y 4 filas con 3) se quedan y pasan por el camino por defecto.
 
 ### 37.8 Cierre del SP6
 
 El plan estimaba −1.5 a −3 ms por paso con los mezcladores a 210 GB/s y los expertos gate/up a DRAM. Lo medido:
-nada de punta a punta (37.7, cadena v84: −0.03 ms por paso, 95 % [−0.19, +0.14]). Los mezcladores no llegan a la tasa de DRAM por la forma (un nodo de 1.9 MB con 81 workgroups
+nada de punta a punta (37.7, cadena v84: −0.03 ms por paso, 95 % [−0.19, +0.14]); el único cambio adoptado se
+revirtió y el SP6 cierra sin cambios de código en producción. Los mezcladores no llegan a la tasa de DRAM por la forma (un nodo de 1.9 MB con 81 workgroups
 tiene poco que repartir: el workgroup grande lo lleva de ~108 a ~116 GB/s), y los expertos no tienen palanca de
 kernel: su costo por par es el trabajo por columna, no la lectura de los pesos (37.5). Lo que queda en la
 verificación son ~9.9 ms de gate/up y ~5.5 de down en el mat-vec-id, que solo bajarían con otro diseño de kernel (B
