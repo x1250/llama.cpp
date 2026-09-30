@@ -248,12 +248,13 @@ void init_sparse()
         // tile is tile0 + x, its compact rows, padded to Bc with zero K/V and -inf mask, at x * compact_cap.
         // With it (a small batch: the workgroup's rows are the gqa_ratio heads of one token) the
         // workgroup's token is tile0 * Br + x and the tile is the token's
+        // with split_k, k_num consecutive workgroups take consecutive parts of the same list
         if (p.gqa_ratio > 1) {
-            gqa_iq1      = p.tile0 * Br + gl_WorkGroupID.x;
+            gqa_iq1      = p.tile0 * Br + gl_WorkGroupID.x / p.k_num;
             i            = 0;
             compact_tile = gqa_iq1 / Br;
         } else {
-            i            = p.tile0 + gl_WorkGroupID.x;
+            i            = p.tile0 + gl_WorkGroupID.x / p.k_num;
             compact_tile = i;
         }
         iq3 = p.batch0;

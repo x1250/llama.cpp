@@ -12071,14 +12071,24 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const bool     chunked     = use_sparse && !use_kv_idx && n_lists < 32;
     const uint32_t n_chunks    = chunked ? CEIL_DIV(nem0, FA_SPARSE_IDX_CHUNK) : 0;
     const uint64_t sparse_size = use_sparse ? sizeof(uint32_t) * ((uint64_t) n_lists + (uint64_t) n_lists * list_stride + (uint64_t) n_lists * n_chunks) : 0;
-    const uint32_t KV_split    = use_sparse ? list_stride : KV;
+    // compact mode: the rows a tile's region holds, its mask rows times the finite entries per row, at most the list
+    const uint32_t compact_cap = use_compact ? ROUNDUP_POW2(std::min<uint32_t>(list_stride, std::min<uint32_t>(Br, (uint32_t) nem1) * (uint32_t) n_kv_max), Bc) : 0;
+    const uint32_t KV_split    = use_compact ? compact_cap : use_sparse ? list_stride : KV;
     if (use_sparse) {
-        split_kv = list_stride;
+        split_kv = KV_split;
     }
 
     // Try to use split_k when KV is large enough to be worth the overhead.
+    // GGML_VK_DISABLE_SPARSE_FA_COMPACT_SPLIT=1 keeps one workgroup per compact list
+    static const bool disable_sparse_fa_compact_split = getenv("GGML_VK_DISABLE_SPARSE_FA_COMPACT_SPLIT") != nullptr;
     if (use_compact) {
-        // the compact tiles run as groups of whole tiles
+        // a small batch has one workgroup per token and KV head (per tile without grouped query
+        // attention): 6 for a 3-token verification of 2 KV heads. Each compact list is split until the
+        // workgroups fill the shader cores; the reduction adds the parts in split order
+        const uint32_t compact_wgs = (gqa_ratio > 1 ? nem1 : list_tiles) * workgroups_y * (uint32_t) neq3;
+        if (!disable_sparse_fa_compact_split && compact_wgs < shader_core_count * 2) {
+            split_k = shader_core_count * 2 / compact_wgs;
+        }
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
@@ -12179,7 +12189,6 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // [tiles][nek2][C][HSK] f16, [tiles][nev2][C][HSV] f16, [tiles][Br][C] f16 with C = compact_cap,
     // the rows a tile can hold: its mask rows times the finite entries per row, at most the list;
     // the groups of one node are gathered and attended in turn
-    const uint32_t compact_cap     = use_compact ? ROUNDUP_POW2(std::min<uint32_t>(list_stride, std::min<uint32_t>(Br, (uint32_t) nem1) * (uint32_t) n_kv_max), Bc) : 0;
     const uint64_t compact_k_tile  = (uint64_t) nek2 * compact_cap * HSK * sizeof(ggml_fp16_t);
     const uint64_t compact_v_tile  = (uint64_t) nev2 * compact_cap * HSV * sizeof(ggml_fp16_t);
     const uint64_t compact_m_tile  = (uint64_t) Br * compact_cap * sizeof(ggml_fp16_t);
@@ -12339,7 +12348,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const vk_flash_attn_sparse_push_constants pc_sparse = { pc, list_stride, list_tiles, list_rows, compact_cap, 0, 0 };
 
     if (use_compact) {
-        GGML_ASSERT(split_k == 1);
+        vk_subbuffer out_buf = dst_buf;
+        if (split_k > 1) {
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
+            if (ctx->prealloc_split_k_need_sync) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+            out_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+        }
         const uint32_t rk3 = (uint32_t) (neq3 / nek3);
         const uint32_t rv3 = (uint32_t) (neq3 / nev3);
         const uint32_t k_unit = k->type == GGML_TYPE_F16 ? 4 * sizeof(ggml_fp16_t) : (uint32_t) ggml_type_size(k->type);
@@ -12373,15 +12389,23 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                 pc_group.batch0 = b;
                 // one workgroup per tile; with grouped query attention one per token of the group's
                 // tiles (the workgroup's rows are the token's heads), never past the mask rows
-                const uint32_t attn_x = gqa_ratio > 1
+                // (split_k workgroups each, over consecutive parts of the list)
+                const uint32_t attn_x = split_k * (gqa_ratio > 1
                     ? std::min<uint32_t>(n_g * Br, nem1 - tile0 * Br) * pipeline->wg_denoms[0]
-                    : n_g * Br;
+                    : n_g * Br);
                 ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                          {q_buf, kc_buf, vc_buf, mc_buf, sinks_buf, dst_buf, mask_opt_buf, idx_buf},
+                                          {q_buf, kc_buf, vc_buf, mc_buf, sinks_buf, out_buf, mask_opt_buf, idx_buf},
                                           pc_group, { attn_x, workgroups_y, 1 });
                 // the next group overwrites the regions
                 ggml_vk_sync_buffers(ctx, subctx);
             }
+        }
+        if (split_k > 1) {
+            const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr) };
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
+                                      {out_buf, sinks_buf, dst_buf},
+                                      pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
+            ctx->prealloc_split_k_need_sync = true;
         }
     } else if (split_k > 1) {
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
