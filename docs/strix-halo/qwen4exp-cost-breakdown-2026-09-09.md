@@ -167,7 +167,7 @@ exista aunque el cambio sea correcto.
 | 19 | Selección QSA a granularidad de bloque y FA que consuma la lista top-k sin construir la máscara | prefill y decode | −1.4 % a 40k, lineal con n_kv | Pasos de memoria medidos | Medio | Diseño; cuantificar a 128k con el perfil |
 | 20 | concat + transpose del `ssm_conv` | prefill | −0.8 % | Medida directa | Bajo | Ninguna |
 | 21 | Mat-muls diminutos en prefill (m=48, m=1 f32, router f32) | prefill | −0.6 % | Medida directa | Bajo | Ninguna |
-| 22 | MMVQ IQ4_NL fuera del allowlist del mat-vec | decode | < 1 % | El commit b9c196c1c midió tg64 sin cambio | Alto | test-backend-ops perf |
+| 22 | MMVQ IQ4_NL fuera del allowlist del mat-vec | decode | < 1 % | El commit b9c196c1c midió tg64 sin cambio; medida el 2026-09-30 en el banco del SP6 (sección 37.5): sin ganancia, descartada | Alto | test-backend-ops perf |
 | 23 | GDN chunked en prefill (hoy kernel secuencial, 2.1 ms por nodo de 2048 tokens = 1.03 µs por token y capa) | prefill | ≤ −1.4 %, probablemente nula | oMLX: su kernel secuencial optimizado rinde 0.93 µs por token y capa a 16k (paridad con el nuestro) y su variante chunked resultó más lenta de extremo a extremo | Alto | Ninguna barata; queda al final por la evidencia de oMLX |
 | M | Caché del indexador como una clave agrupada por bloque de 4 celdas más un anillo de 4 slots con las claves crudas del bloque incompleto (SGLang, oMLX): hoy guardamos la clave cruda de cada celda, 12 × n_ctx × 128 × 2 B = 1.6 GB a 524k | memoria | −1.2 GB del sobre de producción; rendimiento neutro | Diseño de referencia publicado | Medio: toca `llama-memory-hybrid-idx` y el camino de recomputación del prefill | Ninguna; es memoria, se mide al cargar |
 | — | Mat-vec-id agrupado por experto (retirado, sección 5) | decode | medido: −5 % de decode, más lento | Inferencia de bytes sin prueba de cuello de botella | Fallido | — |
@@ -2735,3 +2735,127 @@ prompt de 15k 17.53 → 17.21 chunks/s.
 −0.66 (v52) − 2.16 (v60) − 0.2 a 0.7 (v79) ≈ −3.0 a −3.5 ms por paso a 40k.
 
 Fuentes: `~/dbg/merge/chain_v79.{sh,out}`, `quality_gate.inc.sh`, `~/dbg/depth/ppl-v79q{b,r,n}.log`.
+
+## 37. SP6 del plan de decode: la tasa de los pesos en la verificación (2026-09-30, cadenas v80-v83)
+
+### 37.1 Re-perfil con el build adoptado (cadena v80)
+
+Perf logger serial (una carga NP=1 a 40k, 128 tokens greedy, 61 grafos de verificación de 3 tokens, mediana por
+forma). Casi todos los matmul de la verificación ya leen a la tasa de DRAM: q5_K 10240×2560 a ~216 GB/s, la cabeza
+q6_K a ~228, los iq4_nl 6144×2560, 2560×6144 y 12288×2560 a 193-212. Quedan por debajo:
+
+| Nodo (3 tokens) | Por paso | Por nodo | Tasa |
+|---|---|---|---|
+| Expertos gate/up iq3_s (1280×2560, 47 capas) | 9.87 ms | 210 µs | ver 37.2 |
+| Expertos down iq4_nl con el MUL fusionado (2560×640, 48) | 5.47 ms | 114 µs | ver 37.2 |
+| Mezcladores hc, down 324×10240 (96) | 1.66 ms | 17.3 µs | ~108 GB/s |
+| Mezcladores hc, up 10240×320 (97) | 1.36 ms | 14.1 µs | ~131 GB/s |
+| Experto compartido 640×2560 (96) y 2560×640 (48) | 1.14 ms | 7.8-8.0 µs | ~115-118 GB/s |
+| Router q8_0 512×2560 (48) | 0.53 ms | 11.1 µs | ~126 GB/s |
+
+Con 3 tokens, los expertos no van por el camino de tiles sino por el mat-vec-id (hasta 8 tokens), con un dispatch
+por token: el kernel lee los pesos de cada par (token, experto), 30 por capa.
+
+### 37.2 Expertos distintos por paso
+
+`sp6/moe_ids.cpp` evalúa texto sobre el modelo y lee, por capa MoE, los expertos que elige cada token (tensores
+`ffn_moe_topk` por el callback del scheduler). Sobre 5131 tokens de respuestas del propio modelo, en ventanas de
+tokens consecutivos (el lote de verificación): 2 tokens, 16.2 expertos distintos de 20 pares; 3 tokens, 21.6 de 30
+(72 %); 4 tokens, ~26 de 40. La capa 47 queda fuera del promedio: en un prompt solo computa las filas de salida.
+
+### 37.3 Techos en el modelo (cadena v81)
+
+Build de diagnóstico bin-v81diag (no commiteado), `gpu_wait` de la verificación de 3 tokens, A B C D ×2 + A:
+
+| Variante | Rondas | Media | Contra la base |
+|---|---|---|---|
+| A: base | 36.97 / 36.98 / 36.78 | 36.91 | — |
+| B: expertos compartidos (el workgroup del primer token que elige un experto calcula también los tokens siguientes que lo eligieron; el resto sale) | 36.86 / 36.88 | 36.87 | −0.04 |
+| C: workgroup de 4 subgrupos para m ≤ 1024 y k ≥ 8192 (mezclador hc 324×10240) | 36.47 / 36.67 | 36.57 | **−0.34** |
+| D: el mismo workgroup para m ≤ 1024 y k ≥ 2048 (también 640, 512 y 48 × 2560) | 37.53 / 37.68 | 37.61 | +0.70 |
+
+B da salidas idénticas a la base, bit a bit (por construcción: cada par corre la misma aritmética), pero no ahorra:
+por nodo (perf logger) gate/up baja 210 → 205 µs y down sube 114 → 119 µs, porque los pares repetidos se calculan en
+serie dentro del workgroup del primero. Las lecturas repetidas ya salían de la caché: el costo de un par repetido es
+su decuantización, no la DRAM.
+
+### 37.4 Banco fuera del modelo (`sp6/moe_bench.cpp`)
+
+Las mismas formas con el comportamiento de memoria del modelo: 48 capas de expertos elegidos entre 512, 96 pares de
+pesos de mezclador; nada queda en la MALL de un nodo al siguiente. Reproduce los mezcladores del modelo (18.3 y 14.5
+µs contra 17.3 y 14.1) y los expertos a escala (gate/up 170 µs con 22 expertos distintos, 210 en el modelo).
+Calibración de gate/up con 30 pares por capa: 29.4 distintos 193 µs, 22.0 distintos 170 µs, 10 distintos 138.5 µs; un
+token (10 pares) 70 µs. Un par cuyo experto ya está en caché cuesta ~3.4 µs: es la decuantización del iq3_s (tabla de
+la rejilla en memoria compartida, signos, escalas), repetida por cada token.
+
+Otras variantes medidas en el banco: el camino de tiles (mul_mm_id) para los expertos de 3 tokens, 352 µs (×2.2);
+el camino de tiles para el mezclador de k = 320, 25.2 µs (×1.7). Descartadas.
+
+### 37.5 Expertos agrupados por experto: tres diseños, ninguno gana
+
+La idea: cada experto de la verificación se lee y decuantiza una vez y se multiplica por todos los tokens que lo
+eligieron (columnas del mat-vec), en vez de un par (token, experto) por workgroup. Banco, gate/up iq3_s y down
+iq4_nl con el MUL fusionado, 3 tokens y 22 expertos distintos por capa (el kernel por pares: 168-170 y 110-112 µs):
+
+| Diseño | gate/up | down | Nota |
+|---|---|---|---|
+| Un dispatch por número de columnas (1..n), NUM_COLS exacto, barrido serial de ids | 202 | 179 | 3× workgroups lanzados; cada uno vacío cuesta lanzamiento + barrido |
+| Un dispatch, NUM_COLS = n, columnas inactivas cortadas con `break` uniforme, selección en memoria compartida | 280 | 204 | las guardas dentro de los bucles desenrollados rompen el código generado |
+| Un dispatch, NUM_COLS = n, todas las columnas calculadas (las inactivas repiten la primera, sin escribir) | 258 | 238 | cada columna extra cuesta casi un par completo |
+
+Con 2 y 4 tokens el orden es el mismo. El tercer diseño muestra la causa: en estos mat-vec el costo de un par es el
+trabajo por columna (cargas del vector B en f32, signos, FMA, reducción y escritura), no la lectura ni la
+decuantización de los pesos, así que agrupar tokens no puede ganar. La ruta de producto entero (B en q8_1,
+`dotPacked4x8`, el shader IQ4_NL de b9c196c1c que el selector del mat-vec nunca habilitó, vía 22 de la sección 3):
+down 110.6 → 109.7 µs, mezclador 324×10240 16.0 → 15.0, mezclador 10240×320 15.6 → 17.8 (el B se cuantiza en un
+dispatch aparte). Tampoco. Filas por workgroup (rm 2 u 8 en vez de 4) y el camino de tiles, peores (37.4).
+Los parches quedan en `~/dbg/merge/sp6/` (`shared-experts-diag.patch`, `grouped-experts-X.patch`); no entran al árbol.
+
+### 37.6 La compuerta de calidad no veía el camino de decode
+
+llama-perplexity procesa ubatches de 2048 tokens: los matmul van por los kernels de tiles y nunca por los mat-vec de
+la verificación. La compuerta de las cadenas v79 y v82 no podía ver un cambio en esos kernels (en v82 dio KL ~0 y
+top-1 100 %, lo mismo que en v79). `quality_gate.inc.sh` corre ahora dos modos, los dos obligatorios: ubatches de 2048
+(4 chunks) y ubatches de 3 tokens, el lote de la verificación (2 chunks, ~2 min por corrida). En el modo decode la
+referencia de puro redondeo (la base con las fusiones apagadas) es mucho mayor que en el de prompt (KL ~0.021 frente
+a 0.0028; top-1 igual ~96 % frente a 98.5 %): el decode propaga el redondeo por el estado recurrente del GDN a lo largo
+de los 4096 tokens. Re-medidos en ese modo, los dos cambios pasan: fc788ac4b (cadena v79q) KL 0.0016, top-1 99.59 %;
+el workgroup de 37.7 (cadena v82q) KL 0.0230 contra 0.0207 de referencia, top-1 96.21 % contra 96.04 %.
+
+### 37.7 El workgroup de 4 subgrupos: adoptado (cadenas v82 y v83, 9c63b0eda)
+
+En RDNA3, los mat-vec con m ≤ 1024 y k ≥ 8192 usan los pipelines de 4 subgrupos que ya existían (upstream solo los
+elige en NVIDIA e Intel). En qwen4exp afecta a los mezcladores hc 324×10240 y 320×10240 y a la inyección 4×10240.
+
+| Medida | Base | Nueva |
+|---|---|---|
+| Mezclador 324×10240 por nodo, perf logger en el modelo / banco | 17.3 / 18.3 µs | 16.1 / 16.4 µs |
+| v82, NP=1 a 40k, greedy (base primera y última) | 51.06 / 51.00 ms | 51.25 / 51.11 ms |
+| v82, muestreo de producción | 51.48 / 51.20 ms | 50.98 / 50.74 ms |
+| v82, `gpu_wait` de la verificación (cargas con timing) | 36.27 ms | 36.23 ms |
+| v83, A B A B A B A, `gpu_wait` | 36.60 / 36.65 / 36.81 / 36.44 | 36.60 / 36.59 / 36.34 |
+| v83, total de la verificación | 44.04 / 44.01 / 44.06 / 44.03 | 43.67 / 43.68 / 43.87 |
+| v83, ms por paso greedy | 51.92 / 52.35 / 52.06 / 51.77 | 51.60 / 51.46 / 52.24 |
+
+**−0.1 a −0.3 ms por paso** (v83: −0.29 ms en el total de la verificación, −0.26 ms por paso; v82: −0.17 ms por paso
+en promedio de greedy y muestreo; v81: −0.34 ms de `gpu_wait` con la perilla). Es chico y cerca del ruido entre
+cargas, pero las tres cadenas van en la misma dirección y el nodo baja 7-10 % medido de dos formas. Compuertas (v82):
+nueva contra nueva idéntica, compuerta de historia, `depth_repro` y `depth_repeat`, `graph_diff4` 72 de 11649 nodos,
+probe repetido idéntico, conversación con imagen 5/5, imagen de 2048×2048 en 12.6 s, cero timeouts de anillo,
+compuerta de calidad en los dos modos (37.6). Producción NP=2 recién cargada: 51.03 / 50.91 → 51.00 / 50.98 ms por
+paso (greedy / muestreo); rig NP=2 sin cambio fuera del ruido.
+
+### 37.8 Cierre del SP6
+
+El plan estimaba −1.5 a −3 ms por paso con los mezcladores a 210 GB/s y los expertos gate/up a DRAM. Lo medido:
+−0.1 a −0.3 ms (37.7). Los mezcladores no llegan a la tasa de DRAM por la forma (un nodo de 1.9 MB con 81 workgroups
+tiene poco que repartir: el workgroup grande lo lleva de ~108 a ~116 GB/s), y los expertos no tienen palanca de
+kernel: su costo por par es el trabajo por columna, no la lectura de los pesos (37.5). Lo que queda en la
+verificación son ~9.9 ms de gate/up y ~5.5 de down en el mat-vec-id, que solo bajarían con otro diseño de kernel (B
+en memoria compartida o en f16, varias filas por hilo) o con menos pares por paso; ninguno cabe en la ventana de 3-4
+días del SP6. Las herramientas quedan en `~/dbg/merge/sp6/`: `moe_ids.cpp` (expertos por token sobre el modelo),
+`moe_bench.cpp` (el banco con pesos fuera de la MALL), `shared_test.cpp` (bit a bit entre kernels y contra la CPU),
+`perf_shapes.py` (tiempos por forma de los grafos de verificación).
+
+Fuentes: `~/dbg/merge/chain_v8{0,1,2,3}.{sh,out}`, `chain_v82q`, `chain_v79q`, `~/dbg/depth/srvlog-v8{0p,1p}.log`,
+`~/dbg/merge/sp6/`.
