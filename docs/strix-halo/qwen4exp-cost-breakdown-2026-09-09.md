@@ -2840,18 +2840,35 @@ elige en NVIDIA e Intel). En qwen4exp afecta a los mezcladores hc 324×10240 y 3
 | v83, total de la verificación | 44.04 / 44.01 / 44.06 / 44.03 | 43.67 / 43.68 / 43.87 |
 | v83, ms por paso greedy | 51.92 / 52.35 / 52.06 / 51.77 | 51.60 / 51.46 / 52.24 |
 
-**−0.1 a −0.3 ms por paso** (v83: −0.29 ms en el total de la verificación, −0.26 ms por paso; v82: −0.17 ms por paso
-en promedio de greedy y muestreo; v81: −0.34 ms de `gpu_wait` con la perilla). Es chico y cerca del ruido entre
-cargas, pero las tres cadenas van en la misma dirección y el nodo baja 7-10 % medido de dos formas. Compuertas (v82):
+v81 a v83 sugerían −0.1 a −0.3 ms por paso (v83: −0.29 ms en el total de la verificación, −0.26 ms por paso; v82:
+−0.17 ms por paso en promedio de greedy y muestreo; v81: −0.34 ms de `gpu_wait` con la perilla), con pocas rondas y
+cerca del ruido entre cargas. La cadena v84 lo resolvió (abajo): **de punta a punta el cambio es neutro**; el nodo
+baja 7-10 % aislado, pero eso no se ve en el paso. Compuertas (v82):
 nueva contra nueva idéntica, compuerta de historia, `depth_repro` y `depth_repeat`, `graph_diff4` 72 de 11649 nodos,
 probe repetido idéntico, conversación con imagen 5/5, imagen de 2048×2048 en 12.6 s, cero timeouts de anillo,
 compuerta de calidad en los dos modos (37.6). Producción NP=2 recién cargada: 51.03 / 50.91 → 51.00 / 50.98 ms por
 paso (greedy / muestreo); rig NP=2 sin cambio fuera del ruido.
 
+Cadena v84 (A B ×5 + A, turnos greedy y muestreo de 512 tokens por carga; `sp6/ab_stats.py` compara cada carga nueva
+con la media de las dos bases que la rodean, así la deriva se cancela; intervalo de 95 % con t de Student, 4 grados
+de libertad):
+
+| Medida | Nueva − base | 95 % |
+|---|---|---|
+| ms por paso, muestreo de producción | −0.03 | [−0.19, +0.14] |
+| ms por paso, greedy | +0.10 | [−0.74, +0.94] |
+| `gpu_wait` de la verificación | −0.00 | [−0.21, +0.20] |
+| Total de la verificación | −0.10 | [−0.18, −0.01] |
+
+Sin ganancia medible por paso: con muestreo, cualquier efecto queda por debajo de 0.2 ms (0.4 %) en uno u otro
+sentido. Los t/s brutos de la cadena (+0.36 con muestreo, +0.60 en greedy) vienen del texto: el redondeo nuevo toma
+otro camino y su aceptación del draft salió algo mejor (269/484 contra 267/487); no se atribuyen al cambio. Queda
+adoptado como neutro: el kernel es más rápido aislado, pasó todas las compuertas y no pierde.
+
 ### 37.8 Cierre del SP6
 
 El plan estimaba −1.5 a −3 ms por paso con los mezcladores a 210 GB/s y los expertos gate/up a DRAM. Lo medido:
-−0.1 a −0.3 ms (37.7). Los mezcladores no llegan a la tasa de DRAM por la forma (un nodo de 1.9 MB con 81 workgroups
+nada de punta a punta (37.7, cadena v84: −0.03 ms por paso, 95 % [−0.19, +0.14]). Los mezcladores no llegan a la tasa de DRAM por la forma (un nodo de 1.9 MB con 81 workgroups
 tiene poco que repartir: el workgroup grande lo lleva de ~108 a ~116 GB/s), y los expertos no tienen palanca de
 kernel: su costo por par es el trabajo por columna, no la lectura de los pesos (37.5). Lo que queda en la
 verificación son ~9.9 ms de gate/up y ~5.5 de down en el mat-vec-id, que solo bajarían con otro diseño de kernel (B
@@ -2860,5 +2877,5 @@ días del SP6. Las herramientas quedan en `~/dbg/merge/sp6/`: `moe_ids.cpp` (exp
 `moe_bench.cpp` (el banco con pesos fuera de la MALL), `shared_test.cpp` (bit a bit entre kernels y contra la CPU),
 `perf_shapes.py` (tiempos por forma de los grafos de verificación).
 
-Fuentes: `~/dbg/merge/chain_v8{0,1,2,3}.{sh,out}`, `chain_v82q`, `chain_v79q`, `~/dbg/depth/srvlog-v8{0p,1p}.log`,
+Fuentes: `~/dbg/merge/chain_v8{0,1,2,3,4}.{sh,out}`, `chain_v82q`, `chain_v79q`, `~/dbg/depth/srvlog-v8{0p,1p}.log`,
 `~/dbg/merge/sp6/`.
