@@ -2662,3 +2662,37 @@ Los casos TOPK_MOE de `test-backend-ops` fallan de forma intermitente también c
 
 Fuentes: `~/dbg/merge/chain_v7{3,4,5}.{sh,out}`, `queue_run.sh`; los diagnósticos (no commiteados) en `bin-v73diag`,
 `bin-v74diag`, `bin-v75diag`.
+
+### 36.5 CONT de los mezcladores hc: descartada; cierre del SP4 (2026-09-30, cadenas v76-v78)
+
+El SCALE de cada mezclador hc leía una copia contigua (CONT) de las filas de su matmul conjunto down/inject. El cambio
+deja que SCALE lea las filas acolchadas en el lugar: en CPU, el assert de contigüidad pasa al contrato de
+`ggml_scale` (1d acolchado; se corrige además la rama con bias, que leía el origen con el stride del destino); en
+Vulkan, `scale.comp` indexa con `src0_idx`/`dst_idx` como `copy.comp`, y `supports_op` deja de pedir contigüidad; casos
+nuevos de `test-backend-ops` con filas acolchadas, 531/531. El cambio es exacto por construcción.
+
+La pre-compuerta falló (v76): aceptación 67/120 → 65/123, y en los ubatches de prefill profundos faltaban cadenas del
+router MoE en el perfil. El registro de nodos de Vulkan (v78, `GGML_VK_SYNC_LOGGER`) lo explica: la fusión TOPK_MOE (el
+router en un dispatch) se desactiva cuando su salida se solapa en memoria con una entrada, y el solapamiento depende de
+la disposición del asignador. Quitar los CONT cambia la disposición y el router de 7 a 19 capas por ubatch de prefill
+pasa de sin fusionar a fusionado: otro camino de cálculo y otro redondeo. Descartada: se pedían salidas idénticas a la
+base y la ganancia medida era ~0.23 ms (sección 36.4). Parche en el scratchpad de la sesión
+(`sp4_cand2_scale_padded_rows.patch`).
+
+**Tema abierto (no del SP4): la fusión TOPK_MOE depende de la disposición de memoria.** En el build adoptado, los
+ubatches de prefill corren el router sin fusionar en 44-48 de las 48 capas; el decode lo fusiona en todas. Todo cambio
+que mueva la disposición de un grafo de prefill (un nodo más o menos) puede prender o apagar esa fusión en algunas capas
+y cambiar el redondeo: es la misma fragilidad que las secciones 35.2 y 36.2, y hace que "respuestas idénticas a la
+base" rechace cambios exactos. Darle al router una decisión que no dependa de la disposición (que el kernel fusionado
+admita el solapamiento fila a fila, o que el asignador no reuse esa memoria) es trabajo de backend a decidir; en tiempo
+vale poco (≈6 dispatches por capa en ubatches de ~4 s).
+
+**Cierre del SP4.** Adoptadas la fusión 1 (colas del conv state sin CONT, abc86e8be) y la fusión 3 (snapshots del GDN
+directo al caché, 1d7cd0d16); descartadas la fusión 2 (colas en un gather), la vía 14 del lado de lectura, la norma L2
+del GDN y el CONT de los mezcladores hc. NP=1 a 40k, desde el build del SP3: 53.91 → ~51.5 ms por paso, **41.34 →
+43.2 t/s en greedy (+4.5 %) y 39.29 → 41.2 con muestreo (+4.9 %)**; en producción NP=2 43.3 / 41.2 t/s. La meta
+del SP4 (44.2-44.5 t/s) no se alcanzó: las candidatas restantes no tenían techo o chocaban con la fragilidad de la
+disposición.
+
+Fuentes: `~/dbg/merge/chain_v7{6,7,8}.{sh,out}`, `opcount_gate.py` (ahora admite ops quitadas),
+`~/dbg/depth/srvlog-v78{b,n}.log`.
