@@ -152,7 +152,7 @@ exista aunque el cambio sea correcto.
 | 4 | Mezcladores hyper-connection en prefill: tiles para m=320 y k=320 (48 workgroups, B en f32), formulación transpuesta o fusión del inject m=4 **Medida (2026-09-16, sección 11): `hc_*_inject` fusionado en `hc_*_down` (archivo y loader) −5.2 % prefill y decode +15 %; tile medio alineado para k=320 −1.3 %; split_k para pocos tiles negativo.** | prefill | −5.5 % (−6 s) | Medida directa: 7.5 TFLOPS y 0.1 TFLOPS en formas concretas | Bajo-medio | test-backend-ops perf en esas tres formas con la heurística de split_k relajada (una línea) |
 | 5 | GEMM densa con sombra f16 por nodo en prefill: desempaquetar el peso cuantizado a f16 una vez por nodo y ubatch (scratch transitorio) y correr el pipeline coopmat f16, en vez de dequantizar cada tile de A en cada workgroup que lo usa (16 veces por ubatch de 2048 con BN=128) **Medida (2026-09-16, sección 11): negativa, +4 % a +7 %; el kernel f16 es más lento que los cuantizados en todas las formas (15-17 frente a 20-22 TFLOPS). Cerrada.** | prefill | central −3 %, hasta −5.5 % (los densos grandes: 11.4 s a 18-23 TFLOPS; la sombra cuesta leer el quant y escribir f16 una vez por nodo) | Externa: la ablación de pwilkin en HIP vale 1.42× para "bf16 WMMA dequant GEMM" con ubatch 24576 (sección 6); halo-box atribuye la ganancia de wave32 al conteo de instrucciones de dequant inline (q6_K 3907 → 3433) | Medio-alto: otro backend y otro ubatch; en Vulkan la ruta coopmat f16 debe rendir ~2× la cuantizada para que la sombra se pague | test-backend-ops perf MUL_MAT f16×f32 frente a q5_K, q8_0 e iq4_nl×f32 en las formas densas de la sección 2 (wqkv, ssm_out, z, wq, wo, shexp); si f16 no dobla la tasa, la vía no existe |
 | 6 | **Medidas el 2026-09-16, neutras en este modelo (109.8, 110.1 y 110.9 s frente a 109.6 de la base; corrección 80/80 y 103/103):** compuertas ya compiladas y apagadas del backend: `GGML_VK_DENSE_WAVE32=1` (retile a wave32 de los pipelines coopmat cuantizados densos; `=2` también los f16), `GGML_VK_MMID_WAVE32=1` y `GGML_VK_MMID_WG256=1` (mismo retile y workgroup de 256 hilos para MUL_MAT_ID) | prefill | 0 a −5 % | Externa, misma GPU (halo-box, RADV gfx1151): GEMM densa q6_K +5.2..+10.8 %, q8_0 +5.4..+8.4 %, q4_K +0.7..+9.1 %, q4_0 −1.5..+1.8 %; a nivel de modelo pp2048 +3.9..+7.2 %; activadas allí por defecto desde 2026-08-30. IQ4_NL sin medir en ningún sitio | Medio: el grueso de nuestros pesos es IQ4_NL, del que no hay dato; q5_K y q8_0 (wqkv, o_proj) sí lo tienen | Tres variables de entorno, sin código: test-backend-ops perf en las formas densas y de expertos, luego el rig de 40k con la combinación que gane (auditoría, sección 10) |
-| 7 | split_k en el modo compacto de la FA sparse de decode (hoy 6 workgroups por capa, 350 µs) | decode | hasta −4.5 % (−3 ms), no probado | Inferencia: 6 workgroups en 40 CUs | Alto: el modo índice con split_k=13 fue más lento que el compacto sin split_k | test-backend-ops perf con la FA sparse de 3 tokens y split_k forzado |
+| 7 | split_k en el modo compacto de la FA sparse de decode (hoy 6 workgroups por capa, 350 µs) | decode | hasta −4.5 % (−3 ms); **hecha el 2026-09-30 (7c05f19ab, sección 38): −2.1 ms por paso a 40k** | Inferencia: 6 workgroups en 40 CUs | Alto: el modo índice con split_k=13 fue más lento que el compacto sin split_k | test-backend-ops perf con la FA sparse de 3 tokens y split_k forzado |
 | 8 | Ponderación y suma de expertos en el epílogo del MUL_MAT_ID de prefill (MUL 3.0 s, MULTI_ADD 1.65 s). **Ponderación hecha y medida (2026-09-16, sección 10): prefill 89.0 → 86.8 s (−2.4 %), salida bit-idéntica; la suma (MULTI_ADD, 1.6 s) queda, no hay forma determinista de meterla en el kernel.** | prefill | −4.3 % (el MUL solo, −2.8 %) | Pasos de memoria medidos, 1 ms por tensor de 84-210 MB; implementación de referencia en halo-box: `GGML_VK_MMID_SCALE_EPILOGUE` aplica la escala por (experto, token) al escribir el MUL_MAT_ID de prefill (no en coopmat2) | Bajo para el MUL, medio para la suma | Ninguna para el MUL; la suma requiere diseño (orden de acumulación) |
 | 9 | Cabeza del draft MTP recortada a un subconjunto de vocabulario (248k → ~47k filas, tabla índice → token, muestreo del draft sobre K logits; converter + `common/speculative.cpp`). Aplazada por decisión del Director (2026-09-10) | decode | +4 % (la cabeza del draft mide 1.62 ms por token, 3.24 ms por paso; con 47k filas ~0.6 ms) | Medida directa del mat-vec de la cabeza (221 GB/s) | Medio: la aceptación cae con los tokens fuera del subconjunto; el subconjunto debe salir de nuestro tráfico (español), no de uno de código | Contar en las respuestas de los rigs qué fracción de tokens cae en los 47k más frecuentes de nuestro tráfico |
 | 10 | Mezclador hyper-connection en decode: reparto de k del mat-vec m=4 (14 µs en un solo workgroup), scale plegado, silu y gate fusionados | decode | hasta −3.8 % (−2.5 ms), rebajado desde −4.4 | Cadena medida: 61 µs por mezclador × 96; suelo por dispatch 2.5 µs | Alto si se fusiona todo en un kernel serial por token; medio como reparto de k | test-backend-ops perf del mat-vec m=4, k=10240 con reparto de k |
@@ -609,7 +609,7 @@ Decode (38-41 t/s a 40k; 39.3 ms de GPU por paso, sección 1), pendientes por in
 | D2 | Vía 3: forma del workgroup del mat-vec de expertos (gate/up IQ3_S 5.4 ms + down 2.8 por paso) | −2 a −3 ms | microbench de `MUL_MAT_ID` a n=3 por variante |
 | D3 | Vía 13: router f32 con NUM_ROWS=1 (1.32 ms por paso a 96 GB/s) | −0.7 ms | una línea en la tabla de NUM_ROWS |
 | D4 | Vía 14: estado GDN in place (GET_ROWS + CPY 1.2 ms por paso) | −0.8 ms | |
-| D5 | Vía 7: split_k en el modo compacto de la FA sparse (2.3 ms por paso, 6 workgroups por capa) | −1 ms | |
+| D5 | Vía 7: split_k en el modo compacto de la FA sparse (2.3 ms por paso, 6 workgroups por capa) | −1 ms | hecha el 2026-09-30 (sección 38): −2.1 ms |
 | D6 | Vía 17: menos dispatches pequeños (~2500 por paso, ~2 ms) | −0.5 a −1 ms | fusiones |
 | D7 | Agrupación QSA en CPU incremental: `set_input_qsa` es O(n_kv) por ubatch y en decode corre con la GPU parada (sección 24.3) | −1 ms por paso a 40k, crece con n_kv | el set_inputs del grafo de verificación mide 1.8 ms |
 | D8 | Hueco de host de ~2 ms entre el hook del draft y el primer paso del draft (sección 24.3) | hasta −2 ms | sin atribuir; medir con `LLAMA_SPEC_TIMING` |
@@ -2884,3 +2884,53 @@ días del SP6. Las herramientas quedan en `~/dbg/merge/sp6/`: `moe_ids.cpp` (exp
 
 Fuentes: `~/dbg/merge/chain_v8{0,1,2,3,4}.{sh,out}`, `chain_v82q`, `chain_v79q`, `~/dbg/depth/srvlog-v8{0p,1p}.log`,
 `~/dbg/merge/sp6/`.
+
+## 38. Vía 7 (D5): split_k en el modo compacto de la FA sparse, adoptada (2026-09-30, cadena v85, 7c05f19ab)
+
+Al cerrar el SP6 (sección 37), el perfil de la verificación a 40k dejaba la atención sparse de las 12 capas QSA en
+3.7 ms por paso (309 µs por capa), creciente con la profundidad solo en la construcción de la lista. El modo compacto
+(lotes chicos: decode y verificación) corre tres dispatches por nodo: la lista de celdas elegidas (la unión de las
+filas del tile, desde `kv_idx`), el gather de esas celdas a regiones f16 y la atención sobre las regiones. Con
+atención agrupada (GQA 12), un workgroup por token y cabeza KV: 6 por capa en una verificación de 3 tokens, en una
+GPU de 40 CUs. Desglose en test-backend-ops (forma de la verificación, 32k, selección de 2051 celdas, una perilla de
+diagnóstico que salta dispatches, no quedó en el árbol):
+
+| Parte | µs por nodo |
+|---|---|
+| Lista (1 workgroup) | ~17 |
+| Gather a f16 | ~49 |
+| Atención (6 workgroups) | ~440 |
+| Nodo | 507 |
+
+Cambio: en el modo compacto, cada lista se parte hasta que los workgroups llenan los núcleos (13 partes: 2 × 40 / 6),
+workgroups consecutivos toman partes consecutivas de la misma lista (`init_sparse` divide el índice de workgroup por
+`k_num`) y la reducción de split_k que ya existía suma las partes en orden fijo. Perilla de apagado:
+`GGML_VK_DISABLE_SPARSE_FA_COMPACT_SPLIT=1`. Banco: 509 → 125 µs por nodo a 32k, 533 → 134 a 131k.
+FLASH_ATTN_EXT 5221/5221 (los casos de 1, 3, 16 y 64 filas con `kv_idx` pasan por el modo compacto con split).
+
+Cadena v85 (NP=1 a 40k, base primero y último; la base es la librería Vulkan adoptada con fc788ac4b):
+
+| Carga | Greedy: ms por paso (t/s, aceptación) | Muestreo de producción |
+|---|---|---|
+| Base (primera) | 51.42 (41.89, 548/948) | 52.69 (40.53, 544/965) |
+| Nueva | 49.06 (44.37, 553/948) | 48.62 (44.57, 551/943) |
+| Nueva | 48.97 (44.45, 553/948) | 48.58 (44.61, 551/943) |
+| Base (última) | 50.95 (42.27, 548/948) | 50.82 (42.02, 544/965) |
+
+**−2.1 a −2.2 ms por paso (−4.2 %)** en greedy; con muestreo −2.2 contra la base última (la primera, 52.69, es la
+más alta de la cadena). Cargas con timing: `gpu_wait` de la verificación 36.69 → 34.63 ms, total 43.91 → 41.80.
+Producción NP=2 recién cargada: 50.96 / 51.13 → 49.17 / 48.72 ms por paso (greedy / muestreo); rig NP=2: 48.1-49.5 →
+50.4-54.3 t/s agregados. A igual aceptación, +4 a +4.5 % de t/s a 40k. El costo de la parte partida no depende de la
+profundidad (la lista es de 2051 celdas por consulta), así que el ahorro en ms se mantiene a más contexto.
+
+La reducción suma las partes en orden fijo pero distinto del anterior: los logits se mueven por redondeo. Compuertas:
+nueva contra nueva idéntica, compuerta de historia, `depth_repro` y `depth_repeat`, `graph_diff4` 72 de 11649 nodos,
+probe repetido idéntico (y todavía igual a `probe-v26`: el prompt de 4.7k no llega a la atención sparse),
+conversación con imagen 5/5, imagen de 2048×2048 en 12.6 s, cero timeouts de anillo. Compuerta de calidad en tres
+modos: los de 4096 de contexto no llegan a la atención sparse (KL ~0 en ambos), así que se agregó el modo de decode
+profundo, ubatches de 3 tokens sobre un trozo de 32k con la mitad evaluada a 16-32k: referencia de puro redondeo KL
+0.0116 y top-1 95.80 %, nueva KL 0.0116 y 95.74 %. La corrida base de ese modo escribe ~8 GB de logits con el modelo
+cargado y bajó MemFree a 9 GiB: el guardia de `ppl_run` ahora sincroniza y suelta de la caché ese archivo cada ~5 s.
+
+Fuentes: `~/dbg/merge/chain_v85.{sh,out}`, `quality_gate.inc.sh`, `~/dbg/depth/ppl-v85q{p,d,D}{b,r,n}.log`.
+
