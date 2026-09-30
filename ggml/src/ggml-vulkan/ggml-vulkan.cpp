@@ -8687,6 +8687,14 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         }
     }
 
+    // RDNA3: with few rows the one-subgroup workgroups are too few to keep the memory busy (324 x 10240 gives 81 of
+    // them); four subgroups split each row block's k. Below k = 8192 the four subgroups get too few iterations and
+    // the larger workgroup is slower (640 x 2560 and 48 x 2560 measured)
+    if (ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture == vk_device_architecture::AMD_RDNA3 &&
+        m <= 1024 && k >= 8192) {
+        dmmv_wg = DMMV_WG_SIZE_LARGE;
+    }
+
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;

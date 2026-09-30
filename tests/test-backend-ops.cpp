@@ -10073,6 +10073,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 2048, 2560, {1, 1}, {1, 1})); // output head
+    // the hyper-connection mixers of a decode or verification batch: the mat-vec path with few rows and a long k
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_S, GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t n : {1, 3}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 324, n, 10240, {1, 1}, {1, 1}));
+        }
+    }
+    for (int64_t m : {320, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, m, 3, 10240, {1, 1}, {1, 1}));
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false,  640, 2048, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, 2048,  640));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K,   GGML_TYPE_F32, 256,  8, false, 2048, 2048,  512));
