@@ -44,9 +44,13 @@ sección 5 de este plan.
   para atribuir; relojes y potencia con `power_sampler.py`.
 - NP=2: dos slots generando a ~40k con `--decode-share 0.4` (rig de la sección 25.3), t/s por slot y agregado.
   Producción es NP=2: los grafos del draft y las entradas QSA cambian de forma con dos slots.
-- Exactitud: respuestas idénticas a la base en greedy y en muestreo, misma aceptación del draft, probe idéntico a la
-  referencia vigente, `graph_diff4` con los 72 nodos conocidos, `depth_repeat` a 40k, conversación texto → imagen →
-  texto, cero timeouts de anillo; `img_big.py` 2048×2048 solo si se toca el camino de visión. Compuerta de historia
+- Exactitud (regla del Director del 2026-09-30): un cambio que mueve el redondeo es una optimización si sigue siendo
+  determinista e igual de correcto. Se exige determinismo dentro del build (probe repetido idéntico, `depth_repeat` a
+  40k, `graph_diff4` con los 72 nodos conocidos, compuerta de historia) y la compuerta de calidad
+  (`~/dbg/merge/quality_gate.inc.sh`: divergencia KL contra la base a lo sumo el doble de la de puro redondeo, la base
+  con las fusiones apagadas, y acuerdo del token top-1 no menor que el de referencia menos 0.5 puntos); además
+  conversación texto → imagen → texto y cero timeouts de anillo; `img_big.py` 2048×2048 solo si se toca el camino de
+  visión. Respuestas y probe contra la base se informan, no se exigen. Compuerta de historia
   (desde el 2026-09-30, sección 35.2 del documento de costos): a contexto reducido, el decode de 40k en el slot 0 con
   log-probs da lo mismo en un servidor recién cargado que en uno que procesó antes la imagen de 2048×2048 en el slot 1,
   con MTP y lookup apagados y con los de producción (`~/dbg/merge/history_gate.inc.sh`).
