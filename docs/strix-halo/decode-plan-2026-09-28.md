@@ -48,9 +48,11 @@ sección 5 de este plan.
   determinista e igual de correcto. Se exige determinismo dentro del build (probe repetido idéntico, `depth_repeat` a
   40k, `graph_diff4` con los 72 nodos conocidos, compuerta de historia) y la compuerta de calidad
   (`~/dbg/merge/quality_gate.inc.sh`: divergencia KL contra la base a lo sumo el doble de la de puro redondeo, la base
-  con las fusiones apagadas, y acuerdo del token top-1 no menor que el de referencia menos 0.5 puntos, en dos modos:
-  ubatches de 2048 tokens, los kernels de tiles del prompt, y ubatches de 3 tokens, los mat-vec de la verificación, que
-  un ubatch de 2048 nunca toca; desde el 2026-09-30, sección 37.6 del documento de costos); además
+  con las fusiones apagadas, y acuerdo del token top-1 no menor que el de referencia menos 0.5 puntos, en tres modos:
+  ubatches de 2048 tokens a 4096 de contexto, los kernels de tiles del prompt; ubatches de 3 tokens a 4096, los
+  mat-vec de la verificación, que un ubatch de 2048 nunca toca; y ubatches de 3 tokens sobre un trozo de 32k, la
+  atención sparse QSA, que 4096 de contexto nunca activa; desde el 2026-09-30, secciones 37.6 y 38 del documento de
+  costos); además
   conversación texto → imagen → texto y cero timeouts de anillo; `img_big.py` 2048×2048 solo si se toca el camino de
   visión. Respuestas y probe contra la base se informan, no se exigen. Compuerta de historia
   (desde el 2026-09-30, sección 35.2 del documento de costos): a contexto reducido, el decode de 40k en el slot 0 con
