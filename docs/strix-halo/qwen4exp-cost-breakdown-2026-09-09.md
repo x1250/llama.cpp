@@ -2502,6 +2502,10 @@ redisposiciones.
   idéntico a `probe-v26`, conversación texto → imagen → texto 5/5, imagen de 2048×2048 en 12.6 s. Rig NP=2, base →
   nueva: un slot solo 43.4 / 43.4 → 42.9 / 43.4 t/s, dos slots 47.6-47.9 → 48.4-49.6 t/s agregados, el slot que genera
   mientras llega un prompt de 15k 17.71 → 18.24 chunks/s. Commit 9f3e99782.
+- Memoria a profundidad (cadena v72, NP=1, ctx 131072, prompt de 124.9k, MTP y lookup): con una disposición nueva por
+  grafo, el buffer de cómputo podría crecer en pleno prefill si el plan fresco pidiera más que la reserva. GPU en uso
+  (VRAM + GTT) con pico de 72 880 MiB en la base y 72 874 MiB en la nueva, MemFree mínimo de 33 876 y 33 912 MiB: no
+  crece. Prefill 239.4 → 238.4 s, respuestas idénticas.
 
 El defecto no vino de un error del SP1 sino de una propiedad del asignador que el SP1 dejó a la vista. Las mediciones
 del SP2, el SP3 y las fusiones del SP4 compararon servidores recién cargados y siguen valiendo. Incidente de la investigación: la primera
