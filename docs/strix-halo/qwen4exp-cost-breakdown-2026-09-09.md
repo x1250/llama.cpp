@@ -2427,7 +2427,7 @@ conversación texto → imagen → texto 5/5, imagen de 2048×2048 en 12.9 s, ce
 misma historia la nueva y la base dan lo mismo (cadena v43: A == B), y recién cargadas también (C == v42pb). Adoptado:
 build en `build/bin`, producción descargada como estaba.
 
-### 35.1 Defecto de determinismo que introdujo el SP1: la salida depende de la historia del servidor (abierto)
+### 35.1 Defecto de determinismo que introdujo el SP1: la salida depende de la historia del servidor (resuelto en 35.2)
 
 Apareció en la compuerta de producción del SP3 y se aisló en las cadenas v43-v51 (producción NP=2, contexto nativo,
 pedidos fijados a un slot con `id_slot`). La misma petición (el decode greedy de 1024 tokens sobre el prompt de 39.5k)
@@ -2457,6 +2457,61 @@ SP1 costaría ~1.2 ms por paso y no se revirtió. Las cargas de diagnóstico v43
 Fuentes: `~/dbg/merge/chain_v4{2,3,4,5,6,7,8,9}.{sh,out}`, `chain_v50.out`, `chain_v50b.out`, `chain_v51.out`,
 `sp2/seqrm_equiv.cpp`; `~/dbg/depth/budget-v4{2,3,4,5,6,7,8,9}*.jsonl`, `budget-v5{0,1}*.jsonl`, `srvlog-v4*.log`;
 el parche descartado de la hipótesis 1 en el scratchpad de la sesión (`discard_layout.patch`).
+
+### 35.2 Causa y arreglo del defecto de la sección 35.1 (2026-09-29, cadenas v61-v71)
+
+**Causa.** Las fusiones del backend Vulkan se deciden, en parte, por dónde están los tensores: el reuso in place del
+asignador y los chequeos de solapamiento que desactivan una fusión cuando la salida pisa una entrada. El asignador de
+grafos (`ggml_gallocr`) reutilizaba la disposición del grafo anterior de su scheduler cada vez que el grafo nuevo tenía
+la misma cantidad de nodos y hojas y sus tensores cabían (`ggml_gallocr_needs_realloc`), aunque fuera otro grafo. Antes
+del SP1 los ubatches chicos pasaban por el scheduler principal, así que el grafo anterior a un prefill era el mismo en
+cualquier historia. Con el SP1 esos ubatches van a los slots de grafo y el grafo anterior del scheduler principal pasa a
+depender de la historia del servidor: tras la imagen es el de la imagen. El primer ubatch de 2048 del prompt quedaba
+con otra disposición, otras fusiones y otro redondeo desde la capa 40.
+
+Cómo se localizó, todo a contexto reducido (NP=2, 57344 celdas por slot) con MTP y lookup apagados salvo donde se dice:
+
+- v61: se reproduce (difiere en el carácter 2910) y desaparece con `LLAMA_GRAPH_REUSE_DISABLE=1`, que también apaga los
+  slots del SP1.
+- v62: en 1000 reutilizaciones, cada grafo reutilizado es estructuralmente idéntico a uno construido de nuevo (op,
+  formas, strides, parámetros, offsets de vistas): no es un `can_reuse` incompleto.
+- v63 y v64: llenar con ceros o NaN los intermedios, y después las entradas, de cada grafo recién asignado no cambia
+  nada: no hay lectura de memoria sin inicializar.
+- v65: los log-probs difieren desde el primer token, que calcula el último ubatch del prefill.
+- v66 a v68: el estado recurrente de las capas GDN desde la 40 difiere; el primer ubatch que diverge es el primero de
+  2048 del prompt, en la entrada de la capa 40.
+- v69: ese ubatch calculado nodo por nodo (sin fusiones entre nodos) da salidas idénticas en las dos historias.
+- v70: con `GGML_VK_DISABLE_FUSION=1`, o con una disposición nueva para cada grafo, las dos historias coinciden.
+
+**Arreglo.** `ggml_backend_sched_reset` descarta la disposición (`ggml_gallocr_discard_layout`): cada grafo que se
+asigna después de un reset se dispone para sus propias formas, así que la disposición depende solo del grafo. Un grafo
+reutilizado no pasa por el reset y conserva la suya. Todos los sitios que construyen un grafo nuevo ya llaman al reset
+(el decode, el prefill, el K-shift). El chequeo de depuración `GGML_SCHED_DEBUG_REALLOC` no cuenta estas
+redisposiciones.
+
+**Cadena v71:**
+
+- Historia a contexto reducido, 1024 tokens greedy con log-probs en el slot 0: recién cargado contra tras la imagen de
+  2048×2048 en el slot 1, idénticos token a token y log-prob a log-prob con MTP y lookup apagados y con los de
+  producción. El decode recién cargado es idéntico al del build anterior.
+- NP=1 a 40k, base (build de la fusión 3) primero y último: 51.70 / 51.13 y 51.66 / 50.99 → 51.52 / 50.99 y 51.64 /
+  50.99 ms por paso: sin costo medible. El prefill de 39.5k: 89.7 → 89.6 s.
+- Respuestas idénticas a la base (también en las cargas con timing), `depth_repro` + `depth_repeat` idénticos,
+  `graph_diff4` 72 nodos, cero timeouts de anillo.
+- Producción (NP=2, recién cargados): 51.17 / 50.90 → 51.39 / 51.04 ms por paso, respuestas idénticas a la base; probe
+  idéntico a `probe-v26`, conversación texto → imagen → texto 5/5, imagen de 2048×2048 en 12.6 s. Rig NP=2, base →
+  nueva: un slot solo 43.4 / 43.4 → 42.9 / 43.4 t/s, dos slots 47.6-47.9 → 48.4-49.6 t/s agregados, el slot que genera
+  mientras llega un prompt de 15k 17.71 → 18.24 chunks/s. Commit 9f3e99782.
+
+El defecto no vino de un error del SP1 sino de una propiedad del asignador que el SP1 dejó a la vista. Las mediciones
+del SP2, el SP3 y las fusiones del SP4 compararon servidores recién cargados y siguen valiendo. Incidente de la investigación: la primera
+corrida de v66 hasheaba las fuentes enteras, pesos incluidos (la tabla PLE lazy, 27 GiB); el guard de la cadena
+descargó el servidor al bajar MemAvailable a 21 GiB, sin consecuencias. El volcado corregido lee por trozos de 16 MiB y
+no toca pesos.
+
+Fuentes: `~/dbg/merge/chain_v6{1..9}.{sh,out}`, `chain_v70.{sh,out}`, `chain_v71.{sh,out}`, `logprob_diff.py`,
+`dump_diff.py`, `ophash_diff.py`; los parches de diagnóstico (no commiteados) en el scratchpad de la sesión:
+`diag_reuse_verify.py`, `discard_layout_all.patch`.
 
 ## 36. SP4 del plan de decode: fusiones en la verificación (2026-09-29, cadenas v52-v55)
 
