@@ -348,6 +348,8 @@ extern "C" {
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
+    // The next graph is laid out for its own shapes, not in the layout of the previous graph: backends decide their
+    // fusions on where the tensors are, so a reused layout would make a graph's results depend on the graph before it.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
     // Set a callback to be called for each resulting node during graph compute
