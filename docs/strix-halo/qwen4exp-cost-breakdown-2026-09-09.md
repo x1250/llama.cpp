@@ -2697,3 +2697,41 @@ la disposición.
 
 Fuentes: `~/dbg/merge/chain_v7{6,7,8}.{sh,out}`, `opcount_gate.py` (ahora admite ops quitadas),
 `~/dbg/depth/srvlog-v78{b,n}.log`.
+
+### 36.6 CONT de los mezcladores hc: adoptada con la regla nueva (2026-09-30, cadena v79)
+
+El Director decidió el 2026-09-30 que un cambio que mueve el redondeo es una optimización si sigue siendo determinista
+e igual de correcto: ya no se exigen respuestas idénticas a la base sino determinismo dentro del build (probe repetido,
+`depth_repeat`, `graph_diff4`, compuerta de historia) y una compuerta de calidad (`quality_gate.inc.sh`: divergencia
+KL con llama-perplexity a 4096 de contexto sobre 4 chunks del wikitext-2 contra la base, a lo sumo el doble de la de
+puro redondeo, que es la base con las fusiones apagadas, y acuerdo del token top-1 no menor que el de referencia menos
+0.5 puntos). Con esa regla, el cambio de la sección 36.5 se volvió a medir completo (fc788ac4b).
+
+| Carga | Greedy: ms por paso (t/s, aceptación) | Producción: ms por paso (t/s, aceptación) |
+|---|---|---|
+| Base (primera) | 51.28 (43.46, 564/917) | 50.77 (41.37, 536/973) |
+| Nueva | 50.70 (42.48, 548/948) | 50.68 (42.14, 544/965) |
+| Nueva | 50.82 (42.37, 548/948) | 50.71 (42.12, 544/965) |
+| Base (última) | 51.66 (43.14, 564/917) | 51.03 (41.17, 536/973) |
+
+**Costo por paso: −0.71 ms en greedy y −0.20 con muestreo** (cargas con timing: −1.08 / −0.41; `gpu_wait` de la
+verificación 37.51 / 37.33 → 36.88 / 36.85 ms). Los t/s de esta muestra van en direcciones opuestas porque el texto
+toma otro camino y la aceptación del draft cambia con él: en greedy baja (548/948 contra 564/917) y con muestreo sube
+(544/965 contra 536/973). Es variación del texto, no del cambio; el costo por paso es la medida del cambio, y a igual
+aceptación vale +0.4 a +1.4 % de t/s.
+
+Compuerta de calidad: la referencia (base sin fusiones) da KL 0.0028 y top-1 igual en el 98.55 % de los tokens; la
+nueva, KL ~0 y top-1 igual en el 100.000 %, perplejidad 2.2473 → +0.0012. A 4096 de contexto el cambio no se distingue
+de la base: el efecto sobre la fusión TOPK_MOE aparece en los ubatches de prefill profundos.
+
+Determinismo: nueva contra nueva idéntica, compuerta de historia 1 (su primera corrida real), `depth_repro` +
+`depth_repeat` idénticos, `graph_diff4` 72 de 11649 nodos, probe repetido idéntico (y todavía igual a `probe-v26`: el
+prompt de 4.7k no llega a los ubatches profundos), conversación texto → imagen → texto 5/5, imagen de 2048×2048 en
+12.6 s, cero timeouts de anillo. Producción (NP=2, recién cargados, una carga por build): 51.79 / 50.86 → 50.94 /
+51.04 ms por paso; rig NP=2: dos slots 45.4-47.4 → 46.8-47.3 t/s agregados, el slot que genera mientras llega un
+prompt de 15k 17.53 → 17.21 chunks/s.
+
+**Cierre del SP4 con la fusión 1, la fusión 3 y el CONT de los mezcladores hc:** sumando lo medido en cada cadena,
+−0.66 (v52) − 2.16 (v60) − 0.2 a 0.7 (v79) ≈ −3.0 a −3.5 ms por paso a 40k.
+
+Fuentes: `~/dbg/merge/chain_v79.{sh,out}`, `quality_gate.inc.sh`, `~/dbg/depth/ppl-v79q{b,r,n}.log`.

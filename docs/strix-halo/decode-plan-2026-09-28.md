@@ -179,7 +179,7 @@ registra su medición.
 | Orden | SP | Días | Condición | Estado |
 |---|---|---|---|---|
 | 1 | SP1 | 2-3 | — | hecho el 2026-09-28 en un día (e579358ba, sección 30 del documento de costos): −1.17 ms por paso en greedy y −0.90 con muestreo a 40k; NP=2 sin cambio medible; con NP=2 los grafos se reutilizan (sección 31.2) |
-| 2 | SP4 | 4-6 | una fusión por día | hecho el 2026-09-29/30 (sección 36 del documento de costos): adoptadas la fusión 1 (abc86e8be, −0.66 ms) y la fusión 3 (1d7cd0d16, snapshots del GDN directo al caché, −2.2 ms); descartadas la fusión 2, la vía 14 del lado de lectura (techo nulo), la norma L2 del GDN (~0.12 ms) y el CONT de los mezcladores hc (cambia la fusión TOPK_MOE del prefill por la disposición; sección 36.5). NP=1 a 40k: ≈ −2.8 ms por paso sumando lo medido en cada cadena (~41.3 → ~43.2 t/s greedy, ~39.3 → ~41.2 con muestreo) |
+| 2 | SP4 | 4-6 | una fusión por día | hecho el 2026-09-29/30 (sección 36 del documento de costos): adoptadas la fusión 1 (abc86e8be, −0.66 ms), la fusión 3 (1d7cd0d16, snapshots del GDN directo al caché, −2.2 ms) y el CONT de los mezcladores hc (fc788ac4b, −0.2 a −0.7 ms, con la regla de redondeo del 2026-09-30); descartadas la fusión 2, la vía 14 del lado de lectura (techo nulo) y la norma L2 del GDN (~0.12 ms). Total ≈ −3.0 a −3.5 ms por paso a 40k, sumando lo medido en cada cadena |
 | 3 | SP6 | 3-4 | opcional | pendiente |
 | 4 | SP2 | 2-3 | — | hecho el 2026-09-29 en un día (100f88835, b3e7e2b3f; sección 33 del documento de costos): −0.46 ms por paso a 40k (+0.9 % t/s, bajo su cota de 0.77) y −2.0 a −2.4 ms a 125k (+3.2-3.9 %); salidas idénticas; NP=2 sin cambio medible |
 | 5 | SP5 | 2 de spike + 5-8 | decisión del Director tras el spike | pendiente |
