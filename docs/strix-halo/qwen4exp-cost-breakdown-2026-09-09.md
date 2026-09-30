@@ -2638,3 +2638,27 @@ casos GATED_DELTA_NET existentes, 42/42.
 Fuentes: `~/dbg/merge/chain_v5{6,7,8,9}.{sh,out}`, `chain_v60.{sh,out}`, `v56_verify_ops.txt`, `verify_wait.py`,
 `opcount_gate.py`, `sp4/gdn_snap_test.cpp`; `~/dbg/depth/srvlog-v5{6d,7a1,7b,7a2,8b,8n,9d}.log`,
 `budget-v60*.jsonl`.
+
+### 36.4 Candidatas restantes: techos y descartes (2026-09-30, cadenas v73-v75)
+
+Cada techo se midió con una sola binaria de diagnóstico, con y sin el trabajo, sobre el `gpu_wait` del ubatch de
+verificación (n = 3, `LLAMA_INPUT_TIMING`, NP=1 a 40k). Umbral para implementar: 0.15 ms.
+
+- **Vía 14, lado de lectura (el GDN lee su estado del caché, sin los 36 GET_ROWS de 3 MB; 36 × 17.1 µs en el perfil
+  serializado).** Para el techo (v73, A B A) el estado se lee de la fila del slot de rollback 7, que una verificación de
+  3 tokens nunca escribe, así la fusión 3 sigue activa: 36.83 / 37.57 → 37.41 ms. **Techo nulo dentro del ruido**: el
+  gather se solapa con el resto del grafo. El diseño tampoco era simple: `find_slot` intercambia celdas entre
+  secuencias, así que con dos secuencias en el ubatch una leería en el mismo op la celda que la otra escribe; solo era
+  seguro con una secuencia y sin copias extra, y el GET_ROWS no es adyacente al GDN. Descartada.
+- **Norma L2 del GDN (RMS_NORM + SCALE, 72 por verificación).** Quitar el SCALE rompe los números (v74: HTTP 500); el
+  techo se midió con el op `l2_norm` de un solo dispatch (v75, pares intercalados contra la deriva): −0.13 y −0.10 ms,
+  **~−0.12 ms, bajo el umbral**. La fusión pedía además una regla nueva del optimizador de grafos para dejar el SCALE
+  pegado a su RMS_NORM, con el riesgo de mover vecinos que dejó la fusión 2. Descartada.
+- **CONT de los mezcladores hc (96 por verificación).** Quitar 96 dispatches de su mismo costo: −0.15 ms (v74), −0.45 y
+  −0.10 ms (v75), **~−0.23 ms**: se implementa (sección 36.5).
+
+Los casos TOPK_MOE de `test-backend-ops` fallan de forma intermitente también con el build adoptado (1-2 de 416 en 2 de
+3 corridas): no es de estos cambios.
+
+Fuentes: `~/dbg/merge/chain_v7{3,4,5}.{sh,out}`, `queue_run.sh`; los diagnósticos (no commiteados) en `bin-v73diag`,
+`bin-v74diag`, `bin-v75diag`.
