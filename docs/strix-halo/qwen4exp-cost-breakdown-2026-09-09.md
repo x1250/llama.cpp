@@ -2721,8 +2721,11 @@ toma otro camino y la aceptación del draft cambia con él: en greedy baja (548/
 aceptación vale +0.4 a +1.4 % de t/s.
 
 Compuerta de calidad: la referencia (base sin fusiones) da KL 0.0028 y top-1 igual en el 98.55 % de los tokens; la
-nueva, KL ~0 y top-1 igual en el 100.000 %, perplejidad 2.2473 → +0.0012. A 4096 de contexto el cambio no se distingue
-de la base: el efecto sobre la fusión TOPK_MOE aparece en los ubatches de prefill profundos.
+nueva, KL ~0 y top-1 igual en el 100.000 %, perplejidad 2.2473 → +0.0012. Esa compuerta solo corría ubatches de 2048
+(sección 37.6): con ubatches de 3 tokens, el camino de la verificación, a 4096 de contexto el cambio sí se distingue
+de la base (cadena v79q: KL 0.0016 contra 0.0211 de referencia, top-1 igual en el 99.59 %) y pasa la compuerta. La
+causa de esa diferencia en decode no se investigó; la probable es la misma que en el prefill, fusiones que dependen de
+la disposición de la memoria (sección 36.5).
 
 Determinismo: nueva contra nueva idéntica, compuerta de historia 1 (su primera corrida real), `depth_repro` +
 `depth_repeat` idénticos, `graph_diff4` 72 de 11649 nodos, probe repetido idéntico (y todavía igual a `probe-v26`: el
