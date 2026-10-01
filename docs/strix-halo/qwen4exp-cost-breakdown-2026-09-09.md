@@ -161,7 +161,7 @@ exista aunque el cambio sea correcto.
 | 13 | Router f32: mat-vec con NUM_ROWS=1, 96 GB/s frente a 165 del bf16 de igual forma | decode | −2.7 % (−1.8 ms); −3.5 % con router q8_0 en el GGUF, con PPL/KLD | Medida directa | Bajo | Constante de especialización; se mide |
 | 14 | Estado GDN in place: 36 CPY de snapshots y 36 gathers por paso | decode | −2.3 % (−1.5 ms) | Familias CPY y GET_ROWS medidas; la porción GDN es estimada | Medio | Contar en el perfil los dispatches de estado por capa |
 | 15 | `eh_proj` del draft como una sola matmul (`ggml_reshape_2d` a [5120, 4·T]) en vez de mat-vec por lote de 2048 (130 ms por ubatch). Implementada (bbded2ebe) y medida el 2026-09-16: prefill de 39.5k 104.0 s frente a 107.4 s de la referencia anterior (−3.2 %), decode igual, repeat idéntico | prefill | −3.2 % medido | Medida en el rig | Cerrada | — |
-| 16 | QSA en el bloque del draft reutilizando la selección de bloques del target (IndexShare, como SGLang en su soporte de día 0: el draft no ejecuta el indexador; toma la lista de la última fila aceptada más N+1 columnas para las posiciones drafteadas). La FA densa del draft cuesta 229 ms por ubatch a 37k, lineal con la profundidad, y en decode 0.5 → 3.3 ms por paso de 40k a 262k | prefill y decode | −2.2 % a 40k, crece con la profundidad; decode −6 ms por paso a 262k | Medida directa del coste; diseño de referencia publicado (SGLang) | Medio: la aceptación del draft con una selección prestada se mide al implementar; el target no cambia | Ninguna barata: la ganancia es el coste medido de la FA densa; la aceptación se comprueba en el rig (draft acc) |
+| 16 | QSA en el bloque del draft con su propio indexador, como la referencia (corregido el 2026-10-01, sección 40: la capa MTP es una capa `full_attention` con indexador, `blk.48.indexer.*`; en SGLang el paso de extensión del draft corre ese indexador y los pasos de draft reutilizan su selección más las posiciones drafteadas desde entonces, IndexShare; no toma la selección del target, como decía esta fila). La FA densa del draft cuesta 229 ms por ubatch a 37k, lineal con la profundidad, y en decode 0.5 → 3.3 ms por paso de 40k a 262k | prefill y decode | −2.2 % a 40k, crece con la profundidad; decode −6 ms por paso a 262k | Medida directa del coste; diseño de referencia publicado (SGLang) | Medio: la aceptación del draft con una selección prestada se mide al implementar; el target no cambia | Ninguna barata: la ganancia es el coste medido de la FA densa; la aceptación se comprueba en el rig (draft acc) |
 | 17 | Menos dispatches en decode: cont+cpy de los slots de rollback (108), scale plegado en `hc_down` (96), sigmoid×mul de la norma GDN, máscara fill/set_rows/add si la FA consume la lista | decode | −1 a −3 % | Suelo por dispatch medido (2.4-2.6 µs) | Bajo | Aritmética directa |
 | 18 | gate y up de los expertos en un solo tensor `ffn_gate_up_exps` (el loader ya lo soporta y el converter tiene `--fuse-gate-up-exps`; nuestro GGUF los trae separados). Transformación exacta del archivo: un MUL_MAT_ID por capa en vez de dos, un prólogo de ids menos por capa en prefill, −49 dispatches por paso en decode | prefill y decode | −1 a −2 % en prefill (estimado), −0.3 % en decode | Bit-idéntico según oMLX (`qwen35_moe_gate_up.py`); dispatches medidos | Bajo | Construir el GGUF fusionado con gguf-py (concatenar filas por experto, sin recuantizar) y medir en una ventana; cambio de archivo, decisión del Director |
 | 19 | Selección QSA a granularidad de bloque y FA que consuma la lista top-k sin construir la máscara | prefill y decode | −1.4 % a 40k, lineal con n_kv | Pasos de memoria medidos | Medio | Diseño; cuantificar a 128k con el perfil |
@@ -567,7 +567,7 @@ cadena de medición completa (base primero y último, MTP on, determinismo).
 | 2 | Vía 2 bis: lista por token de la FA sparse construida desde los índices del selector QSA (hoy el prepass barre la fila de máscara entera, 40k columnas por token) y las 4 filas coopmat vacías. **Hecha la lista desde los índices (2026-09-22, sección 21): −0.4 s a 40k, −0.2 s a 55k, −9 % del nodo a 131k; el barrido era ~1 % del nodo, no el 40 % que suponía la sección 9: lo que queda de la FA sparse son los gathers de K/V por token. Las 4 filas vacías no cambian ese tráfico** | — | — | — |
 | 3 | Desquantizado IQ3_S en el kernel coopmat de MUL_MAT_ID (recuento de instrucciones, cargas de 16 bits, tabla en shmem). **Hecha la anchura de carga (2026-09-22, sección 22): 16 valores por hilo, −4 a −7 % del nodo, −0.6 s en el modelo, bit-idéntica. Lo que queda del nodo es el MMA desperdiciado del tile (128 columnas para 40 filas por experto), no el desquantizado** | ≤ −0.5 s más | medio | microbench |
 | 4 | Vía 12: host (`prefetch_ple_rows`, 20k llamadas síncronas por ubatch; huecos entre submisiones, 204 ms por ciclo). **Cerrada (2026-09-18, sección 16): el input PLE son 130-190 ms de E/S aleatoria por ubatch; agrupar o repartir el encolado no cambia el total, batch 8192 pierde decode. El read-ahead entre decodes por hint del server está hecho (2026-09-22, sección 20): −3.3 s, set_inputs 157 → 27 ms por ubatch** | — | — | — |
-| 5 | Vía 16: el draft reutiliza la selección QSA del target (sin indexador en el draft). **Re-valorada (2026-09-23, sección 25.4): la fila 9 dejó la atención densa del draft solo en las filas de salida (draft 232 → 64 ms por ubatch), así que en el prefill ya no queda casi nada; sigue como palanca de decode (FA densa del draft, ~1.3 ms por paso a 40k)** | ~0 en prefill | medio-alto: flujo del MTP | diseño |
+| 5 | Vía 16: QSA en el draft con su propio indexador (corregida en la sección 40; esta fila decía que reutilizaba la selección del target). **Re-valorada (2026-09-23, sección 25.4): la fila 9 dejó la atención densa del draft solo en las filas de salida (draft 232 → 64 ms por ubatch), así que en el prefill ya no queda casi nada; sigue como palanca de decode (FA densa del draft, ~1.3 ms por paso a 40k)** | ~0 en prefill | medio-alto: flujo del MTP | diseño |
 | 6 | Elementwise sobre el residual ancho (RMS_NORM_MUL 2.5 s, HC_GATED_MEAN 1.9, CONT 0.85, ADD 0.8): fusiones adicionales. **Rebajada (2026-09-22, sección 20): quitar el CONCAT entero (0.93 s en el perfil serializado) dio −0.13 s en el modelo; el backend solapa estos nodos con las matmuls, así que el perfil serializado sobreestima su costo real varias veces** | ≤ −0.5 s | medio | perfil por nodo (sección 2) |
 | 7 | Vía 1 bis: expertos `down` (k=640, ~9 ms por dispatch, 7.3 TFLOPS): cargas de B fuera del bucle de filas, BK_STEP. **Hecha en parte (2026-09-22, sección 20): ceros en las columnas sin fila del tile, −3.8 % en el nodo MMQ (−0.3 s); BK_STEP=2 medido en el microbench (sección 20)** | — | — | — |
 | 8 | Vías menores 19-23: QSA por bloques, ssm_conv (= fila 11), mat-muls diminutos (techo 0.5 s repartido en 2-3 arreglos, sección 18), MMVQ IQ4_NL, GDN chunked | −0.5 a −1 s cada una | bajo-medio | varias |
@@ -3022,3 +3022,88 @@ nueva (`bin-v85tool`): la herramienta no toca el backend que se compara.
 
 Fuentes: `~/dbg/merge/chain_v8{6,7}.{sh,out}`, `chain_v87.out.fused`, `sp6/topk-radix-split.patch`,
 `sp6/topk_split_test.cpp`, `sp6/ppl_stream_check.sh`, `sp6/ab_stats.py`.
+
+## 40. La atención del draft MTP: la caché en q8_0 y la vía 16 corregida (2026-10-01, cadenas v88 y v89)
+
+### 40.1 Lo que cuesta hoy
+
+Cada paso de decode corre dos pasos del draft (n-max 2) y cada uno atiende en denso sobre toda la caché del draft
+(una fila, cabeza 256, 2 cabezas KV, GQA 12). Perf logger de la cadena v80 a 40k (39680 celdas): 525 µs por nodo,
+1.05 ms por paso de decode (serializado). El hook (extensión del draft, 3 filas) no atiende: el bloque recortado de la
+sección 19 escribe K y V y no tiene filas de salida. La caché del draft quedaba en f16: el launcher pasa `-ctk q8_0
+-ctv q8_0` al target y nada al draft (`-ctkd`/`-ctvd`), y el tipo por defecto es f16 (`common/common.h`).
+
+Banco (test-backend-ops, 5c07f998f, la forma del paso del draft):
+
+| Caché | 32k | 131k |
+|---|---|---|
+| f16 | 346 µs (~194 GB/s) | 1245 µs (~215 GB/s) |
+| q8_0 | 223 µs | 1011 µs |
+
+En f16 el nodo ya lee a la tasa de DRAM; en q8_0 lee la mitad de bytes y gana 36 % a 32k y 19 % a 131k (el kernel
+de q8_0 de una fila queda en ~140-160 GB/s).
+
+### 40.2 Caché del draft en q8_0 (cadena v88)
+
+Un build (HEAD 2be8c7a2e), A = sin `-ctkd`/`-ctvd` (f16), B = `-ctkd q8_0 -ctvd q8_0`; una carga de control con `-lv 4`
+confirmó la caché del draft en q8_0 (57344 celdas, 59.5 MiB). NP=1, turnos de 512 tokens, cada B contra la media de
+las dos A que lo rodean (`sp6/ab_stats.py`, que ahora reporta también la aceptación del draft):
+
+| Medida | 40k, A B ×5 + A | 125k (ctx 131072), A B A B A |
+|---|---|---|
+| ms por paso, greedy | 48.54 → 48.51: −0.04 [−0.17, +0.08] | 54.15 → 53.49: **−0.77** [−0.92, −0.61] |
+| ms por paso, muestreo de producción | 48.07 → 47.89: −0.18 [−0.27, −0.09] | 53.70 → 53.09: **−0.63** [−1.09, −0.17] |
+| t/s, greedy / muestreo | +0.24 / −0.03 | **+0.56 / +0.46** (+1.4 / +1.2 %) |
+| Aceptación del draft, greedy / muestreo | +0.005 / −0.005 | igual / igual |
+
+Perf logger serial a 40k (cadena v88p, una carga por tipo): el nodo de atención del draft baja de 523.5 a 326.6 µs y
+el grafo del paso de draft de 3100 a 2933 µs, ~0.33 ms de GPU por paso de decode; el paso sin instrumentar refleja
+solo 0.04-0.18 ms a 40k (diferencia no atribuida). A 125k la ganancia sigue al banco (−0.47 ms por paso a 131k) y la
+supera. La aceptación no cambia: la cabeza lee la misma atención con K y V redondeados a q8_0, como ya lee el
+target. Memoria: la caché del draft pasa de 2 KiB a ~1.06 KiB por celda, ~0.5 GiB menos con 2 slots de 262144.
+
+Adopción en el launcher (`strix-halo/run-server.sh`, `DRAFT_KVQ8`, por defecto 1 en qwen38flash; `DRAFT_KVQ8=0` vuelve
+a f16), cadena v89, mismos binarios (HEAD). Solo cambia la caché del contexto del draft, así que los logits del target no
+se mueven: la compuerta de calidad (llama-perplexity no carga draft) y `graph_diff4` (solo el contexto del target) no
+recorren el cambio y no se corrieron. Compuertas corridas, todas en verde: compuerta de historia (log-probs idénticas
+con MTP y lookup apagados y con los de producción), nueva contra nueva idéntica, `depth_repro` y `depth_repeat`, probe
+repetido idéntico (igual a `probe-v87`), conversación con imagen 5/5, imagen de 2048×2048 en 12.6 s, cero timeouts de
+anillo. Producción NP=2 recién cargada: 48.37 / 47.82 → 48.34 / 47.57 ms por paso a 40k (greedy / muestreo), rig NP=2
+53.1-53.7 → 53.0-55.0 t/s agregados (ruido). Un turno con muestreo de la carga `v89n2` tardó 59.3 ms por paso con los
+mismos tokens que `v89n1` (47.6): la GPU quedó ~5 s inactiva dentro del turno (actividad mínima 45 % contra 88-89 %);
+sin causa en los logs, no se repitió en las otras 9 cargas de la misma configuración (v88 y v89).
+
+### 40.3 La vía 16, corregida
+
+La fila 16 (sección 3) y la fila 5 de la sección 4 decían que el draft reutilizaría la selección QSA del target. No es
+lo que hace la referencia:
+
+- La configuración del modelo (`config.json` de Qwen/Qwen3.8-Flash-Next) declara `mtp.layer_types = ["full_attention"]`,
+  y en qwen4exp las capas `full_attention` son las capas QSA, con indexador. El GGUF del draft trae
+  `blk.48.indexer.{q_proj,k_proj,q_norm,k_norm}` (el loader del fork los marca `TENSOR_SKIP`) y
+  `compress_ratios[48] = 0` solo porque su conversor arma la lista desde los `layer_types` del tronco (48 entradas).
+- SGLang (`models/qwen4_exp_mtp.py`: `config.layer_types = ["full_attention"]`; `configs/qwen4_exp.py`:
+  `index_share_for_mtp_iteration`, "draft decode steps reuse the draft-extend indexer top-k") corre el indexador
+  propio del draft en la extensión sobre los tokens aceptados y congela esa selección para los pasos de draft de la
+  iteración, más las posiciones drafteadas desde entonces (IndexShare). El blog de LMSYS del 2026-08-26 reporta la
+  misma aceptación con y sin IndexShare.
+
+El draft del fork atiende en denso: se aparta de la referencia. La versión fiel necesita una caché de indexador (y la
+de claves agrupadas) en el contexto del draft, que hoy es un `llama_kv_cache` simple (`create_memory`); en el flujo del
+fork la selección la haría el primer paso del draft (el hook corre sobre el lote de verificación completo, antes de
+saber qué se acepta) y el segundo la reutilizaría con la celda de su token. Costo de host: la agrupación QSA es O(celdas)
+por grafo (0.13 ms a 40k, 0.41 a 125k tras el SP2), una vez por paso con IndexShare.
+
+Estimación de la versión fiel (sin medir; sobre la caché q8_0 ya adoptada): el paso 1 del draft con indexador, top-k y
+atención sparse (~0.15-0.2 ms de GPU a 40k, por los nodos del target a la misma forma), el paso 2 con la atención sparse
+sola (~35 µs) y la agrupación de host una vez por paso: ~−0.3 ms por paso a 40k, ~−1.3 a 125k y ~−2.8 a 262k, con la
+aceptación de la referencia (sin medir en el fork). Trabajo: la caché del indexador y la de claves agrupadas como
+componente propio, compartido por la memoria híbrida del target y una memoria de atención con indexador para el draft;
+el ratio de la capa MTP desde el código cuando el GGUF trae el indexador con ratio 0 (no transformar el archivo); la
+selección del paso 1 guardada en el dispositivo por secuencia para el paso 2; rollback, NP=2 e imágenes (el hook no
+pasa los lotes de imagen al draft, así que su caché tiene huecos de posición; esos bloques quedan incompletos y siempre
+visibles). 3-5 días con las compuertas.
+
+Fuentes: `~/dbg/merge/chain_v8{8,8p,9}.{sh,out}`, `~/dbg/depth/srvlog-v88p{a,b}.log`, `sp6/ab_stats.py`; SGLang
+`python/sglang/srt/models/qwen4_exp_mtp.py` y `python/sglang/srt/configs/qwen4_exp.py`; blog de LMSYS
+`2026-08-26-qwen-flash-next`.
