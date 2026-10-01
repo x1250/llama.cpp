@@ -3060,7 +3060,9 @@ Perf logger serial a 40k (cadena v88p, una carga por tipo): el nodo de atención
 el grafo del paso de draft de 3100 a 2933 µs, ~0.33 ms de GPU por paso de decode; el paso sin instrumentar refleja
 solo 0.04-0.18 ms a 40k (diferencia no atribuida). A 125k la ganancia sigue al banco (−0.47 ms por paso a 131k) y la
 supera. La aceptación no cambia: la cabeza lee la misma atención con K y V redondeados a q8_0, como ya lee el
-target. Memoria: la caché del draft pasa de 2 KiB a ~1.06 KiB por celda, ~0.5 GiB menos con 2 slots de 262144.
+target. Memoria: la caché del draft pasa de 2 KiB a ~1.06 KiB por celda, ~0.5 GiB menos con 2 slots de 262144. El
+prefill no cambia (el hook escribe K y V cuantizados): 124.9k tokens en 238.1-239.3 s con f16 y 238.2-238.6 s con q8_0;
+39.5k en 79.4-79.5 s y 79.3 s.
 
 Adopción en el launcher (`strix-halo/run-server.sh`, `DRAFT_KVQ8`, por defecto 1 en qwen38flash; `DRAFT_KVQ8=0` vuelve
 a f16), cadena v89, mismos binarios (HEAD). Solo cambia la caché del contexto del draft, así que los logits del target no
