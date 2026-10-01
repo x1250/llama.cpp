@@ -3109,3 +3109,67 @@ visibles). 3-5 días con las compuertas.
 Fuentes: `~/dbg/merge/chain_v8{8,8p,9}.{sh,out}`, `~/dbg/depth/srvlog-v88p{a,b}.log`, `sp6/ab_stats.py`; SGLang
 `python/sglang/srt/models/qwen4_exp_mtp.py` y `python/sglang/srt/configs/qwen4_exp.py`; blog de LMSYS
 `2026-08-26-qwen-flash-next`.
+
+## 41. La vía 16 fiel, medida con un prototipo: la aceptación no cambia, la ganancia es chica (2026-10-01, cadenas v90 y v91)
+
+### 41.1 El prototipo
+
+Parche `~/dbg/merge/sp6/via16-mtp-qsa-spike.patch` (worktree `~/dbg/wt-v16`, nunca en `build/bin`), activo con
+`LLAMA_MTP_QSA=1`: la capa MTP toma el ratio QSA del tronco (4) y carga sus pesos de indexador; el contexto del draft
+usa la memoria híbrida con indexador sin capas recurrentes (su `seq_rm` ignora el rechazo de la parte recurrente vacía
+y las posiciones salen de la caché de atención); el grafo del draft selecciona con su propio indexador en cada grafo
+(sin IndexShare) y el hook calcula el bloque completo (sin el recorte de la sección 19). Comprobaciones de validez: el
+servidor detecta borrado parcial en el draft (tipo 1, no checkpoints); con un prompt de 1021 tokens (la selección
+cubre todas las celdas) A y B dan la misma aceptación (391/614) y la misma respuesta byte a byte; a 40k y 125k todos
+los grafos de paso de draft llevan el top-k QSA y la atención del draft cae de 327 a 52 µs (40k) y de ~1000 a 59 µs
+(125k).
+
+### 41.2 Aceptación (cadena v90)
+
+Un binario, A = sin la variable (draft denso, como producción), B = `LLAMA_MTP_QSA=1`; `LOOKUP=0` para que toda ronda
+use la cabeza MTP; greedy con fin natural (hasta 1024 tokens); `acc_rig.py`: por profundidad, un prompt de prosa
+(wikitext) y uno de código (fuentes del fork), cinco preguntas cada uno (análisis, resumen, traducción, examen y una con
+razonamiento; explicación, tests, refactor, tool call en JSON y una con razonamiento):
+
+| Profundidad | Prompt | Aceptados por paso A → B | Aceptación A → B |
+|---|---|---|---|
+| 40k | prosa (39.5k) | 1.401 → 1.414 | 0.700 → 0.707 |
+| 40k | código (41.5k) | 1.598 → 1.597 | 0.800 → 0.799 |
+| 125k | prosa (124.9k) | 1.439 → 1.463 | 0.720 → 0.732 |
+| 125k | código (124.7k) | 1.637 → 1.637 | 0.819 → 0.819 |
+| **40k total** | 8762 tokens por brazo | **+0.006** | |
+| **125k total** | 9291 tokens por brazo | **+0.014** | |
+
+Con ~2.5 tokens por paso, +0.014 aceptados por paso son ~+0.5 % de t/s. La atención densa del draft no le cuesta
+aceptación medible a la cabeza: la desviación de la referencia es inocua en este eje.
+
+### 41.3 Velocidad (cadenas v90 y v91)
+
+El prototipo es más lento: 47.70 → 49.27 ms por paso a 40k y 52.87 → 55.78 a 125k (v90). Desglose a 125k (v91,
+`LLAMA_INPUT_TIMING`, medianas en ms):
+
+| Grafo | Brazo | set_inputs (GPU parada) | compute | gpu_wait | total |
+|---|---|---|---|---|---|
+| Paso del draft (1 fila) | A denso | 0.030 | 0.310 | 2.932 | 3.274 |
+| Paso del draft (1 fila) | B QSA | 0.495 | 0.368 | 2.630 | 3.518 |
+| Hook (3 filas) | A | 0.063 | 0.266 | 0.264 | 0.597 |
+| Hook (3 filas) | B | 0.546 | 0.531 | 1.234 | 2.320 |
+
+La GPU ahorra 0.30 ms por paso de draft (serializado, perf logger: 3530 → 3035 µs; la atención baja ~0.95 ms y la
+selección suma ~0.4: TOPK_QSA 195 µs, gathers ~130), pero la agrupación QSA del host cuesta ~0.47 ms por grafo a 125k
+y se paga con la GPU parada. A 40k la selección (~270 µs serializados) se come el ahorro de la atención (327 → 52 µs).
+
+### 41.4 Estimación de la versión optimizada y conclusión
+
+Con el recorte del hook (solo K, V y claves del indexador: ~A) e IndexShare (el paso 1 agrupa y selecciona, el paso 2
+reutiliza la selección sin agrupación), sobre las medianas de 41.3: paso 1 +0.24 ms, paso 2 ~−0.47, hook ~+0.03:
+**~−0.2 ms por paso a 125k** (~0.4 %), que con la aceptación (+0.5 %) dan **~+0.9 % de t/s a 125k, ~+0.5 % a 40k y
+~+1.5-2 % a 262k** (estimado: la selección y la agrupación crecen con las celdas, como la atención densa). La estimación
+previa (sección 40.3: −0.3 / −1.3 / −2.8 ms) no contaba la selección ni la agrupación del host. Para 3-5 días de trabajo
+en la capa de memoria, la ganancia no lo justifica hoy: la vía 16 queda descartada como palanca de velocidad, con el
+prototipo guardado. Lo que sí apareció: la agrupación QSA del host está en el camino crítico también en el target, la
+verificación pasa 0.49 ms (40k) y 0.84 ms (125k) en `set_inputs` con la GPU parada (cadena v88); una agrupación
+incremental, persistente entre ubatches (opción no implementada del SP2), abarataría el target y cualquier draft QSA.
+
+Fuentes: `~/dbg/merge/chain_v9{0,1}.{sh,out}`, `acc_rig.py`, `acc_cmp.py`, `vk_draft_graphs.py`,
+`vk_draft_qsa_check.py`, `~/dbg/depth/acc-v90*.jsonl`, `srvlog-v91*.log`.
