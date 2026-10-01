@@ -2887,6 +2887,9 @@ Fuentes: `~/dbg/merge/chain_v8{0,1,2,3,4}.{sh,out}`, `chain_v82q`, `chain_v79q`,
 
 ## 38. Vía 7 (D5): split_k en el modo compacto de la FA sparse, adoptada (2026-09-30, cadena v85, 7c05f19ab)
 
+Superada el 2026-10-01 (sección 39.2): el modo compacto se retiró y los lotes chicos van por el modo índice, que gana
+otros 0.7-0.9 ms por paso; el split de esta sección se fue con él.
+
 Al cerrar el SP6 (sección 37), el perfil de la verificación a 40k dejaba la atención sparse de las 12 capas QSA en
 3.7 ms por paso (309 µs por capa), creciente con la profundidad solo en la construcción de la lista. El modo compacto
 (lotes chicos: decode y verificación) corre tres dispatches por nodo: la lista de celdas elegidas (la unión de las
@@ -2934,3 +2937,88 @@ cargado y bajó MemFree a 9 GiB: el guardia de `ppl_run` ahora sincroniza y suel
 
 Fuentes: `~/dbg/merge/chain_v85.{sh,out}`, `quality_gate.inc.sh`, `~/dbg/depth/ppl-v85q{p,d,D}{b,r,n}.log`.
 
+## 39. Palancas 1 y 2 tras la vía 7 (2026-10-01, cadenas v86 y v87)
+
+### 39.1 Top-k del selector QSA repartido entre workgroups: descartado
+
+El top-k fusionado del selector (`TOPK_QSA`: gather de los puntajes por bloque a las celdas, máscara f16 y radix-select
+de 2051 de 39680) cuesta 78 µs por capa en la verificación, 0.94 ms por paso: un workgroup de 1024 invocaciones por
+fila, 3 en una verificación de 3 tokens. Se escribió `topk_radix_split.comp`: cada fila repartida en n bloques de
+invocaciones del kernel original (las invocaciones virtuales recorren las mismas celdas), cada paso del kernel como
+dispatch propio (4 histogramas de dígito, conteo, emisión), los histogramas parciales sumados en orden y la emisión
+colocada como la del original. Idéntico bit a bit al kernel de un workgroup (índices, orden y empates) con 1, 3 y 8
+filas, con los empates del modelo (4 celdas por bloque) y con los datos de test-backend-ops. Más lento: 151 µs con 16
+bloques de 64 invocaciones, 118 con 8 de 128 y 110 con 4 de 256, contra 77 del original (perf logger, 3 filas): los
+seis dispatches con barrera cuestan más que lo que reparten. Parche en `~/dbg/merge/sp6/topk-radix-split.patch`.
+Variante no probada: dentro del mismo workgroup, compactar las candidatas después del segundo dígito para que los dos
+últimos histogramas recorran unas cientos de celdas en vez de 39680 (techo ~−0.3 ms por paso).
+
+El caso nuevo de test-backend-ops a la forma del modelo fallaba 3-4 corridas de cada 6 con los dos kernels: la rampa
+f16 de la máscara del test es exacta solo hasta 2048 celdas, más allá las celdas empatan y cualquier elección entre
+empates es un top-k válido. La comparación pasó a ser por valores, multiconjunto por fila (0f796165b).
+
+### 39.2 La atención sparse de los lotes chicos en el modo índice; el modo compacto retirado
+
+Tras la vía 7 (sección 38), el desglose del nodo de 3 filas a 32k en el banco era lista 17 µs, gather a f16 49,
+atención con split ~55. El modo índice (cada token su propia lista de 2051 celdas, leídas del caché q8_0 en el shader,
+con split_k), que antes servía solo a los prefills (token-major), le gana en todos los lotes chicos del banco:
+
+| Filas | 32k: compacto → índice (µs) | 131k: compacto → índice (µs) |
+|---|---|---|
+| 1 | 59 → 34 | 66 → 39 |
+| 3 | 129 → 63 | 133 → 67 |
+| 8 | 648 → 126 | 790 → 159 |
+| 16 | 1637 → 328 | 1904 → 397 |
+| 64 | 4629 → 1029 | 6942 → 1406 |
+
+El modo compacto entró a los lotes chicos el 2026-09-09 (c0e776ec4: la atención de la verificación 6.4 → 3.8 ms por
+paso contra el modo índice de entonces); desde entonces el modo índice ganó las listas desde los candidatos del
+selector (vía 2 bis, sección 21) y el token-major, que recorre la lista de cada token y no la unión del tile.
+
+En el modelo (cadena v86, un build, A = compacto, B = `GGML_VK_DISABLE_SPARSE_FA_COMPACT=1`, A B ×5 + A, cada B contra
+la media de las dos A que lo rodean, intervalo de 95 %):
+
+| Medida | Índice − compacto | 95 % |
+|---|---|---|
+| ms por paso, greedy | −0.66 | [−0.93, −0.39] |
+| ms por paso, muestreo de producción | −0.94 | [−1.01, −0.87] |
+| `gpu_wait` de la verificación | −1.01 | [−1.25, −0.77] |
+| Total de la verificación | −0.93 | [−1.00, −0.86] |
+
+Sin uso en ningún lote, el modo compacto se retiró del backend (el gather `flash_attn_sparse_gather.comp`, las
+regiones f16, la rama del shader de atención y el split de 7c05f19ab, que vivía en ella): todos los lotes con QSA
+toman el modo índice token-major, el camino exacto del brazo B. FLASH_ATTN_EXT 5221/5221; el perf de los lotes chicos
+queda en test-backend-ops (1, 3, 8, 16, 64 y 512 filas a 32k y 131k).
+
+### 39.3 Adopción (cadena v87, cab8465c6)
+
+| Carga | Greedy: ms por paso (t/s, aceptación) | Muestreo de producción |
+|---|---|---|
+| Base (primera, 7c05f19ab) | 49.36 (44.09, 553/948) | 49.52 (43.76, 551/943) |
+| Nueva | 48.57 (45.40, 559/937) | 48.04 (44.65, 546/957) |
+| Nueva | 48.52 (45.44, 559/937) | 48.05 (44.64, 546/957) |
+| Base (última) | 49.42 (44.05, 553/948) | 49.06 (44.17, 551/943) |
+
+−0.85 ms por paso en greedy y −1.2 con muestreo; cargas con timing: `gpu_wait` de la verificación 34.61 → 33.45 ms,
+total 42.39 → 40.91. Producción NP=2 recién cargada: 49.74 / 49.31 → 49.05 / 48.12 ms por paso (greedy / muestreo);
+rig NP=2 50.6-51.5 → 50.8-54.8 t/s agregados. Compuertas: nueva contra nueva idéntica, compuerta de historia,
+`depth_repro` y `depth_repeat`, `graph_diff4` 72 de 11649 nodos, probe repetido idéntico (igual a `probe-v26`),
+conversación con imagen 5/5, imagen de 2048×2048 en 12.6 s, cero timeouts de anillo; compuerta de calidad en los tres
+modos (decode profundo: KL 0.0113 contra 0.0113 de referencia, top-1 95.79 % contra 95.97 %).
+
+Con la vía 7 (sección 38), la atención sparse de la verificación quedó en ~3 ms menos por paso a 40k que antes de
+ambas: de ~42 a ~45.5 t/s en NP=1 greedy.
+
+### 39.4 La compuerta de calidad cortada por el fusible de memoria
+
+La primera corrida de v87 la cortó el fusible de la compuerta de recursos (MemFree 5.9 GiB < 6, 2026-10-01 01:25),
+en la corrida base del modo de decode profundo. Con un contexto más largo que el lote, llama-perplexity guardaba los
+logits de toda la mitad evaluada del trozo antes de procesarla y dimensionaba los log-probs por el contexto: a 32k y
+248k de vocabulario, ~24 GB de memoria de host junto al modelo, y el archivo base de 8 GB escrito de una vez al final
+(en la cadena v85 el mismo modo ya había bajado MemFree a 9 GiB). 3c27ad055 procesa cada lote apenas salen sus logits;
+el archivo base es el mismo byte a byte (comprobado con un trozo de 4096 en 4 lotes, KL 0). En la segunda corrida el
+modo profundo tuvo MemFree mínimo 44 GiB. Para la base de v87 se usaron las librerías de 7c05f19ab con la herramienta
+nueva (`bin-v85tool`): la herramienta no toca el backend que se compara.
+
+Fuentes: `~/dbg/merge/chain_v8{6,7}.{sh,out}`, `chain_v87.out.fused`, `sp6/topk-radix-split.patch`,
+`sp6/topk_split_test.cpp`, `sp6/ppl_stream_check.sh`, `sp6/ab_stats.py`.
