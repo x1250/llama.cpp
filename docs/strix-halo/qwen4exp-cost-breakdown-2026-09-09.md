@@ -3200,7 +3200,7 @@ paso baja 1.06 ms (la fila de verificación que se ahorra). Con muestreo el serv
 muestrea el target coincide (`common_sampler_sample_and_accept_n`): un draft dudoso acierta con la probabilidad que el
 target le da, así que cortarlo pierde más tokens de los que ahorra en tiempo. La ayuda de la opción ya dice "(greedy)",
 pero el código la aplica a cualquier muestreo del target. Un umbral global no se adopta: el muestreo es el default del
-launcher. Un umbral solo para pedidos greedy ganaría ~+2.6 % en ellos y nada en los demás; su valor depende de la
-temperatura que mandan los clientes.
+launcher. Un umbral solo para pedidos greedy ganaría ~+2.6 % en ellos y nada en los demás; ningún agente del Director
+pide temperatura 0 (2026-10-01), así que la palanca queda descartada.
 
 Fuentes: `~/dbg/merge/chain_v92.{sh,out}`, `acc_rig.py`, `acc_tps.py`, `~/dbg/depth/acc-v92*.jsonl`.
