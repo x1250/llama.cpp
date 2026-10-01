@@ -3173,3 +3173,34 @@ incremental, persistente entre ubatches (opción no implementada del SP2), abara
 
 Fuentes: `~/dbg/merge/chain_v9{0,1}.{sh,out}`, `acc_rig.py`, `acc_cmp.py`, `vk_draft_graphs.py`,
 `vk_draft_qsa_check.py`, `~/dbg/depth/acc-v90*.jsonl`, `srvlog-v91*.log`.
+
+## 42. El umbral de confianza del draft (`--spec-draft-p-min`): gana en greedy, pierde con muestreo (2026-10-01, cadena v92)
+
+`p_min` (por defecto 0) corta el draft cuando la probabilidad del primer candidato de la cabeza MTP (softmax sobre sus
+10 mejores candidatos, igual con el muestreo del draft en la GPU o en la CPU) queda por debajo: ese token no se propone
+y su fila de verificación no se gasta; si corta en el primer token, tampoco corre el segundo paso del draft. El paso
+del draft que produjo el token cortado sí se paga.
+
+Configuración de producción (build/bin, lookup activo, caché del draft q8_0), NP=1 a 40k, una carga por valor con la
+base primero y último; por carga `acc_rig.py` en greedy y con el muestreo de producción (temp 0.7, top_k 20, top_p
+0.95), 11 peticiones cada uno (prompt corto, prosa y código), `acc_tps.py`:
+
+| `p_min` | Greedy t/s | tokens por paso | ms por paso | Muestreo t/s | tokens por paso | ms por paso |
+|---|---|---|---|---|---|---|
+| 0 (base, primera) | 50.12 | 2.504 | 49.95 | 50.14 | 2.502 | 49.90 |
+| 0.4 | 51.19 | 2.503 | 48.89 | 49.24 | 2.383 | 48.39 |
+| 0.6 | **51.62** | 2.380 | 46.09 | 49.75 | 2.289 | 46.00 |
+| 0.8 | 47.84 | 2.132 | 44.57 | 45.93 | 2.126 | 46.29 |
+| 0 (base, última) | 50.48 | 2.504 | 49.60 | 50.37 | 2.502 | 49.67 |
+
+Contra la media de las dos bases (deriva entre cargas +0.5-0.7 %, mismos tokens y aceptación): greedy +1.8 % (0.4),
+**+2.6 % (0.6)**, −4.9 % (0.8); muestreo −2.0 %, −1.0 %, −8.6 %. En greedy un draft se acepta solo si coincide con
+el argmax del target, y los drafts de baja confianza casi nunca coinciden: a 0.4 los tokens por paso no cambian y el
+paso baja 1.06 ms (la fila de verificación que se ahorra). Con muestreo el servidor acepta el draft si el token que
+muestrea el target coincide (`common_sampler_sample_and_accept_n`): un draft dudoso acierta con la probabilidad que el
+target le da, así que cortarlo pierde más tokens de los que ahorra en tiempo. La ayuda de la opción ya dice "(greedy)",
+pero el código la aplica a cualquier muestreo del target. Un umbral global no se adopta: el muestreo es el default del
+launcher. Un umbral solo para pedidos greedy ganaría ~+2.6 % en ellos y nada en los demás; su valor depende de la
+temperatura que mandan los clientes.
+
+Fuentes: `~/dbg/merge/chain_v92.{sh,out}`, `acc_rig.py`, `acc_tps.py`, `~/dbg/depth/acc-v92*.jsonl`.
