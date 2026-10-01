@@ -11340,6 +11340,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // qwen4exp MTP draft step: the draft block attends densely over its whole cache, one row per step,
+    // with the trunk's heads; f16 is the draft cache's default type, q8_0 the trunk's
+    for (ggml_type type_kv : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t kv : {32768, 131072}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, type_kv, type_kv, {0, 1, 2, 3}, true, false, 0, false));
+        }
+    }
+
     // qwen4exp GDN conv fused with its silu (36 layers, 10240 channels, d_conv 4, ubatch 2048): the padded
     // operand and the history + tokens form
     for (bool split_state : {false, true}) {
