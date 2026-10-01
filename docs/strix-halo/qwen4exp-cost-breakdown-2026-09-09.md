@@ -3229,3 +3229,30 @@ cambio en el núcleo del loader por un ahorro que no aparece en el modelo.
 
 Fuentes: `~/dbg/merge/sp7/fuse_bench.cpp`, `sp7/zba-ceiling-diag.patch`, `chain_v93.{sh,out}`,
 `~/dbg/depth/srvlog-v93*.log`.
+
+## 44. SP5 (el draft dentro de la pasada de verificación): cerrado sin implementar (2026-10-01)
+
+El plan de decode estimaba −2 a −3 ms por paso si la cabeza MTP sacaba el primer draft de cada fila verificada en la
+misma pasada de GPU. El spike se resolvió leyendo el código, sin tiempo de GPU.
+
+**La premisa no se cumple.** El primer paso del draft de la ronda siguiente toma como entrada el token que el target
+muestrea en la fila aceptada y el estado oculto de esa fila: `draft()` usa `id_last = slot.sampled` y `accept()` copia
+a `pending_h` la fila `n_accepted` de `verify_h` (`common/speculative.cpp`). Ese token sale del muestreo del host, con
+temperatura, la gramática de las herramientas y el presupuesto de razonamiento; el muestreo en GPU del server se apaga
+con gramática o presupuesto de razonamiento (sección 25), así que no corre con tráfico de agentes. Dentro de la pasada
+de verificación solo se conocen las entradas del hook (los tokens del lote y el estado oculto de la fila anterior).
+
+**Techo ideal (con el muestreo en el grafo), desde lo medido a 40k (cadena v88):** se quitarían el hook (0.51 ms), el
+primer paso del draft (2.7-2.85) y el hueco entre pasos (0.12), ~3.3-3.5 ms; se agregarían, en serie después del
+tronco, el bloque MTP sobre 3 filas (~0.8 ms) y la cabeza del draft sobre 3 filas en vez de 1 (entre 1.6 ms, la de 1
+fila en iq4_nl, y 2.3 ms, la del target en q6_K con 3 filas): **0.2-1.1 ms por paso**, bajo el umbral de 1.5 ms
+propuesto para el SP5 en todo el rango. A 125k la atención está en los dos lados y el resultado es parecido.
+Precalcular el draft para el argmax de cada fila y volver al camino actual cuando no coincide no supera ese techo y
+paga la cabeza de 3 filas en cada fallo.
+
+**Lo que queda del SP5, chico y sin empezar:**
+- El hook sin la sincronización de host que hoy lo cierra (`llama_synchronize(ctx_dft)` en `process()`, porque dos
+  contextos con trabajo en vuelo bloquean el dispositivo Vulkan): el muestreo del target se solaparía con el trabajo
+  del hook en la GPU. Techo ~0.3 ms por paso; exige resolver ese bloqueo entre contextos.
+- El hook dentro del grafo del target, con la KV del draft compartida (el modo de gemma4 del driver MTP): techo
+  ~0.3-0.5 ms por paso, a cambio de cargar los pesos del bloque MTP en el modelo del target y compartir su KV.
