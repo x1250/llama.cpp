@@ -23,14 +23,11 @@
 #endif
 
 #ifdef FA_SPARSE
-// index mode gathers the cache rows named by the tile's list, staged per tile; compact mode reads the
-// tile's own contiguous rows (flash_attn_sparse_gather.comp)
+// the index mode gathers the cache rows named by the tile's list, staged per tile
 shared uint32_t idxsh[Bc];
-#define KV_ROW(c) (SPARSE_COMPACT ? (j * Bc + (c)) : idxsh[(c)])
-#define FA_COMPACT_ROWS SPARSE_COMPACT
+#define KV_ROW(c) idxsh[(c)]
 #else
 #define KV_ROW(c) (j * Bc + (c))
-#define FA_COMPACT_ROWS false
 #endif
 
 // These need to be supported N,M values for a MatBc x MatBr x 16 coopmatmuladd
@@ -166,24 +163,8 @@ void main() {
         m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * p.KV;
         mo_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * CEIL_DIV(p.nem1, Br) * mo_stride;
     }
-    // first mask row of this tile: the tile's own rows in compact mode
-    uint32_t m_row0 = i * Br;
-#ifdef FA_SPARSE
-    if (SPARSE_COMPACT) {
-        const uint32_t g = compact_tile - p.tile0;              // tile within the dispatch
-        k_offset = (g * p.nek2 + ik2) * p.compact_cap * HSK;   // f16 rows, element units
-        v_offset = (g * p.nev2 + iv2) * p.compact_cap * HSV;
-        if (p.gqa_ratio > 1) {
-            // the rows are the heads of one token: they share the token's mask row of the tile
-            m_offset = (g * Br + gqa_iq1 % Br) * p.compact_cap;
-            m_stride = 0;
-        } else {
-            m_offset = g * Br * p.compact_cap;
-            m_stride = p.compact_cap;
-        }
-        m_row0   = 0;
-    }
-#endif
+    // first mask row of this tile
+    const uint32_t m_row0 = i * Br;
 
     uint32_t mask_opt = 0;
     uint32_t mask_opt_idx = ~0;
@@ -195,12 +176,10 @@ void main() {
 
 #ifdef FA_SPARSE
         // the previous tile's readers of idxsh are done after the barrier at the end of the loop body
-        if (!SPARSE_COMPACT) {
-            if (tid < Bc) {
-                idxsh[tid] = (j * Bc + tid < KV) ? data_idx[list_base + j * Bc + tid] : 0;
-            }
-            barrier();
+        if (tid < Bc) {
+            idxsh[tid] = (j * Bc + tid < KV) ? data_idx[list_base + j * Bc + tid] : 0;
         }
+        barrier();
 #endif
 
         [[unroll]] for (uint32_t idx = 0; idx < mask_cache.length(); ++idx) {
@@ -219,7 +198,7 @@ void main() {
             }
             // Only load if the block is not all zeros
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
-                bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0 && !FA_COMPACT_ROWS;
+                bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
                 [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
@@ -455,10 +434,8 @@ void main() {
             }
         }
 
-        // a block whose mask was loaded may hold columns no valid row of the tile sees: their V rows are zeroed.
-        // Compact sparse rows are exempt: the gather writes every row the tile reads, a selected cell of the
-        // current context or a zero padding row, so nothing stale can reach the product and the direct loads stay
-        const bool masked_block = MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO && !FA_COMPACT_ROWS;
+        // a block whose mask was loaded may hold columns no valid row of the tile sees: their V rows are zeroed
+        const bool masked_block = MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO;
         if (SHMEM_STAGING != 0) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV_pad / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t d = (idx + tid) % (HSV_pad / 4);

@@ -11009,8 +11009,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // sparse K/V (n_kv_max > 0): a backend may attend the finite mask entries only; the reference stays dense.
     // qwen4exp shapes: head 256, 2 KV heads, GQA 12; the bounds keep kv >= 8 x n_kv_max, where the Vulkan
-    // sparse path runs, and the last pairs use the model's own 2051-cell selection. Batches of 64 rows
-    // and more take the compact mode (per-tile gathered rows), the rest the index mode
+    // sparse path runs (the token-major index mode: one list per token), and the last pairs use the model's
+    // own 2051-cell selection
     // With kv_idx the op also receives the candidate columns of every row (the finite ones and masked
     // ones after them, shuffled): the Vulkan index mode builds its lists from them
     for (bool kv_idx : {false, true}) {
@@ -11331,10 +11331,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // qwen4exp QSA attention at depth (head 256, 2 KV heads, GQA 12, q8_0 cache, 2051-cell selection): the
     // token-major sparse index mode, its lists built by scanning the mask rows or from the candidate columns
-    // (512 rows: the token-major index mode of a prefill; 3 rows: the compact mode of a verification batch)
+    // (512 rows: the token-major index mode of a prefill; 1-64 rows: a decode, a verification batch, a short chunk)
     for (bool kv_idx : {false, true}) {
         for (int64_t kv : {32768, 131072}) {
-            for (int64_t nb : {512, 3}) {
+            for (int64_t nb : {512, 64, 16, 8, 3, 1}) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051, kv_idx));
             }
         }
