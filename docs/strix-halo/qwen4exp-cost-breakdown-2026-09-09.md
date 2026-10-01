@@ -3204,3 +3204,28 @@ launcher. Un umbral solo para pedidos greedy ganaría ~+2.6 % en ellos y nada en
 pide temperatura 0 (2026-10-01), así que la palanca queda descartada.
 
 Fuentes: `~/dbg/merge/chain_v92.{sh,out}`, `acc_rig.py`, `acc_tps.py`, `~/dbg/depth/acc-v92*.jsonl`.
+
+## 43. Fusiones de pesos chicos sin transformar el GGUF: sin ganancia en el modelo (2026-10-01, cadena v93)
+
+Candidatas de la verificación (perfil serializado a 40k, cadena v88): el gate y el up del experto compartido (iq4_nl
+2560 → 640, 96 mat-vec de 7.9 µs, más 48 GLU) y las proyecciones z, beta y alpha del GDN (iq4_nl 2560 → 6144, 48 y 48:
+36 × 45 µs y 72 × 5.2 µs), cada grupo con la misma entrada y el mismo tipo. Sin transformar el archivo, la fusión
+exige que el loader arme un tensor con las filas de varios tensores del GGUF (no existe: `TENSOR_SKIP_IF_VIRTUAL` es
+para modelos sin archivo) o una mat-vec del backend con varios pesos (no existe en Vulkan; solo bias y escala
+fusionados).
+
+Techo en el banco (`~/dbg/merge/sp7/fuse_bench.cpp`: 48 capas FFN y 36 GDN con un tensor por peso, fuera de la MALL,
+grafo completo en tiempo real, 3 tokens): separado 3.03-3.06 ms, todo fusionado 2.72-2.78 ms; por grupo, gate+up
+−0.01 ms (las dos mat-vec ya corren en paralelo) y z+beta+alpha −0.26 a −0.29 ms (las dos de 48 filas son casi puro
+costo fijo de dispatch).
+
+Techo en el modelo (cadena v93, build de diagnóstico `sp7/zba-ceiling-diag.patch`: beta y alpha leídos como vistas con
+stride de las filas de z, sin sus dos mat-vec por capa GDN, A B A B A a 40k con `LLAMA_INPUT_TIMING`): el `gpu_wait` de
+la verificación (3 filas) va de 33.91 a 34.58 ms (+0.63 y +0.17 por ronda) y su total de 41.41 a 41.60 ms. **Ningún
+ahorro visible**: como en las candidatas de la sección 36.4, estas mat-vec chicas se solapan con el resto del grafo. La
+medida tiene un sesgo (con números erróneos el texto degenera, aceptación 0.96, y cambia el reparto de los expertos),
+pero ese sesgo favorece a B, que no gana. Las fusiones de pesos sin transformar el GGUF quedan descartadas; no vale un
+cambio en el núcleo del loader por un ahorro que no aparece en el modelo.
+
+Fuentes: `~/dbg/merge/sp7/fuse_bench.cpp`, `sp7/zba-ceiling-diag.patch`, `chain_v93.{sh,out}`,
+`~/dbg/depth/srvlog-v93*.log`.
