@@ -6831,6 +6831,10 @@ struct test_topk_qsa : public test_case {
     const int64_t n_stream;
     const int     width;
     ggml_tensor * out {};
+    // the inputs as initialized, for the comparison
+    std::vector<float>       score_h;
+    std::vector<int32_t>     cell_blk_h;
+    std::vector<ggml_fp16_t> mask_h;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6867,7 +6871,8 @@ struct test_topk_qsa : public test_case {
 
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
 
-    // distinct mask ramp + small scores keep every cell value unique, so no top-k ties
+    // distinct mask ramp + small scores keep every cell value unique up to 2048 cells (the f16 ramp is
+    // exact there); past it cells tie, and the comparison takes any valid choice among the ties
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->op != GGML_OP_NONE) {
@@ -6889,18 +6894,49 @@ struct test_topk_qsa : public test_case {
                 init_tensor_uniform(t, 0.0f, 0.5f);
             }
         }
+        ggml_tensor * score    = ggml_get_tensor(ctx, "score");
+        ggml_tensor * cell_blk = ggml_get_tensor(ctx, "cell_blk");
+        ggml_tensor * kq_mask  = ggml_get_tensor(ctx, "kq_mask");
+        score_h.resize(ggml_nelements(score));
+        cell_blk_h.resize(ggml_nelements(cell_blk));
+        mask_h.resize(ggml_nelements(kq_mask));
+        ggml_backend_tensor_get(score,    score_h.data(),    0, ggml_nbytes(score));
+        ggml_backend_tensor_get(cell_blk, cell_blk_h.data(), 0, ggml_nbytes(cell_blk));
+        ggml_backend_tensor_get(kq_mask,  mask_h.data(),     0, ggml_nbytes(kq_mask));
     }
 
-    // top-k output order is unspecified; compare as a set of indices
+    // the value the graph computes for cell i of row (t, s): its block's score plus its mask entry
+    float cell_value(int64_t row, int32_t i) const {
+        const int64_t t = row % n_tps;
+        const int64_t s = row / n_tps;
+        const int32_t b = cell_blk_h[s * n_kv + i];
+        return score_h[(s * n_tps + t) * n_blocks + b] + ggml_fp16_to_fp32(mask_h[(s * n_tps + t) * n_kv + i]);
+    }
+
+    // top-k output order is unspecified and any choice among tied cells is valid: per row, the
+    // selected values must be the same multiset (the same index set when no cells tie)
     double err(const float * a, const float * b, size_t n) override {
-        std::vector<int32_t> ia(n), ib(n);
         double diff = 0.0;
-        for (size_t i = 0; i < n; i++) {
-            ia[i] = (int32_t) a[i];
-            ib[i] = (int32_t) b[i];
-            diff += std::fabs(a[i] - ia[i]) + std::fabs(b[i] - ib[i]);
+        size_t mismatched = 0;
+        for (size_t r = 0; r < n / width; r++) {
+            std::vector<float> va(width), vb(width);
+            for (int j = 0; j < width; j++) {
+                const int32_t ia = (int32_t) a[r * width + j];
+                const int32_t ib = (int32_t) b[r * width + j];
+                diff += std::fabs(a[r * width + j] - ia) + std::fabs(b[r * width + j] - ib);
+                if (ia < 0 || ia >= n_kv || ib < 0 || ib >= n_kv) {
+                    return 1.0;
+                }
+                va[j] = cell_value(r, ia);
+                vb[j] = cell_value(r, ib);
+            }
+            std::sort(va.begin(), va.end());
+            std::sort(vb.begin(), vb.end());
+            for (int j = 0; j < width; j++) {
+                mismatched += va[j] != vb[j];
+            }
         }
-        return diff + jdst(ia.data(), ib.data(), n);
+        return diff + (double) mismatched / n;
     }
 };
 
@@ -10742,6 +10778,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
+    // the model's shape at 40k (9920 blocks of 4 cells, 2051 selected) for a decode, a speculative
+    // verification and a few rows more: the rows spread over several workgroups each
+    for (int64_t n_tps : {1, 3, 8}) {
+        test_cases.emplace_back(new test_topk_qsa(9920, 39680, n_tps, 1, 2051));
+    }
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
