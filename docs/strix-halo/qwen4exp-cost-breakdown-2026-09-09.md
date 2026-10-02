@@ -3352,5 +3352,37 @@ de varias filas y el sparse va token por token, así que el softmax online reesc
 decode los dos agrupan por token y redondean igual. La referencia de la compuerta (fusiones apagadas) perturba poco a
 16k (0.0027) frente a 32k (0.0105), y por eso P falla por 8.7× y la misma desviación a 32k queda en 2.15×.
 
+**Prueba de precisión contra la atención exacta** (2026-10-02, `~/dbg/merge/sp8/`): `fa_dump` (sobre la base) vuelca
+las entradas y la salida de tres atenciones QSA (capas 3, 27 y 47) del ubatch de prefill a 12288 celdas de un prompt de
+15.3k tokens (Q f32, la caché K/V q8_0, la máscara con la selección, 2051 celdas por fila, y las listas); `fa_replay`
+corre esas mismas entradas en la GPU por el camino denso (idéntico byte a byte a la salida del modelo) y por el sparse
+(`use_sparse=1`, modo índice por token); `fa_exact.py` calcula la atención exacta en float64. Error relativo (RMS):
+
+| Capa | Denso contra el exacto | Sparse contra el exacto | Sparse − denso |
+|---|---|---|---|
+| 3 | 1.734e-4 | 1.735e-4 | 1.51e-5 |
+| 27 | 1.406e-4 | 1.407e-4 | 1.54e-5 |
+| 47 | 1.826e-4 | 1.830e-4 | 1.26e-5 |
+
+El umbral nuevo también pasa a sparse la verificación (ubatch de 3) entre 4.1k y 16.4k celdas, con otros kernels que
+ningún modo de la compuerta puntúa en ese rango (d puntúa bajo 4.1k, D sobre 16k). Los últimos 3 tokens de los mismos
+volcados, repetidos por los dos caminos con ubatch de 3 (el log confirma `use_sparse=1` con `neq1=3`):
+
+| Capa | Denso (ubatch 3) contra el exacto | Sparse (ubatch 3) contra el exacto | Sparse − denso |
+|---|---|---|---|
+| 3 | 1.771e-4 | 1.781e-4 | 2.16e-5 |
+| 27 | 1.495e-4 | 1.510e-4 | 2.07e-5 |
+| 47 | 1.693e-4 | 1.718e-4 | 3.10e-5 |
+
+Con ubatch de 2048 los dos caminos quedan a 0.25 % o menos uno del otro en su error contra el exacto (mismos errores
+máximos); con ubatch de 3, a 0.6-1.5 % (3 tokens, muestra chica), menos de lo que se separan entre sí los dos kernels
+densos (el de prefill, 1.746/1.477/1.656e-4 en esos mismos 3 tokens, contra el de ubatch 3: 1.1-2.2 %). En los dos casos
+sparse y denso se separan entre sí ~8-10 veces menos de lo que cada uno se aparta del exacto: el camino sparse no pierde
+precisión, la diferencia es redondeo. El KLD de 0.023 del modo P es consistente con esa diferencia amplificada por 48
+capas y el estado recurrente a lo largo de miles de tokens (inferencia: la equivalencia está medida por nodo, el PPL es
+igual dentro del ruido); la referencia de la compuerta (las fusiones apagadas) mueve otros nodos y queda más chica a 16k,
+así que la regla formal falla sin una pérdida medible.
+
 Fuentes: `~/dbg/merge/chain_v9{5,6,7}.{sh,out}`, `prefill_cmp.py`, `quality_gate.inc.sh` (modo P),
+`~/dbg/merge/sp8/{fa_dump.cpp,fa_replay.cpp,fa_exact.py}`,
 `~/dbg/depth/ppl-v96q*.log`, `ppl-v97*.log`, `~/dbg/merge/bin-v96new` (el build nuevo).
