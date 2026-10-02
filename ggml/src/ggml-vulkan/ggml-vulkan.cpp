@@ -11829,10 +11829,12 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // path cannot take runs dense.
     static const bool disable_sparse_fa = getenv("GGML_VK_DISABLE_SPARSE_FA") != nullptr;
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
-    // below 8 x n_kv_max the tiles' cell unions cover most of the cache (52% at 8k, 33% at 16k for the
-    // 2051-cell QSA selection) and the list prepass costs more than the gather saves: measured -2% at 8k
-    // and neutral at 16k on gfx1151, so the sparse path starts at 8 x n_kv_max
-    const bool sparse_candidate = !disable_sparse_fa && n_kv_max > 0 && mask != nullptr && (uint64_t) n_kv_max * 8 <= KV &&
+    // the token-major index mode attends each token's own list, so its cost does not grow with the cache while
+    // the dense path's does: for the 2051-cell QSA selection on gfx1151 the sparse path costs 22-25 ms per layer
+    // for a 2048-token ubatch from 4k to 16k cells and 57-60 us for a 3-token verification, the dense one 17.6 ms
+    // at 4k, 40 at 8k and 74 at 16k in the model. From 2 x n_kv_max the sparse path wins (a prefill ubatch at 4k
+    // stays dense)
+    const bool sparse_candidate = !disable_sparse_fa && n_kv_max > 0 && mask != nullptr && (uint64_t) n_kv_max * 2 <= KV &&
                                   k->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_BF16 &&
                                   ctx->device->coopmat1_fa_support && ctx->device->subgroup_ballot &&
                                   ctx->device->properties.limits.maxPushConstantsSize >= sizeof(vk_flash_attn_sparse_push_constants);

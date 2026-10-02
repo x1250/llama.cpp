@@ -11008,14 +11008,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
 
     // sparse K/V (n_kv_max > 0): a backend may attend the finite mask entries only; the reference stays dense.
-    // qwen4exp shapes: head 256, 2 KV heads, GQA 12; the bounds keep kv >= 8 x n_kv_max, where the Vulkan
-    // sparse path runs (the token-major index mode: one list per token), and the last pairs use the model's
-    // own 2051-cell selection
+    // qwen4exp shapes: head 256, 2 KV heads, GQA 12; the bounds keep kv >= 2 x n_kv_max, where the Vulkan
+    // sparse path runs (the token-major index mode: one list per token), except 4096 cells with the model's
+    // 2051-cell selection, just under it (the dense path); the pairs with 2051 use that selection
     // With kv_idx the op also receives the candidate columns of every row (the finite ones and masked
     // ones after them, shuffled): the Vulkan index mode builds its lists from them
     for (bool kv_idx : {false, true}) {
         for (const auto & c : std::vector<std::tuple<int64_t, int, int64_t>>{{4096, 1, 64}, {4096, 3, 512}, {4096, 512, 64}, {16384, 1, 1024},
-                                                                              {16384, 16, 64}, {16384, 64, 1024}, {32768, 1, 2051}, {32768, 3, 2051},
+                                                                              {16384, 16, 64}, {16384, 64, 1024}, {4096, 3, 2051}, {6144, 3, 2051},
+                                                                              {8192, 512, 2051}, {12288, 1, 2051}, {32768, 1, 2051}, {32768, 3, 2051},
                                                                               {32768, 128, 2051}, {131072, 3, 2051}, {131072, 128, 2051}, {131072, 512, 2051}}) {
             for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, std::get<0>(c), std::get<1>(c), true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, std::get<2>(c), kv_idx));
@@ -11349,6 +11350,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (int64_t nb : {512, 64, 16, 8, 3, 1}) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051, kv_idx));
             }
+        }
+    }
+
+    // qwen4exp QSA attention between 2 and 8 x the selection (4k-16k cells), a prefill ubatch and a verification
+    // batch: the sparse path starts at 2 x n_kv_max (it started at 8 x when it attended the tiles' cell unions)
+    for (int64_t kv : {4096, 6144, 8192, 12288, 16384}) {
+        for (int64_t nb : {2048, 3}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051, true));
         }
     }
 
