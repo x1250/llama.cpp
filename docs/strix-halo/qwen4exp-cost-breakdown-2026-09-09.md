@@ -3256,3 +3256,55 @@ paga la cabeza de 3 filas en cada fallo.
   del hook en la GPU. Techo ~0.3 ms por paso; exige resolver ese bloqueo entre contextos.
 - El hook dentro del grafo del target, con la KV del draft compartida (el modo de gemma4 del driver MTP): techo
   ~0.3-0.5 ms por paso, a cambio de cargar los pesos del bloque MTP en el modelo del target y compartir su KV.
+
+## 45. El nodo de expertos gate/up del prefill: qué lo limita (2026-10-02, cadena v94)
+
+Perfil del prefill a 40k (perf logger serializado, cadena v88): el MUL_MAT_ID gate+up IQ3_S (512 expertos de 10, 1280
+filas, k 2560, 2048 tokens) cuesta 15.4 ms por capa, 47 por ubatch, ~0.72 s de cada ubatch (~21 % del prefill).
+
+Banco (`test-backend-ops perf`, casos de 6864cb221, misma forma):
+
+| Pesos | Bytes de A | Tiempo | | Tokens (filas por experto) | IQ3_S | Q4_0 |
+|---|---|---|---|---|---|---|
+| F16 | 3.36 GB | 21.8 ms | | 1024 (~20) | 13.0 ms | 9.4 ms |
+| Q8_0 | 1.78 GB | 14.2 ms | | 2048 (~40) | 14.7 ms | 11.7 ms |
+| IQ4_NL | 0.94 GB | 13.0 ms | | 4096 (~80) | 22.6 ms | 21.2 ms |
+| Q4_0 | 0.94 GB | 11.7 ms | | | | |
+| IQ3_S (producción) | 0.72 GB | 14.7 ms | | | | |
+
+El nodo tiene un costo casi fijo por ubatch: extrapolado a cero tokens, ~11 ms con IQ3_S y ~7 ms con Q4_0. Es la
+pasada que lee y desquantiza los pesos de los 512 expertos una vez por ubatch, cualquiera sea el número de tokens
+(~75 % del nodo con 2048); la diferencia entre tipos es el desquantizado (la búsqueda en la rejilla de IQ3_S, ~3 ms
+más que Q4_0). Las estadísticas de RADV (`RADV_DEBUG=shaderstats`, sin caché de shaders) del kernel coopmat: 132
+VGPRs, 8-10 subgrupos por SIMD, ~3700-3800 instrucciones con Q4_0 o IQ3_S (el desquantizado no domina el código). El
+bucle de `mul_mm.comp` carga A y B a memoria compartida, sincroniza y multiplica bloque a bloque, sin superponer la
+carga del bloque siguiente con el cálculo del actual: la latencia solo se esconde entre workgroups. Con B en f16 la
+ruta de Vulkan no existe para MUL_MAT_ID (falla `support_fp32acc`).
+
+Ubatch 4096 (la ventana 1 de la sección 29.7; la pasada fija se paga la mitad de veces), cadena v94: build de
+producción, NP=1, ctx 57344, sin el draft MTP en ninguna carga (con el draft la huella de ubatch 4096, ~70 GiB,
+dejaba menos de 40 GiB de margen; `llama-fit-params`: los compute buffers del target pasan de 5.9 a 8.8 GiB), cargas
+2048, 4096, 2048:
+
+| Prompt | ubatch 2048 (primera / última) | ubatch 4096 |
+|---|---|---|
+| Prosa 39.5k, prefill completo | 62.24 / 62.16 s | 61.98 s (−0.4 %) |
+| Código 41.5k, prefill completo | 66.50 / 66.46 s | 64.71 s (−2.7 %) |
+| Agente 4.7k, prefill completo | 7.99 / 8.03 s | 7.74 s (−3 %) |
+| Pregunta nueva sobre el prefijo (re-prefill desde el último checkpoint) | 3.45 s, 2050 tokens | 6.35 s, 4098 tokens |
+
+El ahorro del nodo casi no aparece en el prefill completo, y el re-prefill de cada turno se duplica (los checkpoints
+van atados al ubatch): para el tráfico de agentes, ubatch 4096 pierde. Descartado. Lo que queda contra la pasada fija
+es trabajo de kernel: superponer la carga de A del bloque siguiente con el cálculo (cambio de `mul_mm.comp`, que
+comparten todos los tipos; ganancia sin estimar) o un desquantizado de IQ3_S más barato (hasta ~3 ms por nodo, el
+techo de Q4_0); cambiar el tipo de los expertos es transformar el GGUF y agrega ~10 GB.
+
+**Hallazgo aparte: la atención del prefill por debajo del umbral sparse.** El mismo perfil, por capa (12 capas QSA):
+con 2048 consultas, la atención densa cuesta 28.7 ms a 6k celdas, 40.0 a 8k, 49.8 a 10k, 58.9 a 12k, 64.8 a 14k y
+73.9 a 16k; desde 18k, donde la atención sparse se activa (`KV >= 8 × n_kv_max` en Vulkan), 24.3-24.8 ms en todo el
+rango hasta 32k. Todo prompt de más de ~18k tokens paga en sus primeros 16k ~2.0 s de atención densa por encima de lo
+que costaría la sparse (suma de los excesos por ubatch de 6k a 16k). Bajar el umbral para los lotes de prefill es un
+cambio chico del backend; mueve el redondeo (la regla del 2026-09-30) y a 4k la densa todavía gana (17.6 ms).
+
+Fuentes: `~/dbg/merge/chain_v94.{sh,out}`, `prefill_rig.py`, `~/dbg/depth/srvlog-v88pa.log`,
+`~/dbg/depth/prefill-v94*.jsonl`.
