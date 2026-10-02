@@ -3308,3 +3308,49 @@ cambio chico del backend; mueve el redondeo (la regla del 2026-09-30) y a 4k la 
 
 Fuentes: `~/dbg/merge/chain_v94.{sh,out}`, `prefill_rig.py`, `~/dbg/depth/srvlog-v88pa.log`,
 `~/dbg/depth/prefill-v94*.jsonl`.
+
+## 46. La atención sparse desde 2 × la selección: rápida, pero falla la compuerta nueva de prefill (2026-10-02, cadenas v95-v97)
+
+El umbral de la atención sparse (`KV >= 8 × n_kv_max`, 16.4k celdas con la selección de 2051) venía del modo de uniones
+de celdas por tile, que perdía por debajo de 16k. El modo índice por token que se usa hoy cuesta lo mismo a cualquier
+profundidad (banco: 22.3-24.6 ms por capa para un ubatch de 2048 de 4k a 16k celdas, 57-60 µs para una verificación de
+3 filas), mientras la densa crece con las celdas (modelo: 17.6 ms a 4k, 40 a 8k, 74 a 16k; sección 45). Cambio a
+`2 × n_kv_max` (72ef1f1ef, local): un ubatch de prefill a 4k sigue denso, desde 6k sparse.
+
+Velocidad (cadena v95, build de diagnóstico con el umbral por variable, configuración de producción, NP=1, A B A B A):
+prefill de prosa de 39.5k 67.86-68.09 → 65.53-65.82 s y de código de 41.5k 70.93-71.28 → 68.81-68.90 s (−3.4 %);
+re-prefills y el prompt de agente de 4.7k sin cambio; decode con un contexto de 9.8k −0.86 ms por paso en greedy
+(IC 95 % [−0.865, −0.858]), −1.46 con muestreo, total de la verificación −1.06 ms. Correctitud: FLASH_ATTN_EXT
+5237/5237, con casos nuevos a 6k, 8k y 12k celdas con la selección del modelo y uno justo debajo del umbral.
+
+Adopción (cadena v96): compuerta de historia 1; compuerta de calidad con un modo nuevo, P (ubatches de 2048 sobre dos
+chunks de 16k: el prefill a 6-16k, que ningún modo recorría), además de p, d y D:
+
+| Modo | Referencia (fusiones apagadas) KLD / top | Nuevo KLD / top | |
+|---|---|---|---|
+| p (4k, ub 2048) | 0.0028 / 98.55 % | 0.0000 / 100 % | pasa (a 4k nada cambia) |
+| d (4k, ub 3) | 0.0207 / 96.04 % | 0.0000 / 100 % | pasa |
+| D (32k, ub 3) | 0.0118 / 95.53 % | 0.0118 / 95.69 % | pasa |
+| **P (16k, ub 2048)** | **0.0027 / 98.02 %** | **0.0234 / 94.92 %** | **falla** (8.7×, −3.1 puntos) |
+
+La cadena se detuvo ahí (las demás compuertas no cambian el veredicto) y `build/bin` volvió a la base; el commit
+quedó sin publicar.
+
+Diagnóstico (cadena v97, sobre la base de producción, un chunk de 32k, mitad puntuada a 16-32k donde la base ya usa el
+camino sparse; denso = `LLAMA_QSA_NO_SPARSE_FA=1`, la atención con máscara, la semántica exacta):
+
+| Camino | Referencia KLD / top | Denso contra sparse KLD / top | ΔPPL denso − sparse |
+|---|---|---|---|
+| Prefill (ub 2048) | 0.0105 / 95.57 % | 0.0226 / 93.85 % | −0.001 ± 0.008 |
+| Decode (ub 3) | 0.0118 / 95.53 % | 0.0116 / 95.55 % | −0.001 ± 0.006 |
+
+El camino sparse del decode coincide con el denso a nivel de redondeo. El del prefill se aparta ~2× la referencia, con
+la misma perplejidad dentro del ruido (en el modo P también: −0.009 ± 0.006). Es la misma desviación que falló en P,
+y ya existe en producción para todo prompt de más de 16k desde que se adoptó el camino sparse del prefill; ninguna
+compuerta la había medido. Lectura (inferencia, sin verificar en el shader): en prefill el camino denso procesa tiles
+de varias filas y el sparse va token por token, así que el softmax online reescala P (en f16) en otra secuencia; en el
+decode los dos agrupan por token y redondean igual. La referencia de la compuerta (fusiones apagadas) perturba poco a
+16k (0.0027) frente a 32k (0.0105), y por eso P falla por 8.7× y la misma desviación a 32k queda en 2.15×.
+
+Fuentes: `~/dbg/merge/chain_v9{5,6,7}.{sh,out}`, `prefill_cmp.py`, `quality_gate.inc.sh` (modo P),
+`~/dbg/depth/ppl-v96q*.log`, `ppl-v97*.log`, `~/dbg/merge/bin-v96new` (el build nuevo).
