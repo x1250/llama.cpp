@@ -11296,6 +11296,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // gate and up merged in one tensor (ffn_gate_up_exps): m = 1280 in one node instead of two of 640
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 1280, 2048, 2560));
     }
+    // the merged gate+up in weight types with a cheaper A path (no grid lookup, plain blocks, no dequantization):
+    // how much of the node is loading and dequantizing A and how much the kernel's structure
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 1280, 2048, 2560));
+    }
+    // and at half and twice the ubatch: the weights read are about the same (nearly every expert is hit), the
+    // activations and the useful work scale with the tokens
+    for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_Q4_0}) {
+        for (int n : {1024, 4096}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
+        }
+    }
 
     // qwen4exp down experts (512 of which 10, m=2560 k=640) as iq4_nl: the integer-dot path at the prefill and
     // verify batch sizes, 40 rows per expert at 2048
