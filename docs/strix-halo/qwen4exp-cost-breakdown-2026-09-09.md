@@ -3315,7 +3315,7 @@ El umbral de la atención sparse (`KV >= 8 × n_kv_max`, 16.4k celdas con la sel
 de celdas por tile, que perdía por debajo de 16k. El modo índice por token que se usa hoy cuesta lo mismo a cualquier
 profundidad (banco: 22.3-24.6 ms por capa para un ubatch de 2048 de 4k a 16k celdas, 57-60 µs para una verificación de
 3 filas), mientras la densa crece con las celdas (modelo: 17.6 ms a 4k, 40 a 8k, 74 a 16k; sección 45). Cambio a
-`2 × n_kv_max` (72ef1f1ef, local): un ubatch de prefill a 4k sigue denso, desde 6k sparse.
+`2 × n_kv_max` (72ef1f1ef): un ubatch de prefill a 4k sigue denso, desde 6k sparse.
 
 Velocidad (cadena v95, build de diagnóstico con el umbral por variable, configuración de producción, NP=1, A B A B A):
 prefill de prosa de 39.5k 67.86-68.09 → 65.53-65.82 s y de código de 41.5k 70.93-71.28 → 68.81-68.90 s (−3.4 %);
