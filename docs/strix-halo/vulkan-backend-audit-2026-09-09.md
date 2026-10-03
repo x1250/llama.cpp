@@ -261,7 +261,9 @@ Tres modos, elegidos en `V:11737-11774`:
 Umbral (`V:11747-11750`): `n_kv_max > 0` (op_param 4), hay máscara,
 `n_kv_max * 8 <= KV`, K/V no BF16, coopmat1 y ballot disponibles. El comentario documenta la
 medición: por debajo de 8 × n_kv_max la unión de celdas de los tiles cubre casi toda la caché
-(52 % a 8k, 33 % a 16k con la selección de 2051 celdas).
+(52 % a 8k, 33 % a 16k con la selección de 2051 celdas). **2026-10-02 (72ef1f1ef): el umbral es
+`n_kv_max * 2 <= KV`**: el modo índice por token cuesta lo mismo a cualquier profundidad y gana a la
+densa desde 2 × la selección (cost breakdown, sección 46).
 
 Estructuras en `prealloc_y` (`V:11913-11921`): `counts[n_lists]`, luego
 `lists[n_lists][list_stride]`, y en modo troceado `chunk_counts[n_lists][n_chunks]`.

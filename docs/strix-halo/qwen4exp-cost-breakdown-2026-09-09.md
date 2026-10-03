@@ -3309,7 +3309,7 @@ cambio chico del backend; mueve el redondeo (la regla del 2026-09-30) y a 4k la 
 Fuentes: `~/dbg/merge/chain_v94.{sh,out}`, `prefill_rig.py`, `~/dbg/depth/srvlog-v88pa.log`,
 `~/dbg/depth/prefill-v94*.jsonl`.
 
-## 46. La atención sparse desde 2 × la selección: rápida, pero falla la compuerta nueva de prefill (2026-10-02, cadenas v95-v97)
+## 46. La atención sparse desde 2 × la selección: adoptada, con una excepción aceptada en la compuerta de prefill (2026-10-02, cadenas v95-v98)
 
 El umbral de la atención sparse (`KV >= 8 × n_kv_max`, 16.4k celdas con la selección de 2051) venía del modo de uniones
 de celdas por tile, que perdía por debajo de 16k. El modo índice por token que se usa hoy cuesta lo mismo a cualquier
@@ -3333,8 +3333,8 @@ chunks de 16k: el prefill a 6-16k, que ningún modo recorría), además de p, d 
 | D (32k, ub 3) | 0.0118 / 95.53 % | 0.0118 / 95.69 % | pasa |
 | **P (16k, ub 2048)** | **0.0027 / 98.02 %** | **0.0234 / 94.92 %** | **falla** (8.7×, −3.1 puntos) |
 
-La cadena se detuvo ahí (las demás compuertas no cambian el veredicto) y `build/bin` volvió a la base; el commit
-quedó sin publicar.
+La cadena se detuvo ahí (las demás compuertas no cambian el veredicto) y `build/bin` volvió a la base, a la espera de
+la decisión del Director.
 
 Diagnóstico (cadena v97, sobre la base de producción, un chunk de 32k, mitad puntuada a 16-32k donde la base ya usa el
 camino sparse; denso = `LLAMA_QSA_NO_SPARSE_FA=1`, la atención con máscara, la semántica exacta):
@@ -3383,6 +3383,31 @@ capas y el estado recurrente a lo largo de miles de tokens (inferencia: la equiv
 igual dentro del ruido); la referencia de la compuerta (las fusiones apagadas) mueve otros nodos y queda más chica a 16k,
 así que la regla formal falla sin una pérdida medible.
 
-Fuentes: `~/dbg/merge/chain_v9{5,6,7}.{sh,out}`, `prefill_cmp.py`, `quality_gate.inc.sh` (modo P),
+**Adopción** (cadena v98, 2026-10-02 22:00-23:30). El Director aceptó el resultado del modo P como excepción, acotada a
+lo evaluado (KLD del build nuevo ≤ 1.1 × 0.023432 y top ≥ 94.92 − 0.5), y aprobó un quinto modo en la compuerta, M
+(ubatches de 3 sobre un chunk de 16k, puntuado a 8-16k: la verificación sparse entre el umbral nuevo y 16k, que ningún
+modo puntuaba). Todas las compuertas desde cero, sobre el build de HEAD (`libggml-vulkan` idéntica byte a byte a la de
+v96):
+
+| Compuerta | Resultado |
+|---|---|
+| Historia (MTP y lookup apagados y los de producción) | 1024/1024 tokens idénticos en los dos |
+| Calidad p / d / D | pasan, mismos valores que v96 (p y d idénticos a la base: KLD 0, top 100 %) |
+| Calidad P | 0.023432 / 94.921 %, idéntico a v96: dentro de la excepción |
+| **Calidad M (nueva)** | referencia 0.0125 / 96.90 %, nuevo **0.0128 / 96.89 %** (1.02×): pasa; ΔPPL −0.005 |
+| depth_repro + depth_repeat a 40k | determinista (lote chico y re-prefill por lotes) |
+| graph_diff4, división del servidor | 72 nodos (los de siempre) |
+| Producción NP=2: probe ×5, conversación con imagen, imagen 2048×2048 | 1 distribución, 5/5 turnos, 12.7 s |
+| Timeouts de anillo | 0 |
+
+El modo M confirma a nivel modelo lo que la prueba de precisión mostró por nodo: la verificación sparse entre 8k y 16k
+se aparta de la base lo mismo que el puro redondeo (1.02 × la referencia).
+
+Velocidad (NP=1, base A B B A): prefill de 39.5k 65.28 / 65.42 s → 63.34 / 63.27 s (−3.1 %); en producción (NP=2,
+servidores frescos) 65.66 → 63.85 s. El prompt de 15k del rig NP=2 (con el otro slot decodificando, una muestra):
+42.7 → 39.2 s. El decode a 40k no cambia (ahí los dos builds ya usaban el camino sparse); las respuestas difieren de
+la base (redondeo, informado) y son idénticas entre cargas del mismo build.
+
+Fuentes: `~/dbg/merge/chain_v9{5,6,7,8}.{sh,out}`, `prefill_cmp.py`, `quality_gate.inc.sh` (modos P y M),
 `~/dbg/merge/sp8/{fa_dump.cpp,fa_replay.cpp,fa_exact.py}`,
-`~/dbg/depth/ppl-v96q*.log`, `ppl-v97*.log`, `~/dbg/merge/bin-v96new` (el build nuevo).
+`~/dbg/depth/ppl-v9{6,8}q*.log`, `ppl-v97*.log`, `~/dbg/merge/bin-v98new` (el build adoptado).
