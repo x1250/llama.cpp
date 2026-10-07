@@ -7,20 +7,20 @@ TheRock en `~/rocm/install` (`~/dbg/strata/build.sh`). Herramientas y salidas: `
 
 ## 0. Resultado
 
-**Strata (fork, 3 cambios) con el GGUF UD-small supera al llama.cpp de producción en todo lo medido, con la misma
-memoria:** decode +16 % de media (+7 a +29 % por celda; +13 % a 125k), lectura del prompt 2.2-2.5×, perplejidad ~1 %
-mejor, la mitad de distancia a UD-IQ4_XS, y el arranque del pensamiento del incidente en tema el 98 % de las veces
-(contra 49-58 % con el GGUF de producción).
+**Strata (fork, 3 cambios) con el GGUF UD-small decodifica 16-18 % más rápido que el llama.cpp de producción, lee el
+prompt 2.2-2.5× más rápido y ocupa la misma memoria;** el GGUF UD-small además está más cerca del modelo (la mitad de
+distancia a UD-IQ4_XS, perplejidad ~1 % mejor) y arranca el pensamiento en tema mucho más seguido.
 
 | | llama.cpp, producción | Strata + UD-small |
 |---|---|---|
 | Prompt 40k / 125k | 618 / 537 t/s | 1379 / 1338 t/s |
-| Decode medio (corto, prosa y código 40k, dos turnos) | 49.7 t/s | 57.7 t/s |
-| Decode a 125k (primer / segundo turno) | 40.9 / 45.6 | 46.2 / 48.4 (con el GGUF de producción) |
-| Pesos sin la PLE | 56.5 GiB (+2.05 draft, +0.86 mmproj) | 57.4 GiB (+0.9 draft) |
-| GTT a 65k de contexto | 66.7 GiB | 66.2 GiB |
-| KL contra UD-IQ4_XS (wiki 4k / código 4k) | 0.156 / 0.073 | 0.085 / 0.036 |
-| Primer pensamiento del incidente en tema | 58 % (1000) | 98 % (400) |
+| Decode medio, greedy sin pensamiento (corto, prosa y código 40k, dos turnos) | 49.7 t/s | 57.7 t/s (+16 %) |
+| Decode medio, muestreador de pi con pensamiento (los mismos prompts) | 51.7 t/s | 61.2-61.8 t/s (+18 %) |
+| Decode a 125k, greedy (primer / segundo turno) | 40.9 / 45.6 | 46.2 / 48.4 (con el GGUF de producción) |
+| GTT a 65k de contexto | 66.7 GiB (mmproj incluido) | 66.2 GiB (sin codificador de imágenes) |
+| Pesos sin la PLE (la definición de `config.ini`) | 56.5 GiB | 57.4 GiB |
+| Fidelidad del GGUF: KL contra UD-IQ4_XS, medido en llama.cpp (wiki 4k / código 4k) | 0.156 / 0.073 | 0.085 / 0.036 |
+| Primer pensamiento del incidente: en tema / genérico / ajeno | 57 / 43 / 0.4 % (1000) | 98 / 2 / 0 % (400) |
 
 Los 3 cambios del fork (`x1250/Strata`, local): 310bfe4 (las páginas del archivo se liberan a medida que los
 expertos llegan a la GPU: sin esto la carga lleva MemFree a cero), 2485459 (la lectura de las hyper-connections en el
@@ -28,18 +28,16 @@ IQ4_NL del GGUF: −6 ms por ventana) y la configuración (`--mtp-hnorm stream`,
 nuestra; un subconjunto de vocabulario del draft hecho con las salidas de pi; `--mtp-window 8192`). Configuración
 reproducible: `~/dbg/strata/prod/strata-qwen38flash-strix.json` y `env.sh`.
 
-**El pensamiento ajeno al contexto no es un defecto del motor:** aparece en los dos, y lo que más mueve el arranque
-del pensamiento es el GGUF. Los tensores densos chicos de nuestra receta (routers, hyper-connections, compuertas de la
-GDN, experto compartido, PLE key/value y embedding, cuantizados más que en UD; cuál de ellos pesa no está aislado)
-alejan al modelo de UD; devolverlos a su formato de UD (UD-small, +0.93 GiB) mejora la perplejidad, reduce la distancia
-a la mitad y cambia el arranque del pensamiento. La
-posición del incidente es un casi empate entre "I" y "The": su frecuencia la mueve también la numérica del motor
-(sección 5), así que lo robusto es la fidelidad (sección 6), no un solo contexto.
+**El pensamiento ajeno al contexto no es un defecto del motor y no se demuestra que baje:** aparece en los dos motores
+a ~0.4 % en el contexto del incidente, y cero en 400 muestras con UD-small no alcanza para afirmar una mejora. Lo que
+UD-small sí cambia, en los dos motores, es la fidelidad al modelo y el arranque genérico ("I need to investigate this
+further…", de ~43 % a 2-17 %). Los tensores densos chicos de nuestra receta (routers, hyper-connections, compuertas de
+la GDN, experto compartido, PLE key/value y embedding, cuantizados más que en UD; cuál de ellos pesa no está aislado)
+alejan al modelo de UD; devolverlos a su formato de UD cuesta 0.93 GiB. La posición del incidente es un casi empate
+entre "I" y "The" que la numérica de cada motor también mueve (sección 5), así que lo robusto es la fidelidad (sección 6).
 
-**Pendiente para reemplazar producción (decisión del Director):** codificador de imágenes en GPU (el `strata-vision`
-de Strata solo trae CPU en AMD; compilarlo contra `mtmd` con Vulkan), dos slots a 262144 (`"parallel": 2` con
-`--batch-mtp`, sin medir), la integración con pi por la API de Strata y las compuertas de determinismo equivalentes a
-las del fork.
+**Pendiente para reemplazar producción (sección 8):** determinismo de Strata entre cargas, pi a través de su servidor
+(plantilla y tool calls), codificador de imágenes en GPU, dos slots a 262144.
 
 ## 1. Cómo corre aquí sin duplicar los expertos ni usar la CPU
 
@@ -153,6 +151,23 @@ contexto 131072, una carga por motor (`depth125.sh`; Strata en la configuración
 | Decode, primer / segundo turno | 46.2 / 48.4 t/s | 40.9 / 45.6 t/s |
 | GTT pico / MemFree mínimo | 66 / 33 GiB | 69 / 33 GiB |
 
+### 3.5 Con el muestreador de pi y pensamiento (barrido s7)
+
+`BENCH_SAMPLING=pi` (T 0.7, top-k 20, top-p 0.95, min-p 0, semilla 1, pensamiento medium), los mismos prompts:
+
+| Decode, t/s (primer / segundo turno) | Corto | Prosa 40k | Código 40k | Media |
+|---|---|---|---|---|
+| Strata + UD-small, `--spec-min-p 0.5` (primera / última) | 63.5 / 67.0 · 62.8 / 67.3 | 57.0 / 61.1 · 59.2 / 63.0 | 59.9 / 58.9 · 59.7 / 59.0 | 61.2 · 61.8 |
+| Ídem, `--spec-min-p 0.2` / `0` | 64.5 / 64.6 · 65.7 / 64.3 | 56.8 / 60.5 · 56.6 / 59.5 | 60.6 / 56.6 · 59.7 / 57.1 | 60.6 · 60.5 |
+| llama.cpp, producción | 57.5 / 50.3 | 50.1 / 53.8 | 48.6 / 50.1 | 51.7 |
+| llama.cpp, UD-small (layout separado, sin las fusiones gate+up y down+inject) | 51.0 / 44.3 | 47.7 / 51.6 | 46.4 / 48.8 | 48.3 |
+
+Bajo muestreo la ventaja se mantiene (+18 % de media) y el umbral de confianza del draft por defecto sigue siendo el
+mejor. Un primer cálculo desde los logs del estudio de muestreo daba paridad (48.0 contra 48.2 t/s) porque llama.cpp
+cortaba en `</think>` (~16 tokens por petición) y Strata generaba 60. En llama.cpp, UD-small en su layout
+separado decodifica 7 % menos que el GGUF de producción (que lleva las fusiones de las secciones 15 y 7 del cost
+breakdown); una versión fusionada recuperaría parte.
+
 ## 4. Calidad: los mismos tokens en los dos motores
 
 Logprobs teacher-forced por posición (top 20): Strata con su `STRATA_LOGPOS` (`strata_logpos.py`, el motor por stdin),
@@ -178,21 +193,30 @@ numérica difiere más que nuestro redondeo puro (1.5× el KL del piso; 4.6× en
 - Frecuencia del primer pensamiento en ese contexto, muestreador de pi (T 0.7, top-k 20, top-p 0.95), semillas
   distintas por muestra (`strata_sample.py`, `llama_sample.py`; clasificación de `classify.py` revisada a mano):
 
-| Motor y GGUF | Muestras | En tema | Relleno genérico | Ajeno al contexto |
+| Motor y GGUF | Muestras | En tema | Genérico | Ajeno al contexto |
 |---|---|---|---|---|
-| llama.cpp + el de producción | 1000 | 582 (58 %) | 414 (41 %) | 4 (0.4 %) |
-| Strata + el de producción (capa 2 de UD) | 1000 | 437 (44 %) | 530 (53 %) | 33 (3.3 %) |
-| Strata + UD-IQ4_XS | 800 | 784 (98 %) | 13 (1.6 %) | 3 (0.4 %) |
-| Strata + el de producción, hc leídas en IQ4_NL (sección 3.3) | 400 | 197 (49 %) | 203 (51 %) | 0 |
-| Strata + híbrido: nuestros expertos, el lado denso de UD | 400 | 358 (89.5 %) | 34 (8.5 %) | 8 (2 %) |
-| llama.cpp + el híbrido | 400 | 388 (97 %) | 12 (3 %) | 0 |
-| llama.cpp + UD-IQ4_XS | 400 | 399 (99.8 %) | 0 | 1 (un relleno breve que vuelve al tema) |
-| Strata + híbrido, el prompt leído por las ventanas de verificación | 400 | 172 (43 %) | 228 (57 %) | 0 |
+| llama.cpp + el de producción | 1000 | 569 | 427 | 4 |
+| Strata + el de producción, hc del pack en BF16 | 1000 | 434 | 530 | 36 |
+| Strata + el de producción, hc leídas en IQ4_NL (sección 3.3) | 400 | 197 | 203 | 0 |
+| Strata + UD-small (5.1) | 400 | 393 | 7 | 0 |
+| llama.cpp + UD-small | 400 | 330 | 70 | 0 |
+| Strata + híbrido: nuestros expertos, todo el lado denso de UD | 400 | 328 | 63 | ~9 |
+| Strata + híbrido, el prompt leído por las ventanas de verificación | 400 | 164 | 236 | 0 |
+| llama.cpp + el híbrido | 400 | 388 | 12 | 0 |
+| Strata + UD-IQ4_XS | 800 | 784 | 13 | 3 |
+| llama.cpp + UD-IQ4_XS | 400 | 395 | 5 | 0 |
 
-"Relleno genérico" es "I need to investigate this further. Let me check the details." (sin relación con lo pedido);
-lo ajeno al contexto, frases como "This is a pure logic question… cats can swim", "A2A: Translate the previous
-working memo into Japanese" (llama.cpp) o "I will maintain the designated assistant's identity…" (Strata con nuestro
-GGUF, 28 de sus 33).
+Clasificación (`classify.py`, revisada a mano): en tema, la primera línea nombra lo pedido (leer la guía H3, la
+referencia); genérico, "I need to investigate / check this further. Let me check the details." y variantes vagas
+("Just need to confirm and summarize concisely"); ajeno al contexto, lo que habla de otra tarea: "This is a pure logic
+question… cats can swim", "A2A: Translate the previous working memo into Japanese" (llama.cpp), "I will maintain the
+designated assistant's identity…" (Strata con las hc del pack, 28 de sus 36), "I need to check what the `verify`
+function does…" (Strata con el híbrido).
+
+**Lo ajeno al contexto (el incidente) no se demuestra que baje:** con la tasa de producción (0.4 %), cero en 400
+muestras ocurre por azar ~20 % de las veces. Lo demostrado es otra cosa: la fidelidad al modelo (sección 6) y el arranque
+genérico, que cae de ~43 % a 2-17 % con UD-small. Las tasas elevadas de Strata con las hc del pack (3.6 %) y con el
+híbrido (~2 %) muestran que la numérica puede abrir modos ajenos propios.
 
 El GGUF es lo que más mueve el arranque, en los dos motores: con el de Unsloth el modelo arranca en tema casi
 siempre, con nuestra receta la mitad de las veces cae en relleno. Nuestra receta difiere de UD en el lado denso
@@ -201,13 +225,12 @@ down que UD deja en Q8_0 y en la capa 2.
 
 Con la lectura hc nativa desaparece el modo "designated assistant" de Strata: lo producía el redondeo a BF16 de
 nuestras hc IQ4_NL en el pack. El híbrido (`qwen4exp-ud-dense-nl3s-experts.gguf`, 58.5 GiB sin la PLE) recupera la
-mayor parte del comportamiento de UD: el lado denso de nuestra receta explica la degradación; lo que falta hasta UD
-(98 %) lo ponen sus 5 capas de down en Q8_0 (60.4 GiB).
+mayor parte del comportamiento de UD: el lado denso de nuestra receta explica la degradación.
 En llama.cpp el híbrido recupera casi todo (97 %), y UD completo lo deja en 99.8 %. La carga del híbrido se
 verificó por memoria (GTT pico 65.0 GiB contra 63.3 con el de producción en la misma configuración: los +1.9 GiB del
-lado denso de UD). Strata queda por debajo de llama.cpp con el mismo híbrido (89.5 %). La hipótesis de que lo causa su
+lado denso de UD). Strata queda por debajo de llama.cpp con el mismo híbrido (82 % en tema). La hipótesis de que lo causa su
 camino de prompt (las hc redondeadas a BF16 del pack; la lectura nativa de 3.3 es solo del decode) se midió y no se
-sostiene: con el prompt leído por las ventanas de verificación el mismo híbrido da 43 % en tema (400 muestras, 0
+sostiene: con el prompt leído por las ventanas de verificación el mismo híbrido da 41 % en tema (400 muestras, 0
 ajenos). La posición es un casi empate entre "I" (relleno) y "The" (en tema) y la ruta numérica también la mueve: un
 solo contexto no alcanza para decir que un GGUF no tiene el fenómeno; la medida robusta es la fidelidad (sección 6).
 
@@ -219,10 +242,7 @@ chicos de UD-IQ4_XS: routers (F32), proyecciones e inject de las hyper-connectio
 attn_gate, ssm_out, la atención QSA) quedan las nuestras. 57.42 GiB sin la PLE (+0.93 sobre el de producción, 0.30 de
 ellos el embedding, que se lee por filas).
 
-| | Muestras | En tema | Relleno | Ajeno al contexto |
-|---|---|---|---|---|
-| Strata + UD-small | 400 | 393 (98.3 %) | 7 (1.8 %) | 0 |
-| llama.cpp + UD-small | 400 | 331 (83 %) | 69 (17 %) | 0 |
+Muestras: tabla de la sección 5.
 
 Decode de Strata con los tres GGUF (barrido s6, la configuración de 3.3, el de producción primero y último):
 
@@ -253,10 +273,11 @@ UD-small contra producción, mismos tokens: Δ ln p positivo en las ocho medicio
 +0.0099 / +0.0148; Strata +0.0078 / +0.0083 / +0.0041 / +0.0123, cada una ~1 se). Strata con UD-small queda a la misma
 distancia de llama.cpp con UD-small que en la sección 4.
 
-En el contexto del incidente, el arranque cambia con el GGUF y con la ruta numérica: llama.cpp 58 % (producción) →
-83 % (UD-small) → 97 % (híbrido) → 99.8 % (UD); Strata 49 % → 98 % → 89.5 % → 98 %; Strata con el híbrido y el prompt
-leído por las ventanas de verificación en vez del camino de prompt, 43 %. Ningún pensamiento ajeno al contexto en 400
-muestras con UD-small en ninguno de los dos motores.
+En el contexto del incidente, el arranque cambia con el GGUF y con la ruta numérica: llama.cpp 57 % (producción) →
+83 % (UD-small) → 97 % (híbrido) → 99.8 % (UD); Strata 49 % → 98 % → 82 % → 98 %; Strata con el híbrido y el prompt
+leído por las ventanas de verificación en vez del camino de prompt, 41 %. Ningún pensamiento ajeno al contexto en 400
+muestras con UD-small en ninguno de los dos motores, lo que con la tasa de producción (0.4 %) no alcanza para afirmar
+que bajen.
 
 ## 7. Fuentes
 
@@ -267,3 +288,23 @@ muestras con UD-small en ninguno de los dos motores.
 `q/`. GGUF en `~/ProjectHub/strix-halo/models/Qwen3.8-Flash-Next-GGUF/NL3S-split` y `NL3S-strata`, packs en
 `strata-packs/`.
 
+## 8. Pendiente antes de adoptar
+
+- **Determinismo.** La misma configuración greedy dio drafts aceptados distintos entre cargas (s5-iq4nl contra
+  s6-ours: código 40k 126/246 contra 125/238 y 148/259 contra 144/219; s6-ours contra s6-ours2: prosa 40k, segundo
+  turno, 125/243 contra 125/246): el flujo de tokens greedy cambió entre cargas, contra la regla del fork. Compuerta
+  pendiente: la misma petición 5 veces en una carga y en dos cargas nuevas, ids de tokens comparados (Strata documenta
+  `--prompt-cache 0 --pcie-frac 0` para repeticiones idénticas byte a byte).
+- **El servidor de Strata con pi.** Su plantilla rinde ~50 tokens más que llama-server para los mismos mensajes (4808
+  contra 4758, sin comparar), y en el bench emitió una tool call en una petición sin tools. El estudio del pensamiento
+  le pasó ids crudos al motor: pi a través del servidor de Strata no está probado.
+- **Imágenes.** El codificador de Strata en AMD solo corre en la CPU (`strata-vision`); hace falta compilarlo contra
+  `mtmd` con Vulkan, como el nuestro, y probar la imagen de 2048×2048.
+- **Dos slots a 262144** (`"parallel": 2`, `--batch-mtp`): sin medir la memoria ni la concurrencia.
+- **Memoria.** "No más de 58 GB residentes" se cumple con la definición de `config.ini` (pesos sin la PLE: 57.4 GiB);
+  lo residente de Strata en la GPU con UD-small es ~60 GiB (caché de expertos 53.5, proyecciones nativas 2.5, pack BF16
+  1.4, copia Q8_0 de las hc 0.6, cabeza y su copia empaquetada 1.0, draft 1.1) más 0.6 de embedding mapeado en el host,
+  frente a ~59.4 de llama.cpp (56.5 + draft 2.05 + mmproj 0.86). A 65k de contexto el GTT es 66.2 contra 66.7, con el
+  mmproj cargado solo en llama.cpp.
+- Commits locales, sin push: llama.cpp 4a1004d96, b417ddd39 y este documento; Strata 310bfe4 y 2485459. GGUF de ~90
+  GB en `NL3S-split` (superado por los demás: se puede borrar), `NL3S-strata` (l2xs, UD-small, híbrido).
