@@ -36,8 +36,9 @@ la GDN, experto compartido, PLE key/value y embedding, cuantizados más que en U
 alejan al modelo de UD; devolverlos a su formato de UD cuesta 0.93 GiB. La posición del incidente es un casi empate
 entre "I" y "The" que la numérica de cada motor también mueve (sección 5), así que lo robusto es la fidelidad (sección 6).
 
-**Pendiente para reemplazar producción (sección 8):** determinismo de Strata entre cargas, pi a través de su servidor
-(plantilla y tool calls), codificador de imágenes en GPU, dos slots a 262144.
+**Compuertas para reemplazar producción (secciones 8 y 9):** pi a través de su servidor, imágenes en GPU y el pensamiento
+ajeno pasan; el determinismo no (una carrera intermitente en la lectura de prompts largos); con dos peticiones a la vez
+rinde menos que llama.cpp; la memoria residente en la GPU es ~60 GiB.
 
 ## 1. Cómo corre aquí sin duplicar los expertos ni usar la CPU
 
@@ -316,6 +317,15 @@ Configuración de producción (UD-small, ajustes del draft) a 65536 de contexto,
 vez por la compuerta. Herramientas en `~/dbg/strata/`: `det.py` y `det_compare.py` (el texto de las respuestas por el
 servidor), `det_logpos.py` y `det_tail.py` (log-probs con 9 decimales de los últimos 64 tokens leídos por las ventanas
 de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.sh` y `queue14`-`queue23`.
+
+| Compuerta | Estado |
+|---|---|
+| Determinismo | **no pasa**: una carrera en la lectura de prompts de dos o más chunks, intermitente (9.1) |
+| pi a través del servidor de Strata | pasa con 9c6c243 (las tools en la forma de los clientes): ids idénticos a llama-server, sesión en vivo correcta (9.2) |
+| Dos slots | memoria a 262144 × 2 extrapolada en ~36 GiB libres; con dos peticiones a la vez rinde menos que llama.cpp (9.3) |
+| Pensamiento ajeno | 0 de 1000 con UD-small (9.4) |
+| Imágenes en la GPU | pasa con Vulkan (21f52b0): 2048×2048 en 9.4 s (9.5) |
+| 58 GB residentes | no: ~60 GiB en la GPU (sección 8) |
 
 ### 9.1 Determinismo
 
