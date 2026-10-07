@@ -366,7 +366,10 @@ de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.
   (`~/dbg/glitch-1006/request.json`, 14 tools) daba 19 731 ids contra 19 857 de llama-server. Con 9c6c243 el render
   recibe las tools como las mandan los clientes (como transformers y llama-server) y la misma petición da exactamente
   los ids de llama-server. Suite del servidor: 454 tests, OK.
-- **Pendiente:** una sesión de pi en vivo contra el servidor de Strata (streaming y tool calls de vuelta a pi).
+- **pi en vivo contra el servidor de Strata** (`pi_live.sh`: el proveedor `halo` de pi en :8080, `qwen38flash:medium`,
+  sin sesión guardada, un directorio de prueba): pide listar con bash y leer `notas.txt`; 3 turnos, 2 llamadas a bash
+  ejecutadas por pi, razonamiento y texto separados en el stream, la respuesta exacta (4 líneas, la tercera textual),
+  13 s.
 
 ### 9.3 Dos slots (`--batch 2`, el `"parallel": 2` del servidor)
 
@@ -401,3 +404,17 @@ draft): 0 ajenos en 1000.
 - Contra las 4 de 1000 de llama.cpp, que también son una estimación, la diferencia queda al borde (Fisher unilateral,
   p = 0.062). Lo que la sostiene es el mecanismo medido en la sección 6 (la mitad de distancia a UD-IQ4_XS) y el arranque
   genérico, que baja de 43 % a 3 %.
+
+### 9.5 Imágenes en la GPU
+
+`strata-vision` (el codificador de Strata, `tools/vision`) compilado con Vulkan contra nuestro fork de llama.cpp (el
+`mtmd` y el backend de producción; opción `STRATA_VISION_VULKAN` en el fork de Strata, `build_vision.sh`), el
+`mmproj-F16.gguf` de producción, hasta 4096 tokens por imagen como llama.cpp:
+
+| | llama.cpp, producción | Strata |
+|---|---|---|
+| 2048×2048 (`img_big.py`): tokens del prompt, lectura | 4134, 11.3 s (364 t/s) | 4134, 9.4 s en total (1354 t/s) |
+| Transcripción | exacta | exacta salvo dos espacios ("UPTIME3d", "BAT81%") |
+| Texto → imagen → texto (`img_test.py`) | 5 / 5 | 5 / 5 |
+
+Sin reinicio de la cola de cómputo (la imagen de 2048 entra en una lectura).
