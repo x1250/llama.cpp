@@ -3411,3 +3411,96 @@ la base (redondeo, informado) y son idénticas entre cargas del mismo build.
 Fuentes: `~/dbg/merge/chain_v9{5,6,7,8}.{sh,out}`, `prefill_cmp.py`, `quality_gate.inc.sh` (modos P y M),
 `~/dbg/merge/sp8/{fa_dump.cpp,fa_replay.cpp,fa_exact.py}`,
 `~/dbg/depth/ppl-v9{6,8}q*.log`, `ppl-v97*.log`, `~/dbg/merge/bin-v98new` (el build adoptado).
+
+## 47. Un pensamiento ajeno al contexto en producción: ningún defecto que lo explique (2026-10-06/07)
+
+Incidente: en una sesión de pi (media-stack, thinking `medium`, T 0.7, top-k 20, top-p 0.95, min-p 0), tras leer un
+archivo de 2204 tokens el razonamiento completo fue "A simple log of the calibration run — pass 12 through 17. Loss went
+from 3.2 to 1.1, and is converging.", seguido de un resumen correcto del archivo. Producción corría el build de la
+sección 46 sobre el kernel 7.0.0-34 (las compuertas de v98 corrieron sobre 7.0.0-31).
+
+**Petición exacta.** El SDK de pi reconstruye la petición desde una copia de la sesión, con la red bloqueada
+(`capture.mjs`); renderizada por el servidor da exactamente 19857 tokens, el prompt original. La frase no existe en
+ninguna fuente (código, plantillas, proyecto, sesión). La petición (task 320) solo extendió el prompt: sin restauración
+de checkpoint, sin imagen, sin el otro slot activo. `repeat_probe.py` sobre el kernel nuevo da las mismas
+distribuciones que el 2026-10-02. La aceptación especulativa es exacta: la variante sintética
+(`server_sample_and_accept_synth`) solo existe con `--spec-synth-*`, ausente en producción.
+
+**Referencia en CPU.** El mismo GGUF en el backend de CPU (`--device none`, f32, atención densa con máscara, KV f16)
+pone "log", "calibration" y "run" fuera de su top 20, donde producción les daba 1.1, 1.4 y 2 %. Pero la CPU tampoco es
+una referencia única: el mismo prompt por prefill y por decode da distribuciones muy distintas también en CPU.
+
+**Dónde nace la divergencia (`path_diff.cpp`, el mismo token por las dos rutas, capa por capa, CPU f32 y KV f32).**
+Los núcleos coinciden a 1e-7 (estado y salida de GDN, convoluciones, PLE, selección QSA); la primera diferencia real es
+una multiplicación por pesos cuantizados (la proyección de salida de GDN: entrada 1e-7, salida 8e-5), porque los kernels
+de 1 fila y de muchas cuantizan las activaciones de otra forma, y el FFN de expertos la amplifica (3e-4 → 6.6e-3 en una
+capa). La selección QSA (100-150 de 2051 celdas distintas en las capas profundas) y el ruteo de expertos convierten esas
+diferencias en saltos discretos: 20 % de diferencia en la salida, KL 0.16 entre rutas en CPU sin ninguna optimización
+del fork. En GPU la diferencia entre rutas aparece ya en la capa 0 (1.9 %) y termina en KL 0.05.
+
+**Las optimizaciones de GPU no alejan el modelo de la referencia** (llama-perplexity, un chunk de 16k, puntuado a
+8-16k, contra la CPU con ubatch 2048; `isolate.sh`):
+
+| Configuración | KLD | Top igual | ΔPPL |
+|---|---|---|---|
+| CPU con ubatch 512 (el piso de la inferencia cuantizada) | 0.020 | 96.0 % | −0.009 ± 0.006 |
+| Producción | 0.034 | 95.0 % | −0.004 ± 0.008 |
+| KV f16 | 0.036 | 94.8 % | +0.008 ± 0.008 |
+| KV f16 + atención densa | 0.037 | 94.7 % | +0.011 ± 0.008 |
+| KV f16 + densa + sin fusiones | 0.036 | 95.1 % | +0.002 ± 0.008 |
+| Sin productos punto enteros | 0.041 | 95.0 % | +0.038 ± 0.009 |
+| Build anterior a 72ef1f1ef | 0.037 | 95.0 % | +0.000 ± 0.009 |
+| Producción, ubatches de 3 | 0.033 | 95.1 % | +0.011 ± 0.008 |
+
+Ninguna optimización apagada acerca la GPU a la CPU, y la perplejidad es la misma (la fila de la caché de resúmenes no
+se cita: a ubatch 2048 ese camino no corre).
+
+**La implementación contra la referencia** (transformers 5.17 `modeling_qwen4_exp.py` y el `config.json` oficial):
+conexiones hc, compuerta de GDN (`output_gate_type: sigmoid`), PLE (hash, corte en EOS 248044, multiplicadores y
+vocabularios por cabeza recalculados con el código de referencia), puntaje del indexer (media, norma, rope en el inicio
+del bloque, relu por cabeza), cola y `reasoning_effort` (la plantilla del GGUF es la oficial: `medium` no agrega
+instrucción) coinciden. Un desvío: la selección de ancho fijo (2051 celdas, igual en upstream) completa con 1-3 celdas
+de un bloque 513 los lugares que una cola de menos de 3 tokens deja libres; la referencia atiende 512 bloques más la
+cola. La selección exacta (`LLAMA_QSA_EXACT_BUDGET`, parche en `~/dbg/glitch-1006/qsa-exact-budget.patch`, no
+adoptado) no cambia la calidad: KLD 0.026 contra la actual, ΔPPL +0.003 ± 0.007, y queda a la misma distancia de la CPU
+(0.0368 frente a 0.0374).
+
+**Las operaciones fusionadas del fork son exactas.** En GPU (N=7144, capas 0-2, lado prefill), el grafo de hc sin
+fusionar (`LLAMA_QWEN4EXP_NO_FUSED_HC=1`) y la convolución de GDN por concatenación de upstream
+(`LLAMA_GDN_CONV_CONCAT=1`) dan resultados idénticos bit a bit a `ggml_hc_gated_mean`, `ggml_hc_inject` y
+`ggml_ssm_conv_state`.
+
+**La precisión del prefill en Vulkan.** Cada multiplicación de la capa 0 del token del incidente contra su producto
+exacto en float64 (pesos descuantizados del GGUF, entrada del volcado; `mm_exact.py`): el decode (mat-vec) es exacto
+(5e-8; qkv en Q5_K, 1.9e-3 por las activaciones q8_1 de MMVQ), el prefill tiene 0.2-1 % de error en todas: las densas
+por el pipeline de coopmat con acumulador f16 (la elección de upstream con `GGML_PREC_DEFAULT` cuando el dispositivo
+admite acumular en f16) y las de expertos por las activaciones q8_1 de MMQ. Es el origen del 1.9 % de diferencia entre
+rutas en la capa 0 en GPU (`hc_down_inject`, 1 %: −19.094 frente a −19.141 exacto). Forzar acumulación f32
+(`GGML_VK_FORCE_F32_ACC`, parche en `~/dbg/glitch-1006/vk-force-f32-acc.patch`, no adoptado) baja las densas a
+5e-5-2.5e-4 y deja los expertos igual, sin una mejora de calidad consistente: ΔPPL +0.042 ± 0.008 en el chunk de
+wikitext y −0.001 ± 0.006 en uno de código, KLD 0.039 contra la CPU (producción, 0.034).
+
+**Un defecto lateral.** `GGML_OP_TOP_K` en Vulkan con k = 1 devuelve un índice equivocado cuando toda la fila es
+negativa (k ≥ 2 y filas con valores positivos, correctos; `topk/topk_check.cpp`). Ningún camino de producción lo usa:
+la selección QSA usa k = 2051, el muestreo del modelo corre en la CPU (sin `--backend-sampling`) y el del borrador usa
+k = 10. `test-backend-ops` no lo ve porque sus datos tienen los dos signos.
+
+**Muestreo.** La recomendación oficial para el modo con razonamiento es T 1.0, top-p 0.95, top-k 20, min-p 0; pi usa
+0.7, más conservador. Frecuencia: 40 muestras del primer pensamiento en el mismo contexto no repiten un pensamiento
+ajeno (19 empiezan con un relleno genérico).
+
+Conclusión: no hay un defecto del stack detrás del incidente. Es una deriva de muestreo en una posición de alta
+incertidumbre, cuya distribución este modelo mueve con cualquier diferencia numérica (la misma CPU por dos rutas, KL
+0.16): con su arquitectura y esta cuantización, la probabilidad de cada token en esas posiciones tiene una banda de
+incertidumbre, no un valor único. Lo que no se pudo medir aquí: la pérdida de la cuantización del GGUF (expertos
+IQ3_S) frente al modelo original, que no cabe en la máquina.
+
+La máquina se apagó dos veces durante esta investigación (2026-10-06 23:51 y 2026-10-07 02:00), las dos en una
+corrida de inferencia solo en CPU (`--device none`, 16 hilos con AVX-512 sostenido, a los 1-3 minutos), con MemFree en
+36-51 GiB y sin mensaje del kernel ni volcado de kdump: un corte de hardware, no un cuelgue por memoria. Las corridas en
+GPU no lo provocaron.
+
+Fuentes: la sesión de pi `2026-10-07T00-45-12-967Z_01a113d2-...jsonl` (entrada 17), `~/dbg/glitch-1006/` (el log del
+servidor, `capture.mjs`, `score.py`, `dist.py`, `sample.py`, `path_diff.cpp`, `isolate.sh`, `exact_ab.sh`,
+`topk/topk_check.cpp`, `fused_check_gpu.sh`, `mm_exact.py`, `f32acc_*.sh` y sus salidas),
+`~/dbg/merge/probe-glitch1006.out`.
