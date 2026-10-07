@@ -36,10 +36,11 @@ la GDN, experto compartido, PLE key/value y embedding, cuantizados más que en U
 alejan al modelo de UD; devolverlos a su formato de UD cuesta 0.93 GiB. La posición del incidente es un casi empate
 entre "I" y "The" que la numérica de cada motor también mueve (sección 5), así que lo robusto es la fidelidad (sección 6).
 
-**Compuertas para reemplazar producción (secciones 8 y 9):** pi a través de su servidor, imágenes en GPU y el pensamiento
-ajeno pasan; el determinismo no (una carrera intermitente en la lectura de prompts largos); con dos peticiones a la vez
-el camino batch de Strata daba texto corrupto en gfx1151 (9.3, corregido en el fork); la memoria residente en la GPU es
-~60 GiB.
+**Compuertas para reemplazar producción (secciones 8, 9 y 10):** con el fork arreglado (sección 10) pasan todas:
+pi a través de su servidor, imágenes en GPU, el pensamiento ajeno, el determinismo (la carrera era un kernel de expertos
+del prompt al que el compilador le quitó una espera; arreglada y comprobada junto a otro cliente de la GPU), dos
+peticiones a la vez (correctas, a la par de llama.cpp en conjunto y más rápidas para una corta durante una lectura
+larga), la compuerta de historia y el lanzador. La memoria residente en la GPU, ~60 GiB, la aceptó el Director.
 
 ## 1. Cómo corre aquí sin duplicar los expertos ni usar la CPU
 
@@ -321,12 +322,12 @@ de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.
 
 | Compuerta | Estado |
 |---|---|
-| Determinismo | **no pasa**: una carrera en la lectura de prompts de dos o más chunks, intermitente (9.1) |
+| Determinismo | no pasaba: una carrera en la lectura de prompts de dos o más chunks, intermitente (9.1); **pasa** con el fork arreglado (10.1, 10.5) |
 | pi a través del servidor de Strata | pasa con 9c6c243 (las tools en la forma de los clientes): ids idénticos a llama-server, sesión en vivo correcta (9.2) |
-| Dos slots | memoria a 262144 × 2 extrapolada en ~36 GiB libres; con dos peticiones a la vez la salida era corrupta (9.3) |
+| Dos slots | con dos peticiones a la vez la salida era corrupta (9.3); **pasa** con el fork arreglado (10.2); memoria en 10.6 |
 | Pensamiento ajeno | 0 de 1000 con UD-small (9.4) |
 | Imágenes en la GPU | pasa con Vulkan (21f52b0): 2048×2048 en 9.4 s (9.5) |
-| 58 GB residentes | no: ~60 GiB en la GPU (sección 8) |
+| 58 GB residentes | no: ~60 GiB en la GPU (sección 8); el Director lo aceptó (sección 10) |
 
 ### 9.1 Determinismo
 
@@ -459,3 +460,147 @@ draft): 0 ajenos en 1000.
 | Texto → imagen → texto (`img_test.py`) | 5 / 5 | 5 / 5 |
 
 Sin reinicio de la cola de cómputo (la imagen de 2048 entra en una lectura).
+
+## 10. Adopción: el fork de Strata arreglado (2026-10-07, noche)
+
+Decisión del Director: producción pasa a nuestro fork de Strata, arreglado; ~60 GiB residentes son aceptables. El fork
+(`x1250/Strata`, sobre la base 82f46a8 de upstream) suma estos cambios, cada uno con su verificación en gfx1151:
+
+| Commit | Qué arregla | Verificación |
+|---|---|---|
+| 4eae8e5 (upstream 3b499f1, #1180) | la carrera de la lectura del prompt (10.1) | reproducida a demanda y cerrada; el código máquina muestra la causa |
+| 91ab622 | la prueba de los kernels fusionados repite una capa y compara bits (`--repeat`) | encontró la carrera |
+| e3b3edb (upstream 0a22c46, #1139) | dos peticiones a la vez daban texto corrupto (9.3) | `batch_test.py`: cada slot idéntico a su respuesta sola |
+| 57c6375 (incluye upstream 569c094) | `--batch-mtp` caía y los drafters de los slots no eran los del camino solo | `batch_test.py --batch-mtp`: idénticos; 57 t/s juntas |
+| bf7f443 | una petición con imágenes junto a otra rotaba las posiciones del otro slot (10.3) | tests del servidor, compuerta de historia |
+| a2bcaf8 | `STRATA_LOGPOS_DECODE`: las filas del decode, para comparar log-probs | compuerta de historia (10.4) |
+
+### 10.1 La carrera de la lectura del prompt: causa y arreglo
+
+- **Causa.** El kernel fusionado de expertos del prompt (`native_w11_kernel`, `STRATA_PF_FUSED=1`, variante de
+  ocupación con tope de VGPR) compilado con el clang 23 de ROCm 7.14.1: en la proyección de bajada (IQ4_NL, la de casi
+  todas nuestras capas) el bucle de etapas vuelve a la barrera del inicio de la etapa con las escrituras en LDS del
+  siguiente bloque de pesos todavía en vuelo. En el código máquina, el arco de vuelta del bucle llega al `s_barrier`
+  sin `s_waitcnt lgkmcnt(0)` después de los `ds_store` del bloque siguiente; en gfx11 la barrera no espera esas
+  escrituras, así que una onda puede leer el bloque antes de que otra termine de escribirlo. El fuente parecía
+  correcto (una barrera al inicio de cada etapa); la espera que falta es del compilador. Con la barrera que agrega
+  upstream 3b499f1 justo después de la escritura, el compilador emite `s_waitcnt vmcnt(0) lgkmcnt(0)` antes de ella.
+- **Por qué dependía del estado de la máquina.** La ventana de la carrera depende de cuánto tardan las escrituras en
+  LDS frente a las otras ondas: con la GPU sola casi nunca se abre; con otro cliente de la GPU (el escritorio, un
+  navegador; en las ventanas de falla el VRAM usado del escritorio oscilaba entre 0.7 y 0.9 GiB) sí.
+- **Reproducción a demanda** (`fused_repeat.sh`, `noise/gpu_noise.hip`, `noise/vk_noise.sh`: otro cliente HIP o
+  Vulkan junto a la prueba):
+
+  | | Kernel: una capa a 16384 tokens repetida, corridas que difieren | Motor: la lectura de 32.8k ×8 junto a Vulkan |
+  |---|---|---|
+  | Base (sin barrera, tope 8) | 0 / 60 sola; 3 / 60 junto a HIP; ≥4 / 60 junto a Vulkan (18:18-18:22) | 2 de 8 distintas (18:35) |
+  | Barrera, tope 8 | 0 / 30 en cada condición; 0 / 100 junto a Vulkan | 8 / 8 idénticas |
+  | Barrera, sin tope (default de upstream con clang ≥ 22) | 0 / 30 en cada condición; 0 / 100 junto a Vulkan | 8 / 8 idénticas |
+
+  La provocación no es constante: la cadena de control de las 19:00-19:16 (base primero y último) no desvió ni la base
+  (0 / 101 en el kernel, 8 / 8 en el motor). La prueba de que el arreglo cierra la carrera es entonces el código
+  máquina (arriba), más que la estadística; las lecturas con el arreglo nunca desviaron, solas ni junto a otro cliente.
+- **El tope de VGPR se queda.** Upstream lo quita con clang ≥ 22 porque en gfx1100 con clang 22 daba resultados
+  erróneos. En gfx1151 con clang 23, con la barrera: pasa la referencia FP64 de la prueba (todos los pares de
+  formatos), las filas de la lectura de 32.8k son idénticas con y sin tope y a las de la base, y la velocidad del
+  prompt (32.8k, sin ruido, base primero y último): base 1496-1501 y 1485-1498 t/s, barrera con tope 1482-1486 (−1 %),
+  sin tope 1425-1430 (−4.5 %). `strix-halo/build-strata.sh` compila con `-DSTRATA_W_LB=8` solo con clang 23 y lo
+  registra si encuentra otro.
+
+### 10.2 Dos peticiones a la vez
+
+Arreglado el camino batch (e3b3edb) y los drafters de los slots (57c6375), con el reparto entre capas (d810a71, más
+abajo), 65536 de contexto, `--batch 2 --batch-mtp`, `STRATA_BATCH_DECODE_SHARE` 0.67 (`slots.py`, la misma secuencia
+que 9.3):
+
+| | llama.cpp, producción | Strata antes (corrupto) | Strata arreglado |
+|---|---|---|---|
+| Una sola, agente / corta | 45.1 / 61.5 t/s | 66.6 / 77.7 t/s | 67.5 / 77.7 t/s |
+| Dos a la vez, juntas | 56.9 t/s | 36.7 t/s, texto corrupto | 41.8 t/s (`slots.py`); 57.4 t/s (`batch_test.py`) |
+| Una corta (256 tokens) mientras se leen 40k | 7.6 s | 17.5 s | 6.8 s |
+| Lectura de los 40k junto a la corta | ~70 s | ~33 s | 40.8 s |
+| Respuestas iguales a las de cada una sola | sí | no (corruptas) | sí, en todas |
+
+- `tools/batch_test.py` (dos slots, las opciones de exactitud de BATCHING.md): los 128 tokens greedy de cada slot
+  idénticos a los de la misma petición sola, sin y con `--batch-mtp`.
+- **El reparto entre capas** (d810a71): antes la lectura de un prompt junto a un slot que decodifica cedía la GPU solo
+  entre chunks de 16384 tokens (~13 s cada uno en gfx1151). Ahora la lectura le debe al slot 0.67 de su tiempo (el
+  40 % de la GPU, la decisión del Director del 2026-09-23 para `--decode-share` de llama.cpp) y se lo paga entre dos
+  capas, con los streams del prompt sincronizados (`Prefill::between_layers`). Los chunks, kernels y datos de la
+  lectura no cambian: la respuesta de los 40k leídos junto a la corta es la misma que sola.
+
+### 10.3 Imágenes con dos slots
+
+Las posiciones de imagen (M-RoPE) son una sola tabla para todos los slots (`strata/kernels/mrope.hpp`): una petición
+con imagen admitida en un slot rotaba las filas del otro slot con sus posiciones, y una admisión de texto devolvía la
+tabla a la identidad debajo de una conversación con imagen que seguía decodificando. Además, con `"parallel"` las
+peticiones no toman el FIFO del servidor, así que el codificador de imágenes podía correr junto al motor, lo que según
+el propio servidor deja una petición colgada. Arreglo (bf7f443): las peticiones de texto comparten la GPU y el trabajo
+con imágenes (la codificación y la petición entera) la toma solo (`GpuTurns`); el motor rechaza `BGENI`, y `GENI`
+mientras decodifica un slot, así que un error de planificación es un error, no filas rotadas. El costo: mientras corre
+una petición con imagen, otra espera (como con un solo slot).
+
+### 10.4 Compuerta de historia
+
+Como la de llama.cpp (CLAUDE.md): dos slots, 65536, el codificador en la GPU; la petición greedy de 39.5k (512
+tokens, sin pensamiento) en un servidor nuevo contra uno que leyó primero la imagen de 2048×2048; se comparan las 512
+filas del decode (`STRATA_LOGPOS_DECODE`, a2bcaf8: la elección de cada fila, su log-prob y el top 20;
+`hist_gate.sh`, `hist_compare.py`). **Idénticas** con los drafts de producción (MTP, cadena de lookup) y sin drafts,
+y las respuestas iguales.
+
+### 10.5 Determinismo con la configuración de producción
+
+Desde 10.1, toda compuerta de determinismo corre junto a otro cliente de la GPU (`LP_NOISE=vk`): sin él, las lecturas
+son ciegas a esta clase de defecto (por eso todo pareció limpio después de las 14:10). Con el motor de producción
+(`--batch 2 --batch-mtp`: la lectura por chunks de `read_part`, el reparto entre capas instalado) y el fork arreglado,
+la cola de 64 tokens leída 8 veces junto al cliente Vulkan (log-probs con 9 decimales y el top 20):
+
+| Lectura | Idénticas a la primera |
+|---|---|
+| 32.8k, dos chunks | 8 / 8 (la compilación de prueba) y 8 / 8 (la de producción, `build-strata.sh`, 0f43590) |
+| 39.5k, tres chunks | 8 / 8 y 8 / 8 |
+
+y las filas iguales a las de las lecturas sin ruido de todas las compilaciones (base, con y sin tope de VGPR). La
+compuerta de historia (10.4) repetida con la compilación de producción: idéntica. Los GEMM del prompt (40k, `STRATA_HIPBLASLT_VERBOSE=1`):
+1946 llamadas a hipBLASLt, 0 caídas a hipBLAS (el candidato de sumas atómicas de rocBLAS queda descartado).
+
+### 10.6 Lectura de un prompt con dos slots
+
+Con `--batch` toda lectura iba de a un chunk, también sin ningún slot decodificando, y así las filas PLE del chunk
+siguiente no se leían durante el actual: 39.5k tokens con dos slots a 1218 t/s contra 1332 con uno (mismo binario, por
+el lanzador, dos veces cada uno). Arreglo (0f43590): sola, la lectura va hasta el final en una pasada y se detiene antes
+de un chunk si llega un `BYIELD` (una petición más corta que espera); junto a slots que decodifican sigue de a un
+chunk. Con la misma compilación: 1288 t/s sola con dos slots (1218 antes). La cesión a una petición corta que llega
+durante una lectura larga sigue siendo en el límite de un chunk (16384 tokens, hasta ~13 s de espera): ahí llama.cpp,
+que cede cada 2048 tokens, responde antes.
+
+### 10.7 El lanzador
+
+`strix-halo` (commits del 2026-10-07): `config.ini` elige el motor por modelo (`engine = strata` en qwen38flash;
+`ENGINE=llama` vuelve a llama-server para una carga); `run-server.sh` renderiza la plantilla `strata/qwen38flash.json`
+con el contexto por slot, los slots, el puerto y el muestreo de la familia y lanza el servidor de Strata en el mismo
+scope de systemd; `strix unload` termina el servidor y cualquier motor suelto; `build-strata.sh` compila el motor y el
+codificador con las compuertas de `lib/build-guard.sh` (compartidas con `build-llama.sh`, que ahora reconoce a Strata
+como servidor cargado); `gate.py` cuenta `strata` y `strata-vision` como servidores cargados.
+
+Prueba por el lanzador (`launcher_test.sh`, el puerto de producción, 131072 × 2: una prueba no puede cargar 262144 × 2
+con los 40 GiB de margen): carga en 36 s; corta 77 t/s; pi en vivo con sus herramientas (14 s); la imagen de 2048×2048
+en 9.2 s; texto → imagen → texto 5 / 5; dos peticiones a la vez iguales a sus respuestas solas; una imagen enviada
+durante una petición de texto espera a que esta termine y las dos responden igual que solas; `SIGTERM` (como `strix
+unload`) termina servidor, motor y codificador en 2 s; ningún reinicio de anillo en el kernel. Memoria: GTT máximo 72.0
+GiB y MemAvailable mínimo 39 GiB a 131072 × 2; a 262144 × 2 las tres sesiones crecen 5.4 GiB (extrapolado): ~33 GiB
+libres, contra ~22 de llama.cpp. `footprint_gb = 83`.
+
+### 10.8 Para el Director
+
+- **El fusible `ram-guard`** (`~/.local/bin/ram-guard.sh`, unidad de usuario) solo mata `llama-*` y ComfyUI; no pude
+  cambiarlo desde esta sesión (el clasificador de permisos lo bloqueó). Con producción en Strata hay que agregar el
+  motor y el codificador a su lista: en la línea del `for p in $(pgrep -x llama-server; ...)`, sumar
+  `pgrep -x strata; pgrep -x strata-vision;`, y después `systemctl --user restart ram-guard.service`.
+- **La primera carga de producción a 262144 × 2** es suya (`strix load qwen38flash`): una prueba mía no puede cargarla
+  con los 40 GiB de margen; la huella de `config.ini` (83 GiB) está medida a 131072 × 2 y extrapolada.
+- **Límites conocidos:** una petición corta que llega durante la lectura de un prompt largo espera hasta el fin del
+  chunk en curso (hasta ~13 s; llama.cpp cede cada 2048 tokens); una petición con imágenes corre sola (la otra espera).
+- **Mantenimiento:** el fork está sobre la base 82f46a8 de upstream más arreglos puntuales (tres de ellos ya están en
+  upstream: 3b499f1, 0a22c46, 569c094); upstream avanza rápido (265 commits en dos días). Un merge de upstream es un
+  paso con sus propias compuertas, como los de llama.cpp.
