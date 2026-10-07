@@ -388,3 +388,16 @@ de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.
   ("mtp: unsupported native MMVQ GGML type"): sin probar sin `--mtp-q4`. Las respuestas en un slot no son las del camino
   solo (otra composición de ventanas, sin los ajustes de exactitud de BATCHING.md).
 - Pendiente: la misma medición de llama.cpp con dos peticiones a la vez, para comparar.
+
+### 9.4 El pensamiento ajeno, 600 muestras más
+
+El primer pensamiento del incidente con el muestreador de pi (semillas 3000-3599), Strata con UD-small y la
+configuración de producción (`--mtp-draft-vocab`, `--mtp-window 8192`, `--mtp-hnorm stream`; `bug_sample.sh`,
+`classify.py`): **581 en tema, 19 genéricos, 0 ajenos.** Con las 400 anteriores (semillas 2000-2399, sin los ajustes del
+draft): 0 ajenos en 1000.
+
+- Con la tasa de producción (0.4 %, 4 de 1000 en llama.cpp con nuestro GGUF), 0 en 1000 sale por azar el 1.8 % de las
+  veces; el límite superior al 95 % de la tasa de Strata con UD-small es 0.3 %.
+- Contra las 4 de 1000 de llama.cpp, que también son una estimación, la diferencia queda al borde (Fisher unilateral,
+  p = 0.062). Lo que la sostiene es el mecanismo medido en la sección 6 (la mitad de distancia a UD-IQ4_XS) y el arranque
+  genérico, que baja de 43 % a 3 %.
