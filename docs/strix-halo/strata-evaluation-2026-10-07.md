@@ -352,12 +352,17 @@ de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.
 
   La diferencia no es de último bit: Δlogp de hasta 0.51 en la cola, la misma magnitud que separa la numérica rápida de
   Strata de la lenta (0.065 de media): el modelo amplifica una diferencia mínima a lo largo de 40k de recurrencia.
-- **Es una carrera que depende del tiempo, no un kernel con su propio orden.** Con 8 lecturas, apagar PF_FUSED, PA_FAST,
-  el indexador por lotes (`STRATA_INDEXER_PER_TOKEN=1`) o el scorer de matrices (`STRATA_SELECT_OLD=1`) la esconde
-  (8 / 8 cada uno); la misma configuración cambia de tasa entre cargas; y `STRATA_PF_STEP_SYNC=1` (el host espera a la GPU
-  al final de cada capa del prompt) da 8 / 8 a la misma velocidad (1475 contra 1465 t/s). En la lectura que divergió con
-  `STRATA_STATE_HASH_GDN=1`, los estados GDN de las capas 0 a 13 eran iguales y distintos desde la 14. Todos los
-  expertos están en la caché de la GPU (el stream de copia del prompt no copia nada).
+- **Depende del tiempo, no de un interruptor.** Dentro de la ventana en que fallaba corrieron limpias (8 / 8) varias
+  configuraciones: sin PF_FUSED, sin PA_FAST, con el indexador por token (`STRATA_INDEXER_PER_TOKEN=1`), con el scorer
+  antiguo (`STRATA_SELECT_OLD=1`) y con `STRATA_PF_STEP_SYNC=1` (el host espera a la GPU al final de cada capa), pero
+  intercaladas con cargas que fallaban y con la misma configuración cambiando de tasa entre cargas (1 / 8 y 7 / 8): eso
+  no muestra que alguna de ellas la quite. En la lectura que divergió con `STRATA_STATE_HASH_GDN=1`, los estados GDN de
+  las capas 0 a 13 eran iguales y distintos desde la 14. Todos los expertos están en la caché de la GPU (el stream de
+  copia del prompt no copia nada).
+- **También con la caché de prompts y en otra ventana.** En los barridos de la noche, pares de la misma configuración en
+  cargas distintas divergieron en la primera lectura completa de 40k (s1-base contra s1-base2: prosa en el carácter 242,
+  código en el 263; s2-vocab contra s2-vocab2: prosa en el 242; s3-vw contra s3-vw2: prosa en el 97), entre las 05:30 y
+  las 06:30; los pares s5 y s6 coincidieron en los 300 caracteres guardados.
 - **Desde las 14:10 no se reproduce.** Entre las 12:40 y las 14:06 falló en ocho cargas (hasta 7 de 8 lecturas,
   intercaladas con las cargas limpias de arriba); después, 12 de 12 en cuatro cargas seguidas de 32.8k, incluido el
   binario de producción sin cambios (`lp-fast12`), con los mismos archivos y sin otros trabajos en la máquina
@@ -367,10 +372,8 @@ de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.
   escondió la carrera, la de las últimas 64 filas corrió cuando ya no se reproducía. Queda para cuando reaparezca, con
   `sum_compare.py`.
 - **Estado de la compuerta: no pasa.** Una conversación nueva con un prompt de más de 16384 tokens lee por este camino
-  también con la caché de prompts. `STRATA_PF_STEP_SYNC=1` dio 8 de 8 dentro de la ventana en que fallaba, a la misma
-  velocidad (1475 contra 1465 t/s): es la medida provisoria candidata, no la corrección. La compuerta de historia (una
-  imagen de 2048×2048 en el otro slot antes del mismo prompt) queda por correr ahora que hay imágenes en GPU y dos
-  slots.
+  también con la caché de prompts. No hay causa ni mitigación verificada. La compuerta de historia (una imagen de
+  2048×2048 en el otro slot antes del mismo prompt) queda por correr ahora que hay imágenes en GPU y dos slots.
 
 ### 9.2 pi a través del servidor de Strata
 
