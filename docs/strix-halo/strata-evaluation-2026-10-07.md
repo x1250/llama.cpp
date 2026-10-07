@@ -367,3 +367,24 @@ de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.
   recibe las tools como las mandan los clientes (como transformers y llama-server) y la misma petición da exactamente
   los ids de llama-server. Suite del servidor: 454 tests, OK.
 - **Pendiente:** una sesión de pi en vivo contra el servidor de Strata (streaming y tool calls de vuelta a pi).
+
+### 9.3 Dos slots (`--batch 2`, el `"parallel": 2` del servidor)
+
+| | 65k | 131k |
+|---|---|---|
+| Sesión por slot (log del motor) | 1.00 GiB | 1.89 GiB |
+| GTT máximo (solo a 65k: 66.2) | 68.3 GiB | 71.0 GiB |
+| MemAvailable mínimo | 43.9 GiB | 41.2 GiB |
+| Una petición sola, agente / corta | 66.6 / 77.7 t/s | 67.2 / 77.8 t/s |
+| Dos a la vez, agente + corta | 24.7 + 26.3 t/s (36.7 juntas) | 24.7 + 26.2 t/s (36.5 juntas) |
+| Una corta mientras se leen 40k | 6.2 t/s | 6.0 t/s |
+
+- Las sesiones crecen en línea con el contexto (0.89 GiB cada 65536 celdas): a 262144 serían ~3.7 GiB cada una, tres
+  sesiones (la del camino solo y dos slots), ~76 GiB de GTT, ~77.5 con el codificador de imágenes (1.4 GiB): ~36 GiB de
+  MemAvailable, contra los ~22 de producción con llama.cpp. Medido hasta 131k (la compuerta de 40 GiB no admite cargar
+  262144 × 2 para una prueba); 262144 es extrapolado.
+- Dos peticiones a la vez decodifican sin drafts (un token por ventana): ~25 t/s cada una, menos en conjunto que una
+  sola. `--batch-mtp` (una propuesta MTP por slot) hace caer el motor al admitir la segunda petición con `--mtp-q4 all`
+  ("mtp: unsupported native MMVQ GGML type"): sin probar sin `--mtp-q4`. Las respuestas en un slot no son las del camino
+  solo (otra composición de ventanas, sin los ajustes de exactitud de BATCHING.md).
+- Pendiente: la misma medición de llama.cpp con dos peticiones a la vez, para comparar.
