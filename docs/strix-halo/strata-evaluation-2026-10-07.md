@@ -165,8 +165,8 @@ contexto 131072, una carga por motor (`depth125.sh`; Strata en la configuración
 Bajo muestreo la ventaja se mantiene (+18 % de media) y el umbral de confianza del draft por defecto sigue siendo el
 mejor. Un primer cálculo desde los logs del estudio de muestreo daba paridad (48.0 contra 48.2 t/s) porque llama.cpp
 cortaba en `</think>` (~16 tokens por petición) y Strata generaba 60. En llama.cpp, UD-small en su layout
-separado decodifica 7 % menos que el GGUF de producción (que lleva las fusiones de las secciones 15 y 7 del cost
-breakdown); una versión fusionada recuperaría parte.
+separado decodifica 7 % menos que el GGUF de producción (que lleva la fusión down+inject, decode +15 %, y la de
+gate+up, sección 15 del cost breakdown y su tabla de estado); una versión fusionada recuperaría parte.
 
 ## 4. Calidad: los mismos tokens en los dos motores
 
