@@ -406,11 +406,13 @@ de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.
 
 - Las sesiones crecen en línea con el contexto (0.89 GiB cada 65536 celdas): a 262144 serían ~3.7 GiB cada una, tres
   sesiones (la del camino solo y dos slots), ~76 GiB de GTT, ~77.5 con el codificador de imágenes (1.4 GiB): ~36 GiB de
-  MemAvailable, contra los ~22 de producción con llama.cpp. Medido hasta 131k (la compuerta de 40 GiB no admite cargar
-  262144 × 2 para una prueba); 262144 es extrapolado.
+  MemAvailable, contra los ~22 de producción con llama.cpp. Medido con dos slots hasta 131k (la compuerta de 40 GiB no
+  admite cargar 262144 × 2 para una prueba). La configuración de producción a 262144 con un slot carga y responde (GTT
+  69.1 GiB, MemAvailable mínimo 44.5 GiB, 77.6 t/s en la corta), de acuerdo con la recta.
 - Dos peticiones a la vez decodifican sin drafts (un token por ventana): ~25 t/s cada una, menos en conjunto que una
   sola. `--batch-mtp` (una propuesta MTP por slot) hace caer el motor al admitir la segunda petición con `--mtp-q4 all`
-  ("mtp: unsupported native MMVQ GGML type"): sin probar sin `--mtp-q4`. Las respuestas en un slot no son las del camino
+  ("mtp: unsupported native MMVQ GGML type"), y también sin `--mtp-q4`: el camino MTP por slot no acepta el tipo de los
+  pesos de nuestro draft. Las respuestas en un slot no son las del camino
   solo (otra composición de ventanas, sin los ajustes de exactitud de BATCHING.md).
 - **llama.cpp de producción con dos slots** (NP=2, 65536 por slot, `slots.py`, la misma secuencia):
 
