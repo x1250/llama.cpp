@@ -38,7 +38,8 @@ entre "I" y "The" que la numérica de cada motor también mueve (sección 5), as
 
 **Compuertas para reemplazar producción (secciones 8 y 9):** pi a través de su servidor, imágenes en GPU y el pensamiento
 ajeno pasan; el determinismo no (una carrera intermitente en la lectura de prompts largos); con dos peticiones a la vez
-rinde menos que llama.cpp; la memoria residente en la GPU es ~60 GiB.
+el camino batch de Strata daba texto corrupto en gfx1151 (9.3, corregido en el fork); la memoria residente en la GPU es
+~60 GiB.
 
 ## 1. Cómo corre aquí sin duplicar los expertos ni usar la CPU
 
@@ -322,7 +323,7 @@ de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.
 |---|---|
 | Determinismo | **no pasa**: una carrera en la lectura de prompts de dos o más chunks, intermitente (9.1) |
 | pi a través del servidor de Strata | pasa con 9c6c243 (las tools en la forma de los clientes): ids idénticos a llama-server, sesión en vivo correcta (9.2) |
-| Dos slots | memoria a 262144 × 2 extrapolada en ~36 GiB libres; con dos peticiones a la vez rinde menos que llama.cpp (9.3) |
+| Dos slots | memoria a 262144 × 2 extrapolada en ~36 GiB libres; con dos peticiones a la vez la salida era corrupta (9.3) |
 | Pensamiento ajeno | 0 de 1000 con UD-small (9.4) |
 | Imágenes en la GPU | pasa con Vulkan (21f52b0): 2048×2048 en 9.4 s (9.5) |
 | 58 GB residentes | no: ~60 GiB en la GPU (sección 8) |
@@ -409,11 +410,17 @@ de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.
   MemAvailable, contra los ~22 de producción con llama.cpp. Medido con dos slots hasta 131k (la compuerta de 40 GiB no
   admite cargar 262144 × 2 para una prueba). La configuración de producción a 262144 con un slot carga y responde (GTT
   69.1 GiB, MemAvailable mínimo 44.5 GiB, 77.6 t/s en la corta), de acuerdo con la recta.
+- **Corrección (2026-10-07, noche): las respuestas de dos peticiones a la vez eran texto corrupto** ("…_MOV_MOV_MOV…",
+  "sist sist sist…", `slots-p2-65k.jsonl`), y la lectura de los 40k junto a la corta empezó con "Elform腰capítulo". Las
+  cifras de rendimiento de esta sección miden ese camino roto: valen como tiempos, no como comparación con llama.cpp.
+  Causa (upstream 0a22c46, #1139): con `STRATA_QFUSE=1`, un default de gfx1151, la recurrencia GDN de un batch no escribe
+  la imagen q8_1 de la proyección de salida, que leía bytes viejos. El texto de una petición sola nunca pasó por ahí.
 - Dos peticiones a la vez decodifican sin drafts (un token por ventana): ~25 t/s cada una, menos en conjunto que una
   sola. `--batch-mtp` (una propuesta MTP por slot) hace caer el motor al admitir la segunda petición con `--mtp-q4 all`
   ("mtp: unsupported native MMVQ GGML type"), y también sin `--mtp-q4`: el camino MTP por slot no acepta el tipo de los
-  pesos de nuestro draft. Las respuestas en un slot no son las del camino
-  solo (otra composición de ventanas, sin los ajustes de exactitud de BATCHING.md).
+  pesos de nuestro draft (corrección: no es el tipo de los pesos sino un defecto de Strata en nuestra base, el tipo del draft de
+  vocabulario reducido no se copiaba a los drafters de los slots; upstream 569c094). Las respuestas en un slot no eran
+  "otra composición de ventanas" como se dijo aquí: eran texto corrupto (arriba).
 - **llama.cpp de producción con dos slots** (NP=2, 65536 por slot, `slots.py`, la misma secuencia):
 
   | | llama.cpp | Strata |
