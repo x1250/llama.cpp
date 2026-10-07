@@ -348,10 +348,19 @@ de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.
   al final de cada capa del prompt) da 8 / 8 a la misma velocidad (1475 contra 1465 t/s). En la lectura que divergió con
   `STRATA_STATE_HASH_GDN=1`, los estados GDN de las capas 0 a 13 eran iguales y distintos desde la 14. Todos los
   expertos están en la caché de la GPU (el stream de copia del prompt no copia nada).
-- **Pendiente:** el primer paso que diverge, con una suma por capa y mitad calculada en la GPU sin esperas del host
-  (`STRATA_PF_CHECKSUM`, escrita en el fork, sin compilar todavía); la compuerta de historia (una imagen de 2048×2048
-  en el otro slot) necesita imágenes en GPU y dos slots. `STRATA_PF_STEP_SYNC=1` sería una medida provisoria sin
-  costo medido, no la corrección.
+- **Desde las 14:10 no se reproduce.** Entre las 12:40 y las 14:06 falló en ocho cargas (hasta 7 de 8 lecturas,
+  intercaladas con las cargas limpias de arriba); después, 12 de 12 en cuatro cargas seguidas de 32.8k, incluido el
+  binario de producción sin cambios (`lp-fast12`), con los mismos archivos y sin otros trabajos en la máquina
+  (`~/.strix-gate.log`). Lo que la provoca depende del estado de la máquina, no solo de la configuración.
+- **Diagnóstico pendiente.** `STRATA_PF_CHECKSUM` (rama local `debug-pf-checksum` del fork, `build-dbg`): la salida de
+  cada mitad de capa sumada en la GPU sin esperas del host, la tabla impresa al final; la suma sobre todas las filas
+  escondió la carrera, la de las últimas 64 filas corrió cuando ya no se reproducía. Queda para cuando reaparezca, con
+  `sum_compare.py`.
+- **Estado de la compuerta: no pasa.** Una conversación nueva con un prompt de más de 16384 tokens lee por este camino
+  también con la caché de prompts. `STRATA_PF_STEP_SYNC=1` dio 8 de 8 dentro de la ventana en que fallaba, a la misma
+  velocidad (1475 contra 1465 t/s): es la medida provisoria candidata, no la corrección. La compuerta de historia (una
+  imagen de 2048×2048 en el otro slot antes del mismo prompt) queda por correr ahora que hay imágenes en GPU y dos
+  slots.
 
 ### 9.2 pi a través del servidor de Strata
 
