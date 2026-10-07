@@ -390,7 +390,17 @@ de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.
   sola. `--batch-mtp` (una propuesta MTP por slot) hace caer el motor al admitir la segunda petición con `--mtp-q4 all`
   ("mtp: unsupported native MMVQ GGML type"): sin probar sin `--mtp-q4`. Las respuestas en un slot no son las del camino
   solo (otra composición de ventanas, sin los ajustes de exactitud de BATCHING.md).
-- Pendiente: la misma medición de llama.cpp con dos peticiones a la vez, para comparar.
+- **llama.cpp de producción con dos slots** (NP=2, 65536 por slot, `slots.py`, la misma secuencia):
+
+  | | llama.cpp | Strata |
+  |---|---|---|
+  | Una sola, agente / corta | 45.1 / 61.5 t/s | 66.6 / 77.7 t/s |
+  | Dos a la vez | 28.7 + 36.1 t/s (56.9 juntas, con drafts en cada slot) | 24.7 + 26.3 t/s (36.7 juntas, sin drafts) |
+  | Una corta mientras se leen 40k | 34.2 t/s (la lectura cede el 40 %, `--decode-share`) | 6.2 t/s |
+  | Lectura de los 40k junto a la corta | ~70 s | ~33 s |
+
+  Con dos agentes a la vez, llama.cpp entrega más a cada uno y no deja casi parada una conversación mientras otra lee un
+  prompt largo; Strata gana en la petición sola y en la lectura.
 
 ### 9.4 El pensamiento ajeno, 600 muestras más
 
