@@ -285,8 +285,9 @@ que bajen.
 `depth125.sh`, `logpos.cpp`, `strata_logpos.py`, `strata_engine.py`, `q_*.sh`, `q_compare.py` (calidad),
 `inc_score.py`, `strata_sample.py`, `llama_sample.py`, `bug_sample.sh`, `classify.py` (pensamiento), `prep_*.sh`
 (GGUF y packs), `verify_split.py` (bytes), `test_gr.sh`; salidas `bench-*.jsonl`, `mem-*.log`, `engine-*.log`,
-`q/`. GGUF en `~/ProjectHub/strix-halo/models/Qwen3.8-Flash-Next-GGUF/NL3S-split` y `NL3S-strata`, packs en
-`strata-packs/`.
+`q/`. GGUF en `~/ProjectHub/strix-halo/models/Qwen3.8-Flash-Next-GGUF/NL3S-strata`, packs en `strata-packs/`. El
+archivo dividido (`NL3S-split`, 89.5 GB) se borró el 2026-10-07: se regenera desde producción con
+`scripts/qwen4exp-split-merged.py`.
 
 ## 8. Pendiente antes de adoptar
 
@@ -307,4 +308,4 @@ que bajen.
   frente a ~59.4 de llama.cpp (56.5 + draft 2.05 + mmproj 0.86). A 65k de contexto el GTT es 66.2 contra 66.7, con el
   mmproj cargado solo en llama.cpp.
 - Commits locales, sin push: llama.cpp 4a1004d96, b417ddd39 y este documento; Strata 310bfe4 y 2485459. GGUF de ~90
-  GB en `NL3S-split` (superado por los demás: se puede borrar), `NL3S-strata` (l2xs, UD-small, híbrido).
+  GB en `NL3S-strata` (l2xs, UD-small, híbrido); `NL3S-split` ya se borró (sección 7).
