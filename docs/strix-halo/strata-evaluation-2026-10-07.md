@@ -309,3 +309,61 @@ archivo dividido (`NL3S-split`, 89.5 GB) se borró el 2026-10-07: se regenera de
   mmproj cargado solo en llama.cpp.
 - Commits locales, sin push: llama.cpp 4a1004d96, b417ddd39 y este documento; Strata 310bfe4 y 2485459. GGUF de ~90
   GB en `NL3S-strata` (l2xs, UD-small, híbrido); `NL3S-split` ya se borró (sección 7).
+
+## 9. Las compuertas (2026-10-07, tarde)
+
+Configuración de producción (UD-small, ajustes del draft) a 65536 de contexto, producción descargada, una carga a la
+vez por la compuerta. Herramientas en `~/dbg/strata/`: `det.py` y `det_compare.py` (el texto de las respuestas por el
+servidor), `det_logpos.py` y `det_tail.py` (log-probs con 9 decimales de los últimos 64 tokens leídos por las ventanas
+de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.sh` y `queue14`-`queue23`.
+
+### 9.1 Determinismo
+
+- **Con la caché de prompts, como en producción:** las mismas peticiones (agente 4.7k ×5, prosa 40k ×3, otra
+  conversación en medio, el muestreador de pi con semilla ×3) dieron textos idénticos dentro de una carga y entre dos
+  cargas nuevas.
+- **Sin la caché** (`--prompt-cache 0`, cada petición lee su prompt entero): la prosa de 40k divergió en el carácter 179
+  en 1 de 3 lecturas, y también con ventanas de un token (`--spec 2` sin MTP ni lookup): el origen no es el draft.
+- **La política de drafts de Strata** (`DraftPolicy`, una por proceso) decide la cadena de lookup y los sufijos con el
+  tiempo medido de cada ronda y lo aceptado en peticiones anteriores: los drafts propuestos varían entre peticiones
+  idénticas (agente: 160, 156, 150, 153 y 145 propuestos, 114 aceptados siempre). Con `STRATA_LOOKUP_CHAIN_FIXED=1
+  --suffix-draft 0` son fijos. No cambia el texto greedy mientras el modelo sea determinista (las ventanas de
+  verificación dan las mismas filas), pero es estado entre peticiones.
+- **La lectura del prompt no es determinista desde el segundo chunk de 16384:**
+
+  | Lectura (log-probs de la cola de 64) | Idénticas a la primera |
+  |---|---|
+  | 15k, un chunk | 8 / 8 |
+  | 32.8k, dos chunks | 1 / 8 y 7 / 8 (dos cargas) |
+  | 40k, tres chunks | 4 / 8 |
+  | 40k sin MTP | 1 / 8 |
+  | La cola a 32.8k leída 8 veces sobre un mismo estado (solo ventanas de verificación) | 8 / 8 |
+  | 1024 tokens por ventanas de verificación | 8 / 8 en todas las configuraciones |
+
+  La diferencia no es de último bit: Δlogp de hasta 0.51 en la cola, la misma magnitud que separa la numérica rápida de
+  Strata de la lenta (0.065 de media): el modelo amplifica una diferencia mínima a lo largo de 40k de recurrencia.
+- **Es una carrera que depende del tiempo, no un kernel con su propio orden.** Con 8 lecturas, apagar PF_FUSED, PA_FAST,
+  el indexador por lotes (`STRATA_INDEXER_PER_TOKEN=1`) o el scorer de matrices (`STRATA_SELECT_OLD=1`) la esconde
+  (8 / 8 cada uno); la misma configuración cambia de tasa entre cargas; y `STRATA_PF_STEP_SYNC=1` (el host espera a la GPU
+  al final de cada capa del prompt) da 8 / 8 a la misma velocidad (1475 contra 1465 t/s). En la lectura que divergió con
+  `STRATA_STATE_HASH_GDN=1`, los estados GDN de las capas 0 a 13 eran iguales y distintos desde la 14. Todos los
+  expertos están en la caché de la GPU (el stream de copia del prompt no copia nada).
+- **Pendiente:** el primer paso que diverge, con una suma por capa y mitad calculada en la GPU sin esperas del host
+  (`STRATA_PF_CHECKSUM`, escrita en el fork, sin compilar todavía); la compuerta de historia (una imagen de 2048×2048
+  en el otro slot) necesita imágenes en GPU y dos slots. `STRATA_PF_STEP_SYNC=1` sería una medida provisoria sin
+  costo medido, no la corrección.
+
+### 9.2 pi a través del servidor de Strata
+
+- La plantilla es la misma en producción, UD-small y el pack de Strata (sha256 `12827f24…`).
+- Los ~50 tokens de más del bench (4808 contra 4758) vienen del prompt del bench, no de pi: `agent_prompt.txt` es una
+  conversación ya renderizada pegada como texto del usuario, y Strata codifica el texto de los tokens de control dentro
+  de un mensaje como texto (#537), llama-server como tokens de control; con el mismo tratamiento son 4758. La tool call
+  "sin tools" es el modelo continuando ese texto, que el parser de Strata reconoce aunque la petición no traiga tools
+  (llama-server no lo hace).
+- **Un defecto real, corregido en el fork:** el servidor de Strata quitaba el envoltorio `{"type": "function",
+  "function": …}` de las tools antes de la plantilla, que las escribe con `tojson`; la petición real de pi del incidente
+  (`~/dbg/glitch-1006/request.json`, 14 tools) daba 19 731 ids contra 19 857 de llama-server. Con 9c6c243 el render
+  recibe las tools como las mandan los clientes (como transformers y llama-server) y la misma petición da exactamente
+  los ids de llama-server. Suite del servidor: 454 tests, OK.
+- **Pendiente:** una sesión de pi en vivo contra el servidor de Strata (streaming y tool calls de vuelta a pi).
