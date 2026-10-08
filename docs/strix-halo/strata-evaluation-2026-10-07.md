@@ -585,7 +585,7 @@ el lanzador, dos veces cada uno). Arreglo (0f43590): sola, la lectura va hasta e
 de un chunk si llega un `BYIELD` (una petición más corta que espera); junto a slots que decodifican sigue de a un
 chunk. Con la misma compilación: 1288 t/s sola con dos slots (1218 antes). La cesión a una petición corta que llega
 durante una lectura larga sigue siendo en el límite de un chunk (16384 tokens, hasta ~13 s de espera): ahí llama.cpp,
-que cede cada 2048 tokens, responde antes.
+que cede cada 2048 tokens, responde antes. (Corregido en 10.11: chunks de 8192 y la cesión en 0.25 s, ~3 s medidos.)
 
 ### 10.7 El lanzador
 
@@ -626,22 +626,29 @@ Investigación del Director: "el bug de las dos peticiones a la vez". Tres halla
    |---|---|---|
    | Dos conversaciones de 40k que se alternan (`alt_conv.py`), segundo turno de cada una | 31.3 y 32.4 s (relee 39.6k y 41.7k) | 3.9 y 2.9 s (restaurada en 36 ms) |
    | Dos peticiones a la vez (`slots.py`), en conjunto | 42.2 t/s (10.0 s) | 68.5 t/s (6.2 s); llama.cpp 56.9 |
-   | Una conversación de 40k estacionada | — | ~1.1 GB de RAM del host |
+   | Una conversación de 40k estacionada | — | ~1.1 GB de RAM del host; con dos que se alternan, el caché retuvo hasta 2.2 GB (una conversación restaurada conserva su K/V para su próximo estacionamiento) |
 
    En el par, el agente releía sus 4808 tokens (3.5 s) porque la petición corta anterior había ocupado la sesión.
    **Exactitud en gfx1151:** `tools/parking_test.py` (arreglado en 5c812ba: leía el log del motor de una ruta fija):
    la continuación de una conversación de 24.4k decodifica los mismos 107 tokens viva que estacionada y restaurada; por
    el servidor con dos slots (65536), los segundos turnos restaurados de las dos conversaciones de 40k son iguales a
-   los de su continuación sin otra conversación en medio. Costo: hasta 8 GiB de RAM del host (MemAvailable mínimo 38
-   contra 40 GiB a 131072 × 2).
-2. **Las cifras por petición con dos slots son de otra petición.** El servidor arma los `timings`, el historial y los
-   totales de cada petición con `engine.last`, un único registro del motor que reescribe el último DONE o BDONE de
-   cualquier petición (`serve/server.py`, `Service.run` y `StrataEngine`): con dos a la vez, una petición informa la
-   lectura, los drafts y los t/s de la otra (el "draft 0/0" y los 78 t/s de 10.2). El texto y el uso de tokens no se
-   ven afectados; las cifras de velocidad de 10.2 están medidas con el reloj del cliente por eso.
-3. **Una petición que llega durante la lectura de otra espera esa lectura** (o hasta el fin del chunk en curso si es
-   más larga que un chunk): el par del ensayo esperó los 3.5 s de los 4.8k del agente; con 16384 tokens por chunk, hasta
-   ~13 s. Es la granularidad del motor (la sesión principal admite de a una petición), no un defecto.
+   los de su continuación sin otra conversación en medio. Costo: hasta 8 GiB de RAM del host; a 131072 × 2 la carga
+   bajó MemAvailable 4.1 GiB más que sin el caché con las dos conversaciones alternadas (mínimo 36.3 GiB contra 40.5)
+   y 1.7 GiB más en el par (38.7). **Esas corridas quedaron bajo el margen de 40 GiB**: las declaré con una huella de
+   74 GiB y la caída medida fue 74.1-76.5 (la del lanzador a 131072 × 2, 75.5: mínimo 39.2). No hubo congelamiento
+   (MemFree mínimo 23 GiB), pero la regla no se cumplió; desde 10.11 cada huella declarada es la caída medida.
+2. **Las cifras por petición con dos slots informaban solo el último tramo de la petición.** (Corrige lo que este
+   punto afirmaba antes, que eran de otra petición: `StrataEngine.last` es propio del hilo de cada petición, no un
+   registro compartido.) Con `--batch` una petición corre en tramos (sola; admisión y slot cuando llega otra; sola de
+   nuevo si queda sola; una lectura que cede sigue en otro tramo), cada uno cerrado por su DONE o BDONE, y cada tramo
+   reemplazaba el registro: una petición pasada de sola a un slot informaba `prompt_n` 0 (su tramo reusa el prompt) y
+   los pocos tokens del slot. Además, una petición que termina en su token de parada sale del slot sin leer el BDONE,
+   que se leía en segundo plano y nunca entraba en sus cifras: los 35.6 t/s del agente en el par eran 1 token en 28 ms.
+   El texto y el uso de tokens no se veían afectados; las cifras de velocidad de 10.2 están medidas con el reloj del
+   cliente por eso. Arreglado en 10.11.
+3. **Una petición que llega durante la lectura de otra espera esa lectura** (o hasta un límite de chunk si la
+   lectura es más larga que un chunk): el par del ensayo esperó los 3.5 s de los 4.8k del agente; con 16384 tokens por
+   chunk, ~13 s medidos. El Director lo considera un defecto; la causa está en el servidor y se arregló en 10.11.
 
 Con el caché encendido, en la ventana batch Strata produce ~64 t/s entre dos slots (90 ventanas de 50 ms con 3.7 filas
 aceptadas de 4), lo mismo que una petición sola: el decode del MoE está limitado por memoria y dos secuencias no
@@ -653,9 +660,84 @@ comparten la lectura de expertos.
   codificador de Strata (`pgrep -x strata; pgrep -x strata-vision`), con la autorización del Director (2026-10-07,
   21:18; el script reemplazado de una vez y la unidad reiniciada).
 - **La primera carga de producción a 262144 × 2** es suya (`strix load qwen38flash`): una prueba mía no puede cargarla
-  con los 40 GiB de margen; la huella de `config.ini` (83 GiB) está medida a 131072 × 2 y extrapolada.
-- **Límites conocidos:** una petición corta que llega durante la lectura de un prompt largo espera hasta el fin del
-  chunk en curso (hasta ~13 s; llama.cpp cede cada 2048 tokens); una petición con imágenes corre sola (la otra espera).
+  con los 40 GiB de margen; la huella de `config.ini` (91 GiB desde 10.11, con el caché de conversaciones lleno) está
+  medida a 131072 × 2 y extrapolada.
+- **Límites conocidos:** una petición que llega durante la lectura de un prompt largo espera hasta el fin del chunk en
+  curso (8192 tokens, ~6 s; llama.cpp cede cada 2048 tokens); dos lecturas largas que llegan juntas se alternan y la
+  primera responde ~12 s más tarde (10.11); una petición con imágenes corre sola (la otra espera).
 - **Mantenimiento:** el fork está sobre la base 82f46a8 de upstream más arreglos puntuales (tres de ellos ya están en
   upstream: 3b499f1, 0a22c46, 569c094); upstream avanza rápido (265 commits en dos días). Un merge de upstream es un
   paso con sus propias compuertas, como los de llama.cpp.
+
+### 10.11 Los arreglos de las dos peticiones a la vez (2026-10-07, noche)
+
+La orden del Director ("arréglalos") sobre los hallazgos de 10.9. Commits del fork de Strata: ee7e7c5 (las cifras por
+petición), d8a6ce9 (los drafts de un slot en BDONE), c195c0c (la cesión de la lectura del prompt); `strix-halo`: la
+plantilla con el caché de conversaciones y chunks de 8192, `footprint_gb = 91`.
+
+1. **Cifras por petición.** Los tramos de una petición se suman (`add_leg`): el prompt y la reutilización del caché
+   son los del primer tramo, los tiempos, los tokens, los drafts y las lecturas de expertos se suman, el final es el
+   del último. El BDONE de un slot se lee hasta 5 s al dejarlo, y el motor informa en él los drafts del slot
+   (`--batch-mtp`). Por el lanzador, dos peticiones a la vez: el agente `prompt_n` 7 + `cache_n` 4801, drafts 86/101;
+   la corta, drafts 151/166 (antes: 0/0 y la lectura de la otra).
+2. **La espera de una petición que llega durante una lectura.** Antes, el servidor pedía ceder (`BYIELD`) solo en sus
+   latidos (la línea de progreso al final de un chunk, o 10 s de silencio), cuando el motor ya había empezado el chunk
+   siguiente, y solo a una petición con un prompt de a lo sumo la mitad de largo. El largo del prompt no dice cuánto
+   falta leer: el turno siguiente de una conversación es largo y casi todo está en caché, y esperaba la lectura
+   entera. Ahora:
+   - la lectura cede a cualquier petición que espera y podría seguir (tiene un slot, o queda uno libre para ella);
+     cada lectura cede a lo sumo dos veces;
+   - el servidor nota la petición en 0.25 s;
+   - el motor toma el `BYIELD` desde el segundo chunk de la lectura, así que todo tramo lee algo;
+   - una petición que encuentra todos los slots ocupados espera uno sin retener las líneas de control: con la regla
+     nueva, dos lecturas estacionadas en los dos slots más una tercera petición se esperaban entre sí para siempre (el
+     test nuevo falla con el código anterior);
+   - chunks de 8192 tokens en la plantilla (`--prefill 8192`).
+
+   Medido con la compilación de producción (servidor con los argumentos nuevos, sin caché ni codificador, 49152 × 2):
+
+   | Caso | Antes (chunks de 16384, regla de la mitad) | Ahora |
+   |---|---|---|
+   | Petición corta que llega 3 s después de empezar una lectura de 41.5k | ~13 s medidos (10.9) | 3.2 s |
+   | Prompt de 41.5k casi todo en caché durante una lectura de 39.5k | la lectura entera, ~29 s | 5.0 s |
+   | Dos lecturas frescas (39.5k y 41.5k, la segunda 1 s después) | ~44 y ~71 s (estimado con las lecturas solas) | 56.2 y 73.1 s |
+   | Lectura de 39.5k sola | 1316-1327 t/s | 1345 t/s |
+
+   **El costo:** dos lecturas largas que llegan juntas se alternan cada 8192 tokens (dos veces cada una, el log del
+   motor muestra las cesiones en 8192 y 16384): la primera responde ~12 s más tarde y la segunda no gana nada. Es el
+   precio de no comparar largos sin conocer lo que la petición que espera tiene en caché. `YIELDS_MAX = 1` lo bajaría a
+   ~6 s, pero entonces una segunda petición corta durante la misma lectura esperaría la lectura entera; queda en 2.
+3. **El caché de conversaciones**, activo en la plantilla (`--conversation-cache-mib 8192 --conversation-cache-slots
+   4`). Por el lanzador, el panel lo muestra activo (8192 MiB, 10 estacionamientos y 3 restauraciones en la prueba).
+
+Compuertas (la compilación de producción, `build-strata.sh`, con los tres commits):
+
+| Compuerta | Resultado |
+|---|---|
+| Suite del servidor | 464 tests OK (nuevos: cede a uno de largo parecido, cede sin líneas de progreso, no cede si el que espera no tiene slot, espera un slot sin las líneas de control) |
+| `batch_test` con `--batch-mtp`, chunks de 8192 | los dos slots idénticos a su lectura sola |
+| `parking_test`, chunks de 8192 | la continuación de 24.4k: 107 / 107 tokens iguales viva y restaurada |
+| Calidad del chunk de 8192 (criterio fijado antes de medir) | ver abajo: pasa |
+| Determinismo junto a un cliente Vulkan | 8 / 8 a 32.8k (336 iteraciones del ruido) y 8 / 8 a 39.5k (397) |
+| Historia (49152, el caché encendido) | idéntica con los drafts de producción (513 filas) y sin ellos (512); respuestas iguales |
+| Lanzador (16384 × 2) | carga en 34 s; corta 77 t/s; imagen de 2048×2048 en 9.3 s; texto → imagen → texto 5 / 5; dos a la vez iguales a sus respuestas solas, 69.9 t/s juntas |
+| Lanzador (28672 × 2) | pi en vivo con sus herramientas, 8.3k tokens (8212 del caché) |
+| Lanzador (49152 × 2) | una imagen enviada durante la petición de texto de 39.5k espera a que termine (+2.5 s) y las dos responden igual que solas |
+
+**Calidad.** El chunk cambia el orden de las sumas de la ruta de prompt. Criterio (la regla del Director del
+2026-09-30, con la referencia de redondeo puro de Strata): sobre las secuencias profundas (16384 tokens por la ruta de
+prompt, 1024 puntuados), KL(16384 ‖ 8192) a lo sumo el doble de KL(16384 ‖ 16384 con `STRATA_PF_FUSED=0`, la misma
+cuenta en otro orden), y el acuerdo de argmax a lo sumo 0.5 puntos bajo el de la referencia:
+
+| Secuencia | KL 8192 | KL referencia | argmax 8192 / referencia | Δ ln p 8192 (± se) |
+|---|---|---|---|---|
+| wiki profunda | 0.0170 | 0.0165 | 95.11 / 95.21 % | −0.0014 ± 0.0075 |
+| código profunda | 0.0053 | 0.0063 | 99.12 / 98.92 % | +0.0003 ± 0.0037 |
+
+**Memoria.** Desde esta sección cada huella declarada es la caída medida de MemAvailable (10.9: las corridas
+anteriores a 131072 × 2 quedaron bajo el margen). Medido: batch_test 66.8 GiB (65536), el servidor sin codificador
+66.3 (49152), la historia 67.5 sin drafts y 69.2 con ellos (49152, con el codificador y la imagen), el lanzador 70.1
+(16384, imágenes y caché), 68.9 (28672) y 70.8 (49152, la imagen junto al texto de 39.5k: 1.3 sobre lo declarado,
+mínimo 41.8 libres). El escritorio dejaba 110.6-112 GiB libres sin ninguna carga (116 a la
+tarde): los navegadores ocupan ~11 GiB. Con producción a 262144 × 2 y el caché lleno quedan 21-25 GiB, según esa cifra
+(llama.cpp ~22).
