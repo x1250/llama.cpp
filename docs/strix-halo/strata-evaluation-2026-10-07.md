@@ -659,9 +659,8 @@ comparten la lectura de expertos.
 - **El fusible `ram-guard`** (`~/.local/bin/ram-guard.sh`, unidad de usuario) ahora también mata el motor y el
   codificador de Strata (`pgrep -x strata; pgrep -x strata-vision`), con la autorización del Director (2026-10-07,
   21:18; el script reemplazado de una vez y la unidad reiniciada).
-- **La primera carga de producción a 262144 × 2** es suya (`strix load qwen38flash`): una prueba mía no puede cargarla
-  con los 40 GiB de margen; la huella de `config.ini` (91 GiB desde 10.11, con el caché de conversaciones lleno) está
-  medida a 131072 × 2 y extrapolada.
+- **La huella de producción** está medida a 262144 × 2 desde 10.12 (`footprint_gb = 88`, con el caché de
+  conversaciones lleno); la carga de producción es suya (`strix load qwen38flash`).
 - **Límites conocidos:** una petición que llega durante la lectura de un prompt largo espera hasta el fin del chunk en
   curso (8192 tokens, ~6 s; llama.cpp cede cada 2048 tokens); dos lecturas largas que llegan juntas se alternan y la
   primera responde ~12 s más tarde (10.11); una petición con imágenes corre sola (la otra espera).
@@ -741,3 +740,22 @@ anteriores a 131072 × 2 quedaron bajo el margen). Medido: batch_test 66.8 GiB (
 mínimo 41.8 libres). El escritorio dejaba 110.6-112 GiB libres sin ninguna carga (116 a la
 tarde): los navegadores ocupan ~11 GiB. Con producción a 262144 × 2 y el caché lleno quedan 21-25 GiB, según esa cifra
 (llama.cpp ~22).
+
+### 10.12 La huella real de producción (2026-10-08)
+
+El Director bajó el margen de carga de 40 a 20 GiB (MemAvailable − huella; `gate.py`, `CLAUDE.md`): producción corre
+semanas con 21-25 GiB libres y el freeze #7 dejó ~15. Con eso una prueba puede cargar producción tal cual, y la huella
+de `config.ini`, extrapolada de 131072 × 2, quedó medida. Por el lanzador, `config.ini` y la plantilla de producción
+(262144 × 2, el caché de conversaciones, chunks de 8192, el codificador de imágenes), con MemAvailable ≥ 24 GiB
+verificado antes de cada paso:
+
+| Paso | Caída de MemAvailable | MemFree mínimo |
+|---|---|---|
+| La carga (36 s; GTT 76.5 GiB) | 77.9 GiB | 16.6 GiB |
+| Dos lecturas frescas de 40k en los dos slots | 80.2 | 14.4 |
+| Dos conversaciones de 40k alternadas (los segundos turnos en 3.0 y 3.1 s, restauradas del caché) | 81.3 | 13.3 |
+| La imagen de 2048×2048 (9.3 s) y pi en vivo | 81.6 | 13.0 |
+
+Al final el caché tenía 2.5 GB (4 conversaciones). Con el resto de su presupuesto (8 GiB) la huella llega a 87.2 GiB:
+`footprint_gb = 88` (antes 91, extrapolado), que con los ~111 GiB que el escritorio deja libres hoy deja ~24 GiB.
+La velocidad a 262144 es la de contextos chicos: corta 78.3 t/s, la lectura de 39.5k a 1324 t/s (39483 tokens en 29.8 s de lectura).
