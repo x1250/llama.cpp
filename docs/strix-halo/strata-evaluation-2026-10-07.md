@@ -38,9 +38,11 @@ entre "I" y "The" que la numérica de cada motor también mueve (sección 5), as
 
 **Compuertas para reemplazar producción (secciones 8, 9 y 10):** con el fork arreglado (sección 10) pasan todas:
 pi a través de su servidor, imágenes en GPU, el pensamiento ajeno, el determinismo (la carrera era un kernel de expertos
-del prompt al que el compilador le quitó una espera; arreglada y comprobada junto a otro cliente de la GPU), dos
-peticiones a la vez (correctas, a la par de llama.cpp en conjunto y más rápidas para una corta durante una lectura
-larga), la compuerta de historia y el lanzador. La memoria residente en la GPU, ~60 GiB, la aceptó el Director.
+del prompt al que el compilador le quitó una espera; arreglada), dos peticiones a la vez (correctas), la compuerta de
+historia y el lanzador. La memoria residente en la GPU, ~60 GiB, la aceptó el Director. **Con dos peticiones a la vez
+Strata rinde menos que llama.cpp en conjunto** (42 contra 57 t/s con `slots.py`); una corta que llega antes que una
+lectura larga termina antes que en llama.cpp (6.8 contra 7.6 s), pero una que llega durante una lectura larga espera
+hasta el fin del chunk (21 s en total, 10.6).
 
 ## 1. Cómo corre aquí sin duplicar los expertos ni usar la CPU
 
@@ -474,6 +476,8 @@ Decisión del Director: producción pasa a nuestro fork de Strata, arreglado; ~6
 | 57c6375 (incluye upstream 569c094) | `--batch-mtp` caía y los drafters de los slots no eran los del camino solo | `batch_test.py --batch-mtp`: idénticos; 57 t/s juntas |
 | bf7f443 | una petición con imágenes junto a otra rotaba las posiciones del otro slot (10.3) | tests del servidor, compuerta de historia |
 | a2bcaf8 | `STRATA_LOGPOS_DECODE`: las filas del decode, para comparar log-probs | compuerta de historia (10.4) |
+| d810a71 | un slot que decodifica esperaba un chunk entero (~13 s) mientras otro leía un prompt; ahora cede entre capas | `slots.py`: 6.8 s en vez de 17.5, respuestas iguales (10.2) |
+| 0f43590 | con dos slots, una lectura sola iba de a un chunk (−8.6 % de velocidad de prompt) | 1288 t/s en vez de 1218; la cesión a una corta sigue igual (10.6) |
 
 ### 10.1 La carrera de la lectura del prompt: causa y arreglo
 
@@ -516,13 +520,18 @@ que 9.3):
 | | llama.cpp, producción | Strata antes (corrupto) | Strata arreglado |
 |---|---|---|---|
 | Una sola, agente / corta | 45.1 / 61.5 t/s | 66.6 / 77.7 t/s | 67.5 / 77.7 t/s |
-| Dos a la vez, juntas | 56.9 t/s | 36.7 t/s, texto corrupto | 41.8 t/s (`slots.py`); 57.4 t/s (`batch_test.py`) |
-| Una corta (256 tokens) mientras se leen 40k | 7.6 s | 17.5 s | 6.8 s |
+| Dos a la vez, juntas | 56.9 t/s | 36.7 t/s, texto corrupto | 42.4 t/s |
+| Una corta (256 tokens) que llega antes que la lectura de 40k | 7.6 s | 17.5 s | 6.8 s |
+| Una corta que llega 3 s después de empezar una lectura de 41.5k | sin medir | sin medir | 21.2 s (10.6) |
 | Lectura de los 40k junto a la corta | ~70 s | ~33 s | 40.8 s |
 | Respuestas iguales a las de cada una sola | sí | no (corruptas) | sí, en todas |
 
-- `tools/batch_test.py` (dos slots, las opciones de exactitud de BATCHING.md): los 128 tokens greedy de cada slot
-  idénticos a los de la misma petición sola, sin y con `--batch-mtp`.
+- **En conjunto, Strata queda ~26 % por debajo de llama.cpp con dos peticiones a la vez** (y dos juntas suman menos
+  que una sola, 66-78 t/s). En `slots.py` el agente del par no propone drafts (`draft 0/0`) mientras la corta sí
+  (64/69): es la primera pista para cerrar esa diferencia, sin investigar.
+- `tools/batch_test.py` (otra prueba: prompts cortos, 128 tokens, las opciones de exactitud de BATCHING.md) es la
+  compuerta de exactitud: los 128 tokens greedy de cada slot idénticos a los de la misma petición sola, sin y con
+  `--batch-mtp` (57.4 t/s juntas en esa prueba; no comparable con los 56.9 de llama.cpp en `slots.py`).
 - **El reparto entre capas** (d810a71): antes la lectura de un prompt junto a un slot que decodifica cedía la GPU solo
   entre chunks de 16384 tokens (~13 s cada uno en gfx1151). Ahora la lectura le debe al slot 0.67 de su tiempo (el
   40 % de la GPU, la decisión del Director del 2026-09-23 para `--decode-share` de llama.cpp) y se lo paga entre dos
@@ -560,7 +569,11 @@ la cola de 64 tokens leída 8 veces junto al cliente Vulkan (log-probs con 9 dec
 | 32.8k, dos chunks | 8 / 8 (la compilación de prueba) y 8 / 8 (la de producción, `build-strata.sh`, 0f43590) |
 | 39.5k, tres chunks | 8 / 8 y 8 / 8 |
 
-y las filas iguales a las de las lecturas sin ruido de todas las compilaciones (base, con y sin tope de VGPR). La
+y las filas iguales a las de las lecturas sin ruido de todas las compilaciones (base, con y sin tope de VGPR). Estas
+lecturas no prueban por sí solas el cierre: la provocación no es constante (la cadena de control de las 19:00 no
+desvió ni la base). La evidencia que cierra la carrera es el código máquina (10.1: falta la espera en el arco de
+vuelta, que el compilador emite con la barrera) más que ninguna lectura con el arreglo desvió nunca. Riesgo residual:
+la misma omisión del compilador podría estar en otros bucles con doble búfer en LDS; no revisé otros kernels. La
 compuerta de historia (10.4) repetida con la compilación de producción: idéntica. Los GEMM del prompt (40k, `STRATA_HIPBLASLT_VERBOSE=1`):
 1946 llamadas a hipBLASLt, 0 caídas a hipBLAS (el candidato de sumas atómicas de rocBLAS queda descartado).
 
@@ -591,7 +604,15 @@ unload`) termina servidor, motor y codificador en 2 s; ningún reinicio de anill
 GiB y MemAvailable mínimo 39 GiB a 131072 × 2; a 262144 × 2 las tres sesiones crecen 5.4 GiB (extrapolado): ~33 GiB
 libres, contra ~22 de llama.cpp. `footprint_gb = 83`.
 
-### 10.8 Para el Director
+### 10.8 Profundidad
+
+Con las funciones de producción (MTP y lookup, el codificador de imágenes) por el lanzador, un slot a 262144 (dos a
+262144 no entran en el margen de una prueba): la prosa de 124.8k y el código de 124.7k en un turno (249 558 tokens),
+leídos a 1247 t/s en 200 s y 256 tokens a 43.1 t/s; después, un turno con una imagen de 1024×1024 (las cuatro líneas
+transcritas exactas) y uno corto de texto (coherente con el principio del texto). Ningún reinicio de anillo, de KFD ni
+de MES en el kernel; GTT máximo 70 GiB, MemAvailable mínimo 41 GiB.
+
+### 10.9 Para el Director
 
 - **El fusible `ram-guard`** (`~/.local/bin/ram-guard.sh`, unidad de usuario) solo mata `llama-*` y ComfyUI; no pude
   cambiarlo desde esta sesión (el clasificador de permisos lo bloqueó). Con producción en Strata hay que agregar el
