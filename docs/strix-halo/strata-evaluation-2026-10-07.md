@@ -614,10 +614,9 @@ de MES en el kernel; GTT máximo 70 GiB, MemAvailable mínimo 41 GiB.
 
 ### 10.9 Para el Director
 
-- **El fusible `ram-guard`** (`~/.local/bin/ram-guard.sh`, unidad de usuario) solo mata `llama-*` y ComfyUI; no pude
-  cambiarlo desde esta sesión (el clasificador de permisos lo bloqueó). Con producción en Strata hay que agregar el
-  motor y el codificador a su lista: en la línea del `for p in $(pgrep -x llama-server; ...)`, sumar
-  `pgrep -x strata; pgrep -x strata-vision;`, y después `systemctl --user restart ram-guard.service`.
+- **El fusible `ram-guard`** (`~/.local/bin/ram-guard.sh`, unidad de usuario) ahora también mata el motor y el
+  codificador de Strata (`pgrep -x strata; pgrep -x strata-vision`), con la autorización del Director (2026-10-07,
+  21:18; el script reemplazado de una vez y la unidad reiniciada).
 - **La primera carga de producción a 262144 × 2** es suya (`strix load qwen38flash`): una prueba mía no puede cargarla
   con los 40 GiB de margen; la huella de `config.ini` (83 GiB) está medida a 131072 × 2 y extrapolada.
 - **Límites conocidos:** una petición corta que llega durante la lectura de un prompt largo espera hasta el fin del
