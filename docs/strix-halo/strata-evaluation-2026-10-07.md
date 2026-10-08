@@ -612,7 +612,42 @@ leídos a 1247 t/s en 200 s y 256 tokens a 43.1 t/s; después, un turno con una 
 transcritas exactas) y uno corto de texto (coherente con el principio del texto). Ningún reinicio de anillo, de KFD ni
 de MES en el kernel; GTT máximo 70 GiB, MemAvailable mínimo 41 GiB.
 
-### 10.9 Para el Director
+### 10.9 Dos peticiones a la vez: por qué rinde menos que llama.cpp (2026-10-07, noche)
+
+Investigación del Director: "el bug de las dos peticiones a la vez". Tres hallazgos, en orden de peso:
+
+1. **El caché de conversaciones del motor estaba apagado.** La sesión principal de Strata guarda una sola
+   conversación: cuando entra otra, los checkpoints de la anterior se descartan y su siguiente turno se lee entero de
+   nuevo. Strata trae un caché que estaciona hasta N conversaciones en RAM del host (`--conversation-cache-mib`,
+   `--conversation-cache-slots`, "controller/worker histories when their requests alternate"), apagado por defecto, y
+   la plantilla de producción no lo activaba. Medido con la compilación de producción (131072 × 2):
+
+   | | sin el caché | con el caché (8192 MiB, 4 conversaciones) |
+   |---|---|---|
+   | Dos conversaciones de 40k que se alternan (`alt_conv.py`), segundo turno de cada una | 31.3 y 32.4 s (relee 39.6k y 41.7k) | 3.9 y 2.9 s (restaurada en 36 ms) |
+   | Dos peticiones a la vez (`slots.py`), en conjunto | 42.2 t/s (10.0 s) | 68.5 t/s (6.2 s); llama.cpp 56.9 |
+   | Una conversación de 40k estacionada | — | ~1.1 GB de RAM del host |
+
+   En el par, el agente releía sus 4808 tokens (3.5 s) porque la petición corta anterior había ocupado la sesión.
+   **Exactitud en gfx1151:** `tools/parking_test.py` (arreglado en 5c812ba: leía el log del motor de una ruta fija):
+   la continuación de una conversación de 24.4k decodifica los mismos 107 tokens viva que estacionada y restaurada; por
+   el servidor con dos slots (65536), los segundos turnos restaurados de las dos conversaciones de 40k son iguales a
+   los de su continuación sin otra conversación en medio. Costo: hasta 8 GiB de RAM del host (MemAvailable mínimo 38
+   contra 40 GiB a 131072 × 2).
+2. **Las cifras por petición con dos slots son de otra petición.** El servidor arma los `timings`, el historial y los
+   totales de cada petición con `engine.last`, un único registro del motor que reescribe el último DONE o BDONE de
+   cualquier petición (`serve/server.py`, `Service.run` y `StrataEngine`): con dos a la vez, una petición informa la
+   lectura, los drafts y los t/s de la otra (el "draft 0/0" y los 78 t/s de 10.2). El texto y el uso de tokens no se
+   ven afectados; las cifras de velocidad de 10.2 están medidas con el reloj del cliente por eso.
+3. **Una petición que llega durante la lectura de otra espera esa lectura** (o hasta el fin del chunk en curso si es
+   más larga que un chunk): el par del ensayo esperó los 3.5 s de los 4.8k del agente; con 16384 tokens por chunk, hasta
+   ~13 s. Es la granularidad del motor (la sesión principal admite de a una petición), no un defecto.
+
+Con el caché encendido, en la ventana batch Strata produce ~64 t/s entre dos slots (90 ventanas de 50 ms con 3.7 filas
+aceptadas de 4), lo mismo que una petición sola: el decode del MoE está limitado por memoria y dos secuencias no
+comparten la lectura de expertos.
+
+### 10.10 Para el Director
 
 - **El fusible `ram-guard`** (`~/.local/bin/ram-guard.sh`, unidad de usuario) ahora también mata el motor y el
   codificador de Strata (`pgrep -x strata; pgrep -x strata-vision`), con la autorización del Director (2026-10-07,
