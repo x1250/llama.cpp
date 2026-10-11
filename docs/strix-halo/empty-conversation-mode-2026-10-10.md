@@ -20,7 +20,10 @@ muestreo) y `~/dbg/strata/empty/official/` (la referencia con el código oficial
   que conserva la plantilla, BF16 abre con el modo 0.23-0.40 y el GGUF 0.87-0.96 (sección 10). No depende del
   pensamiento anómalo del turno 2: quitar cualquiera de los siete por separado deja el modo (sección 3). Las secciones 7 y 9
   la localizan con una medida forzada (gate/up IQ3_S cerca de tres cuartos, down IQ4_NL el resto, repartida en todas
-  las capas); el control nulo de la sección 9 dice si esa medida sigue la precisión.
+  las capas). El control nulo de la sección 9 muestra que esa medida no sigue la distancia al redondeo de producción
+  (otro IQ3_S con imatrix amplifica igual) ni solo el tamaño del error (IQ3_S sin imatrix, peor en general, queda al
+  nivel de gate/up sin cuantizar): en esa medida forzada, con un redondeo por tipo, amplifica el IQ3_S calibrado con
+  imatrix; Q5_K con imatrix, no.
 - **No hay arreglo de motor.** Las palancas (sección 11) son decisiones del Director: más precisión en los expertos
   (lo reduce en req8, no el inicio, y no cabe en la memoria de producción) o no conservar los pensamientos anteriores
   (lo elimina en req8 por una razón que no se aisló; no toca el inicio).
@@ -127,8 +130,9 @@ continuación anómala 5 tokens o más y el tercer token (lo que sigue a "The us
 | req8+12 | 0.240 → 0.364 |
 | req2 | 0.058 → **0.647** |
 
-BF16 0/7, GGUF 4/7. En el prompt corto, GGUF contra BF16: KL 0.43, argmax 83.1 %, PPL 3.40 → 3.48. Entre corridas la
-referencia varía hasta ~0.01 en p(3.º) (cómputo no determinista de la GPU), muy por debajo de la diferencia.
+BF16 0/7, GGUF 4/7. En el prompt corto, GGUF contra BF16: KL 0.43, argmax 83.1 %, PPL 3.40 → 3.48. La referencia no es
+determinista entre corridas (sección 9): en cinco corridas del mismo GGUF, p(3.º) fue 0.57-0.92 en req8+0, 0.66-0.82
+en req8+1, 0.42-0.67 en req8+4 y 0.64-0.65 en req2, siempre por encima de BF16 en esas cuatro.
 
 Estas cifras son las de **las continuaciones que escribió el GGUF**, forzadas: miden cuánto prefiere cada modelo esas
 aperturas, no con qué frecuencia el modelo BF16 abriría con el modo por su cuenta (sección 10).
@@ -162,7 +166,9 @@ Recalibrar no basta. Error ponderado por el imatrix (capa 5, expertos 0-3) contr
 | IQ3_S sin imatrix | 0.027-0.029 |
 | IQ4_XS con o sin imatrix | 0.0054-0.0062 |
 
-El IQ3_S de Unsloth ya está calibrado. IQ4_XS baja el error 3× y en la bisección solo llega a mitad de camino.
+El IQ3_S de Unsloth ya está calibrado. IQ4_XS baja el error 3× y en la bisección solo llega a mitad de camino; se
+midió sin imatrix, y quitar el imatrix ya baja la medida por sí solo (sección 9): esa mitad no se puede atribuir a los
+bits.
 
 ## 8. Lo que admiten los motores
 
@@ -188,13 +194,14 @@ Misma medida que la sección 7, con el lado denso del GGUF en todas y la referen
 - Gate/up lleva cerca de tres cuartos del exceso; down (IQ4_NL) el cuarto restante.
 - Q5_K en gate/up queda al nivel de gate/up sin cuantizar: la diferencia entre los dos (0.092 contra 0.106) es la
   resolución de la medida, no una mejora.
-- Ninguna mitad de las capas lo concentra: la segunda pesa más (0.093 de exceso contra 0.044) y juntas dan más que la
-  suma (0.193).
+- Ninguna mitad de las capas lo concentra: con una mitad cuantizada queda 0.097-0.146, con las dos 0.246 (más que la
+  suma de los dos excesos); cuál mitad pesa más queda dentro de la resolución de la medida (abajo).
 - req2 aporta ~1e-10 en todas las variantes: la media son, en la práctica, las tres continuaciones de la petición 8.
 
 Costo de las recetas que la medida señala (gate/up en Strata: IQ3_S 0.672 GiB por capa; IQ4_XS +0.159, Q5_K +0.403;
-down IQ4_NL 0.439, Q5_0 +0.098): Q5_K en las 48 capas +19.3 GiB, solo en la segunda mitad +9.7, IQ4_XS en todas +7.6
-(llega a mitad de camino, sección 7), down Q5_0 en todas +4.7. Producción deja ~3 GiB sobre el margen.
+down IQ4_NL 0.439, Q5_0 +0.098): Q5_K con imatrix en las 48 capas +19.3 GiB (medido), IQ4_XS en todas +7.6 (medido
+solo sin imatrix, mitad de camino; abajo), down Q5_0 en todas +4.7 (sin medir). Subir solo una mitad de las capas no
+tiene apoyo en la medida (abajo). Producción deja ~3 GiB sobre el margen.
 
 **El GGUF de Strata y el anterior de llama.cpp tienen los mismos expertos.** Diferencias de tipos entre
 `NL3S/qwen4exp-nl3s-hcdi-gu-rq8-oproj8.gguf` y `NL3S-strata/qwen4exp-ud-small-nl3s.gguf` (además del layout gate+up
@@ -206,9 +213,32 @@ salvo la capa 2, y en llama.cpp reproduce más (10/10 contra 6/10, sección 2): 
 monótona**.
 
 Las cifras de esta sección y de la 7 son de continuaciones que escribió el GGUF de producción en un casi empate:
-cualquier perturbación de esos pesos tiende a bajarles la probabilidad aunque no mejore nada. El control nulo
-(gate/up re-cuantizado a IQ3_S desde BF16, mismos bits que producción) decide si miden precisión o distancia al redondeo
-de producción: PENDIENTE.
+cualquier perturbación de esos pesos podría bajarles la probabilidad aunque no mejore nada. El control nulo
+(`variants-null.json`) re-cuantiza gate/up a IQ3_S desde BF16, los mismos bits que producción, en la misma pasada que
+el GGUF:
+
+| Gate/up | Error (sección 7) | Anómalas / 4 | Media p(primeros 10) | req8+0, +1, +4 | KL corto contra el GGUF | PPL corto |
+|---|---|---|---|---|---|---|
+| IQ3_S de producción (Unsloth) | 0.0168-0.0185 | 3 | 0.278 | 0.378, 0.535, 0.201 | — | 3.472 |
+| IQ3_S desde BF16 con nuestro imatrix | 0.0160-0.0175 | 3 | 0.303 | 0.227, 0.594, 0.389 | 0.251 | 3.444 |
+| IQ3_S desde BF16 sin imatrix | 0.027-0.029 | 2 | 0.108 | 0.162, 0.144, 0.125 | 0.366 | 3.532 |
+
+**Resolución.** La referencia no es determinista entre corridas (no fija el modo determinista de PyTorch; cada corrida
+de una secuencia cae en uno de pocos resultados exactos). El mismo GGUF en cinco corridas (las pasadas de las secciones 6 y 7,
+la de esta tabla y dos veces en una misma pasada, `variants-noise.json`): media 0.239-0.278; por continuación,
+0.19-0.38 (req8+0), 0.40-0.54 (req8+1) y 0.20-0.35 (req8+4); anómalas 4/4 en cuatro corridas y 3/4 en esta; entre dos
+corridas, KL 0.006 y |Δ log p| hasta 1.6 en el texto corto. Cada brazo de las tablas es una corrida: diferencias de
+media de ~0.04 y de uno en la columna de anómalas no se distinguen. Los extremos de esos rangos son la corrida de esta
+tabla, que no coincidió exactamente con ninguna otra; sin ella quedan 0.19-0.23, 0.40-0.44 y 0.33-0.35, y las dos
+lecturas de abajo no cambian.
+
+- **No mide la distancia al redondeo de producción.** Otro IQ3_S con imatrix, que cambia el 13 % de los argmax del
+  texto corto, queda dentro o por encima del rango de producción en las tres continuaciones.
+- **Tampoco mide solo el tamaño del error.** IQ3_S sin imatrix, con 1.6× el error y peor perplejidad, queda por debajo
+  del rango de producción en las tres, al nivel de gate/up sin cuantizar (0.108 contra 0.106).
+- **En esta medida amplifica el IQ3_S calibrado con imatrix;** IQ3_S sin calibrar y Q5_K con imatrix quedan al nivel
+  de gate/up sin cuantizar (que todavía lleva el exceso de down). Es una descripción (un redondeo por tipo, tres continuaciones forzadas), no un mecanismo. De los brazos
+  con más bits, Q5_K con imatrix es el único que no confunde los bits con quitar el imatrix.
 
 ## 10. Generación libre con BF16
 
@@ -216,7 +246,7 @@ de producción: PENDIENTE.
 (GGUF: filas del archivo; BF16: rangos del checkpoint). Verificado contra la pasada por capas con los mismos pesos:
 expertos bajo demanda idénticos al módulo oficial (`test_ondemand.py`, diferencia 0); el decode con caché, forzado
 sobre req8+0 y req8+1, KL 0.009 / 0.004 y un argmax distinto en 80 posiciones (un empate 0.362 / 0.362), del orden del
-ruido de la propia referencia entre corridas (KL hasta 0.006, |Δ log p| hasta 0.55).
+ruido de la propia referencia entre corridas (KL 0.006, |Δ log p| hasta 1.6; sección 9).
 
 La medida (`opening_tree`): el árbol de la apertura del pensamiento con la distribución de cada modelo, todas las rutas
 de 3 tokens con probabilidad ≥ 0.01 entre los 8 más probables de cada nodo, cada hoja continuada greedy hasta 10
@@ -287,11 +317,14 @@ modelo ya tiene en ese contexto.
 - **El inicio:** es del modelo (BF16 0.43 en req2; con la tabla PLE oficial, "The user hasn't asked" 0.39). Ninguna
   cuantización de los expertos lo quita.
 - **req8, con precisión:** subir los expertos lo acerca a BF16 (0.23-0.40 en vez de 0.87-0.96). Sobre la
-  medida forzada, IQ4_XS en gate/up de todas las capas (+7.6 GiB) recupera la mitad y Q5_K (+19.3 GiB) casi todo
-  (secciones 7 y 9); producción deja ~3 GiB sobre el margen. Un canje a igual tamaño por capa (Strata ya acepta
+  medida forzada, Q5_K con imatrix en gate/up de todas las capas (+19.3 GiB) llega al nivel de gate/up sin cuantizar
+  (sección 9); IQ4_XS (+7.6 GiB) se midió solo sin imatrix, que por sí solo ya baja la medida: IQ4_XS con imatrix está
+  sin medir. Producción deja ~3 GiB sobre el margen. Un canje a igual tamaño por capa (Strata ya acepta
   IQ3_XXS e IQ2_S en gate/up para bajar) choca con que el efecto está repartido en todas las capas; por experto (los
   más usados arriba: el 25 % más usado recibe el 68 % del tráfico en el corpus del imatrix) exige dos tipos por capa en
-  los dos motores. Ninguno se midió.
+  los dos motores. Ninguno se midió. IQ3_S sin imatrix baja la medida forzada al mismo tamaño, pero es peor en general
+  (KL 0.37 contra producción, perplejidad 3.47 → 3.53), es un solo redondeo y no pasó por el árbol de la sección 10:
+  no es una palanca medida.
 - **req8, sin los pensamientos anteriores:** no conservarlos (sección 3) elimina el modo en req8 (25/25 → 0/25 con
   el GGUF), aunque ninguno de ellos por separado es la causa, y no toca el inicio (req2 9/25); sin pensamientos, req8
   con 4 de relleno inventa otra cosa. Quedó en un stash de los dos repos ("preserve_thinking (not adopted)"); el
