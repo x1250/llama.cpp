@@ -331,6 +331,45 @@ modelo ya tiene en ese contexto.
   Director lo había descartado como workaround.
 - **Aceptarlo y reportarlo a Qwen** como modo de falla del modelo en bucles de herramientas, con req2 como caso.
 
+## 12. La comunidad y la receta oficial (2026-10-11)
+
+**Lo reporta mucha gente, con las mismas frases.** Hilos revisados: NVIDIA Developer Forums ("Weird Post Turn System
+Prompt Injection Issues - Qwen 3.8 Flash", 2026-09-18 a 10-05), Hacker News (49749532), Qwen/Qwen3.8-Flash-Next #68
+y #50 en HF, unslothai/unsloth #12327 y ISTA-DASLab GSQ-RCO-GGUF #32. Aparecen "The user hasn't asked anything
+substantive yet", "The user's message is just system instructions setup" y "The user's message is empty — there's no
+actual query content, just a conversation start marker". Hay reportes con vLLM, SGLang, llama.cpp, MLX y Strata
+(IQ3_S); con NVFP4, int4, Q8, Q5_K_M e IQ4_XS; y con pi, OpenCode, Qwen Code y Unsloth Studio. Un usuario dice verlo
+también en el modelo que sirve Alibaba por OpenRouter (sin verificar). Tres usuarios independientes reportan el mismo
+prompt de sistema inventado, "You are an expert software engineer. Helps user to solve problems." (uno, además, "always
+invoke a function call"): es lo que citó el modelo en la sesión de la sección 1, sin que esos textos estén en el prompt.
+
+**Nadie tiene la causa ni un arreglo confirmado, y Qwen no respondió en ningún hilo.** Lo propuesto:
+- el arreglo de CUDA graphs de QSA de NVIDIA (refutado por el mismo reportero);
+- que la plantilla acepta un turno de usuario vacío (cierto, pero no cubre los casos con pedido real);
+- quitar del historial un turno vacío anterior (#50, otro síntoma: "No response requested.");
+- esfuerzo medium o min_p 0.1 (anécdotas sin confirmar).
+
+En la sesión de la sección 1 no hay turnos de usuario vacíos ni cadenas de control (`<|im_end|>`, `<tool_response>`,
+`</think>`) dentro de los resultados de herramientas.
+
+**La receta oficial** (ficha del modelo, "Best Practices" y "API Usage"; `generation_config.json`) contra producción
+(pi `models.json` + `run-server.sh` + Strata):
+
+| Parámetro | Oficial (thinking) | Producción |
+|---|---|---|
+| temperature | 1.0 | 0.7 (decisión del Director, `run-server.sh` d7fb83d); T 1.0 no cambia el modo (sección 3) |
+| top_p, top_k, min_p | 0.95, 20, 0.0 | igual |
+| presence / repetition penalty | 0.0 / 1.0 | igual |
+| enable_thinking, preserve_thinking | true, true (por defecto) | igual |
+| reasoning_effort | xhigh (por defecto) | **medium** (nivel de pensamiento de pi); con medium la plantilla no agrega ninguna instrucción de esfuerzo al sistema |
+| Salida máxima | 262 144 de razonamiento + 131 072 de respuesta | 16 384 (pi `maxTokens`) |
+| Contexto | 262 144 nativo | 262 144 |
+| Plantilla | la del checkpoint | la de Unsloth; mismos tokens en req2 y req8 (sección 1); el texto de xhigh es el mismo en las dos |
+| Pesos | BF16 / FP8 | GGUF con expertos IQ3_S (amplifica en req8, sección 10) |
+| Motor | SGLang, vLLM, TokenSpeed, KTransformers | Strata, fiel al código oficial (sección 5) |
+
+Todas las mediciones de este documento usan esfuerzo medium. El modo con xhigh no se midió.
+
 ## Herramientas
 
 | Archivo (`~/dbg/strata/empty/`) | Qué hace |
