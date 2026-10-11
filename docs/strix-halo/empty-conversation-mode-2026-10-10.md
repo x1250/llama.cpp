@@ -14,9 +14,8 @@ muestreo) y `~/dbg/strata/empty/official/` (la referencia con el código oficial
   afectado de la sesión con probabilidad 0.43 ("The user hasn't asked anything substantive yet", "The user's
   message is empty — there's no", el texto exacto de pi), igual que el GGUF de producción (0.46) (sección 10). Aparece
   en turnos de agente cuyo último mensaje "user" es una respuesta de herramienta: el modelo concluye que el usuario no
-  pidió nada o que solo hay instrucciones de sistema. Salvedad: en todas las pasadas de referencia, BF16 incluido, la
-  tabla PLE es la del GGUF (IQ4_NL; sus 320 M de filas no se traen por rangos); el control con la tabla oficial está
-  en la sección 10.
+  pidió nada o que solo hay instrucciones de sistema. Las pasadas de referencia usan la tabla PLE del GGUF (IQ4_NL);
+  con las filas oficiales de la tabla el inicio se mantiene: "The user hasn't asked" 0.39 en req2 (sección 10).
 - **En el contexto largo de req8 la cuantización de los expertos lo amplifica.** Con los siete pensamientos anteriores
   que conserva la plantilla, BF16 abre con el modo 0.23-0.40 y el GGUF 0.87-0.96 (sección 10). No depende del
   pensamiento anómalo del turno 2: quitar cualquiera de los siete por separado deja el modo (sección 3). Las secciones 7 y 9
@@ -250,7 +249,30 @@ check the skill location…", "I should approach this with a direct answer", "An
 La cuantización cambia la redacción dominante ("just sent system instructions" en el GGUF, "hasn't asked anything" en
 BF16); con la masa cortada (0.37 y 0.49) la medida no dice si cambia también la frecuencia.
 
-**En req8 la cuantización lo amplifica.** En el contexto largo de req8, BF16 también abre con el modo (0.23-0.40; en req8+0 es su apertura greedy: "The user has just sent system instructions
+**La tabla PLE oficial.** Todas las pasadas de referencia, BF16 incluido, leen la tabla PLE del GGUF (IQ4_NL): sus
+320 M de filas (~102 GB en BF16) no se traen por rangos fila a fila. `ple_official.py` calcula con el módulo oficial
+las filas que leen req2 y req8+0 con sus aperturas (132 921), recorre la tabla oficial completa en 768 pedidos de
+128 MB (27 min, sin disco) y guarda solo esas (43 MB; correlación por fila con las del GGUF 0.997, la de la sección 4).
+`ref_variants.py` con `"ple"` las usa en lugar de las del GGUF (`ref_forward.OfficialRows`). Las aperturas de BF16,
+forzadas con las dos tablas (`ple_compare.py`, `out-ple/`):
+
+| | Tabla del GGUF | Tabla oficial |
+|---|---|---|
+| req2: P("The"), P(" user"), P(" hasn" \| "The user") | 0.532, 0.972, 0.751 | 0.562, 0.941, 0.762 |
+| req2: "The user hasn't asked" (conjunta) | 0.37 | 0.39 |
+| req2: "The user's message is empty — there's no" (conjunta) | 0.031 | 0.026 |
+| req8+0: P("The") | 0.674 | 0.942 |
+| req8+0: tercer token tras "The user" | has 0.31, hasn 0.25, asked 0.19, just 0.16 | just 0.34, hasn 0.23, asked 0.16, has 0.14 |
+
+El inicio no depende de la tabla: con la oficial, req2 abre con "The user hasn't asked" 0.39 y "The user's message is
+empty" 0.03, al menos lo mismo que con la del GGUF. En req8+0 la tabla sí pesa, y la oficial lleva al modelo hacia la
+apertura del GGUF ("The" 0.94 contra 0.93 del GGUF): con la tabla oficial BF16 abriría req8 con el modo al menos tanto
+como en el árbol de arriba (con la oficial, "The user has just sent system instructions establishing me as" 0.11
+forzada, más el prefijo "The user hasn" 0.22, que en todos los árboles siguió con el modo). La cifra exacta de BF16
+completo en req8 no se midió; la amplificación por los expertos de abajo está medida con la tabla del GGUF fija, la
+que conservaría cualquier receta de producción.
+
+**En req8 la cuantización de los expertos lo amplifica.** En el contexto largo de req8, BF16 también abre con el modo (0.23-0.40; en req8+0 es su apertura greedy: "The user has just sent system instructions
 establishing me as"), pero el GGUF lo hace 0.87-0.96. Aun sumándole a BF16 toda la masa cortada (0.56-0.73), queda por
 debajo del GGUF. El resto de las hojas de BF16 en req8 son sanas o neutras ("The user asked only to fix the AGENTS.md",
 "The user just wants the content", "El archivo quedó con 3 líneas"). Por la regla fijada, req8 queda entre los dos
@@ -262,8 +284,8 @@ modelo ya tiene en ese contexto.
 - **En los motores:** nada. Strata y llama.cpp reproducen el código oficial con los mismos pesos (sección 5); la
   diferencia de tasa en el campo (Strata 3/356 turnos, los tres en una sesión; llama.cpp 2/2342) es una sesión contra
   dos (1 de 8 contra 2 de 87; Fisher unilateral p = 0.23).
-- **El inicio:** es del modelo (BF16 0.43 en req2, con la tabla PLE del GGUF). Ninguna cuantización de los expertos
-  lo quita.
+- **El inicio:** es del modelo (BF16 0.43 en req2; con la tabla PLE oficial, "The user hasn't asked" 0.39). Ninguna
+  cuantización de los expertos lo quita.
 - **req8, con precisión:** subir los expertos lo acerca a BF16 (0.23-0.40 en vez de 0.87-0.96). Sobre la
   medida forzada, IQ4_XS en gate/up de todas las capas (+7.6 GiB) recupera la mitad y Q5_K (+19.3 GiB) casi todo
   (secciones 7 y 9); producción deja ~3 GiB sobre el margen. Un canje a igual tamaño por capa (Strata ya acepta
@@ -285,5 +307,6 @@ modelo ya tiene en ese contexto.
 | `repro_set.py`, `sample_set.py`, `session_replay.py`, `replay_score.py` | reproductor greedy, muestreo, réplica de sesiones |
 | `official/official_hf.py`, `official/gguf_weights.py` | el checkpoint por rangos HTTP; el GGUF como tensores oficiales |
 | `official/ref_forward.py`, `ref_pair.py`, `ref_variants.py` | la referencia oficial por capas: GGUF, BF16 contra GGUF, conjuntos de pesos mezclados |
-| `official/ref_decode.py`, `decode_score.py` | generación con la caché oficial y los expertos bajo demanda |
+| `official/ref_decode.py`, `decode_score.py` | generación con la caché oficial y los expertos bajo demanda; el árbol de la apertura |
+| `official/ple_official.py`, `ple_compare.py` | las filas oficiales de la tabla PLE que leen unas secuencias; la comparación de las dos tablas |
 | `official/variants_score.py`, `pair_score.py` | las medidas sobre las continuaciones |
