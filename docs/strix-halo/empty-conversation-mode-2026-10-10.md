@@ -370,6 +370,9 @@ En la sesión de la sección 1 no hay turnos de usuario vacíos ni cadenas de co
 
 Todas las mediciones de este documento usan esfuerzo medium. El modo con xhigh no se midió.
 
+Signal 3.8 Flash Next (agentionai) es este modelo con otra capa de salida y no cambia el modo en req8
+(`signal-evaluation-2026-10-12.md`, sección 4).
+
 ## Herramientas
 
 | Archivo (`~/dbg/strata/empty/`) | Qué hace |
