@@ -12,6 +12,8 @@ n_ctx 135168, lazy mode, regla de splits, determinismo).
   resolver el merge `00bbf6c90`; verificado por contenido en `src/llama-model.cpp:1413-1421` (solo el
   fallback de `use_mmap`). Ojo: al vivir en una resolución de merge y no en un revert, un futuro
   cambio de upstream en ese bloque volverá como conflicto: resolver manteniendo la eliminación.
+  **Corrección (2026-10-20):** falso para un `git merge` normal. Por las 129 copias reescritas, git toma `5eec3ad01`
+  como base y el bloque vuelve sin conflicto; ver `upstream-review-2026-10-20.md`, sección 2.1.
 - `992cb503c` (regla de splits): revertido explícitamente por `ca1c30baf`; la regla sigue viva en
   `ggml/src/ggml-backend.cpp:1341-1351`.
 - Nuevo: `14a9d09f7` elimina `--mmap/--no-mmap/--mlock/--dio` (reemplazo `--load-mode`). El launcher ya
