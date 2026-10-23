@@ -243,7 +243,7 @@ esos tensores reemplazados:
 
 1. **Los tensores.** Leer por rango HTTP los 372 tensores BF16 (5.4 GiB) y aplicarles las permutaciones del
    convertidor (cabezas de valor de GDN, como en `gguf_weights.py`). Cuantizarlos al tipo exacto que tienen en
-   producción, con el imatrix de producción (`~/dbg/imatrix/imatrix-ud.gguf`):
+   producción, con el imatrix de producción (`~/ProjectHub/llama.cpp-evidence/imatrix/imatrix-ud.gguf`):
 
    | Tensor | Tipo |
    |---|---|
@@ -365,4 +365,4 @@ El 27B anticipa ~13 % en `medium` (sección 4), por debajo de ese umbral.
 | `delta_rank.py` | espectro del cambio de tensores enteros (`delta_rank.log`) |
 | `hdr_cmp.py`, `gguf_win.py`, `iq3check.py` | GGUF de ThinkingCap, de Unsloth y de producción: tipos, metadatos, bytes por ventanas, IQ3_S descuantizado contra el oficial |
 | `pi_thinking.py` | razonamiento en los turnos de pi de producción |
-| `~/dbg/signal/scripts/gguf_head.py` | cabecera de un GGUF por rango HTTP (`hdr/`) |
+| `~/ProjectHub/llama.cpp-evidence/signal/scripts/gguf_head.py` | cabecera de un GGUF por rango HTTP (`hdr/`) |

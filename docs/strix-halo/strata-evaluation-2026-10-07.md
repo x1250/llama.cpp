@@ -3,7 +3,7 @@
 Evaluación de [Strata v0.1.40](https://github.com/Niko1221/Strata) (motor propio para Qwen3.8-Flash-Next, HIP/ROCm,
 gfx1151 experimental) frente al fork en producción, pedida por el Director: "no más lento que Strata, sin el bug, no más
 de 58 GB residentes". Fork del motor: `x1250/Strata` (privado), clon en `~/ProjectHub/strata`, build con ROCm 7.14.1 de
-TheRock en `~/rocm/install` (`~/dbg/strata/build.sh`). Herramientas y salidas: `~/dbg/strata/`.
+TheRock en `~/rocm/install` (`~/ProjectHub/llama.cpp-evidence/strata/build.sh`). Herramientas y salidas: `~/ProjectHub/llama.cpp-evidence/strata/`.
 
 ## 0. Resultado
 
@@ -26,7 +26,7 @@ Los 3 cambios del fork (`x1250/Strata`, local): 310bfe4 (las páginas del archiv
 expertos llegan a la GPU: sin esto la carga lleva MemFree a cero), 2485459 (la lectura de las hyper-connections en el
 IQ4_NL del GGUF: −6 ms por ventana) y la configuración (`--mtp-hnorm stream`, la norma del draft por stream como la
 nuestra; un subconjunto de vocabulario del draft hecho con las salidas de pi; `--mtp-window 8192`). Configuración
-reproducible: `~/dbg/strata/prod/strata-qwen38flash-strix.json` y `env.sh`.
+reproducible: `~/ProjectHub/llama.cpp-evidence/strata/prod/strata-qwen38flash-strix.json` y `env.sh`.
 
 **El pensamiento ajeno al contexto no es un defecto del motor y no se demuestra que baje:** aparece en los dos motores
 a ~0.4 % en el contexto del incidente, y cero en 400 muestras con UD-small no alcanza para afirmar una mejora. Lo que
@@ -71,7 +71,7 @@ hasta el fin del chunk (21 s en total, 10.6).
 
 ## 3. Velocidad (mismos prompts, greedy, 256 tokens, contexto 65536, una carga por configuración)
 
-`~/dbg/strata/bench.py`: el prompt de agente de 4.8k, prosa de 39.5k y código de 41.5k (los de los rigs del fork),
+`~/ProjectHub/llama.cpp-evidence/strata/bench.py`: el prompt de agente de 4.8k, prosa de 39.5k y código de 41.5k (los de los rigs del fork),
 leídos enteros y luego una segunda pregunta en la misma conversación. Strata en su configuración rápida de Strix
 (`--spec 4 --mtp --lookup-chain 3 --mtp-q4 all --prefill 16384`, KV int8, los interruptores de la sección 5 de su
 `docs/STRIX_HALO.md`); llama.cpp con los argumentos de producción (MTP n-max 2, lookup, PLE lazy, visión), NP=1.
@@ -286,7 +286,7 @@ que bajen.
 
 ## 7. Fuentes
 
-`~/dbg/strata/`: `chain.sh`, `sweep.py` y `sweep*.sh` (velocidad), `bench.py`, `memmon.sh`, `llama_chain.sh`,
+`~/ProjectHub/llama.cpp-evidence/strata/`: `chain.sh`, `sweep.py` y `sweep*.sh` (velocidad), `bench.py`, `memmon.sh`, `llama_chain.sh`,
 `depth125.sh`, `logpos.cpp`, `strata_logpos.py`, `strata_engine.py`, `q_*.sh`, `q_compare.py` (calidad),
 `inc_score.py`, `strata_sample.py`, `llama_sample.py`, `bug_sample.sh`, `classify.py` (pensamiento), `prep_*.sh`
 (GGUF y packs), `verify_split.py` (bytes), `test_gr.sh`; salidas `bench-*.jsonl`, `mem-*.log`, `engine-*.log`,
@@ -318,7 +318,7 @@ archivo dividido (`NL3S-split`, 89.5 GB) se borró el 2026-10-07: se regenera de
 ## 9. Las compuertas (2026-10-07, tarde)
 
 Configuración de producción (UD-small, ajustes del draft) a 65536 de contexto, producción descargada, una carga a la
-vez por la compuerta. Herramientas en `~/dbg/strata/`: `det.py` y `det_compare.py` (el texto de las respuestas por el
+vez por la compuerta. Herramientas en `~/ProjectHub/llama.cpp-evidence/strata/`: `det.py` y `det_compare.py` (el texto de las respuestas por el
 servidor), `det_logpos.py` y `det_tail.py` (log-probs con 9 decimales de los últimos 64 tokens leídos por las ventanas
 de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.sh` y `queue14`-`queue23`.
 
@@ -389,7 +389,7 @@ de verificación tras leer el prompt, comparados entre lecturas), `logpos_chain.
   (llama-server no lo hace).
 - **Un defecto real, corregido en el fork:** el servidor de Strata quitaba el envoltorio `{"type": "function",
   "function": …}` de las tools antes de la plantilla, que las escribe con `tojson`; la petición real de pi del incidente
-  (`~/dbg/glitch-1006/request.json`, 14 tools) daba 19 731 ids contra 19 857 de llama-server. Con 9c6c243 el render
+  (`~/ProjectHub/llama.cpp-evidence/glitch-1006/request.json`, 14 tools) daba 19 731 ids contra 19 857 de llama-server. Con 9c6c243 el render
   recibe las tools como las mandan los clientes (como transformers y llama-server) y la misma petición da exactamente
   los ids de llama-server. Suite del servidor: 454 tests, OK.
 - **pi en vivo contra el servidor de Strata** (`pi_live.sh`: el proveedor `halo` de pi en :8080, `qwen38flash:medium`,

@@ -214,7 +214,7 @@ y `--spec 6` fue peor.
 | Commit | Qué | Veredicto | Valor aquí |
 |---|---|---|---|
 | `f711c8f30` | resize de Qwen-VL como transformers | **tomar ya**; recompilar `strata-vision` y llama-server | sección 0, punto 1; afecta a los dos motores |
-| `e467e5b5e` | el KV plano respeta `PARTIAL_ONLY` | tomar (el hunk de `llama-kv-cache.cpp`) | cada checkpoint copia hoy el KV entero del draft MTP (`llama-kv-cache.cpp:2105`, los flags se ignoran): en `~/dbg/depth/srvlog-v33lv.log` crece 2072 B/token (186.5 MiB a 37.4k tokens, 190.6 a 39.5k; sin MTP, 112.6 fijos). A 262k serían cientos de MiB por checkpoint, hasta 8 checkpoints por slot (estimado) |
+| `e467e5b5e` | el KV plano respeta `PARTIAL_ONLY` | tomar (el hunk de `llama-kv-cache.cpp`) | cada checkpoint copia hoy el KV entero del draft MTP (`llama-kv-cache.cpp:2105`, los flags se ignoran): en `~/ProjectHub/llama.cpp-evidence/depth/srvlog-v33lv.log` crece 2072 B/token (186.5 MiB a 37.4k tokens, 190.6 a 39.5k; sin MTP, 112.6 fijos). A 262k serían cientos de MiB por checkpoint, hasta 8 checkpoints por slot (estimado) |
 | `4453b535f` | filas NextN sin máscara en orden de lote | tomar | el fork las extrae en orden de ubatch y el hook MTP las lee por índice de lote (`common/speculative.cpp:1617, 1680`); con NP=2 y dos prompts a la vez el draft recibe estados equivocados. Afecta la aceptación, no la salida |
 | `d280808f5` | no aceptar drafts después de un EOG | tomar, más el mismo corte en la variante `dists` del fork | `common/sampling.cpp:704` corta solo por desacuerdo |
 | `23b0202a1`, `8e1642198` | slot ocupado pedido por `id_slot`; corte de `keep_first` dentro de un chunk de imagen | tomar | 5 líneas y 1 línea |

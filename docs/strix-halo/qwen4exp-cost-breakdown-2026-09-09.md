@@ -56,13 +56,13 @@ la sección 2 está reemplazado por el perfil del build actual.
 
 Fuentes de datos (2026-09-09):
 
-- Perfiles del Vulkan perf logger a 40k: `~/dbg/depth/strix-decode-prof-cd-vk.log` (prefill de
+- Perfiles del Vulkan perf logger a 40k: `~/ProjectHub/llama.cpp-evidence/depth/strix-decode-prof-cd-vk.log` (prefill de
   39.5k + decode) y `strix-decode-prof-cdec-vk.log` (decode con filas compactas). El logger
   serializa cada op (barrera + timestamp por nodo), así que sus tiempos son cotas superiores:
   la suma por paso de decode es 72 ms frente a 66 ms medidos en producción.
-- Rigs de profundidad `~/dbg/depth/depth-*.log` (turno 1 = prefill 39512 tokens, turnos 2-8 =
+- Rigs de profundidad `~/ProjectHub/llama.cpp-evidence/depth/depth-*.log` (turno 1 = prefill 39512 tokens, turnos 2-8 =
   re-prefill de ~2048 + 256 generados).
-- `LLAMA_SPEC_TIMING` y `LLAMA_INPUT_TIMING` en `~/dbg/merge/srvlog-p40-*.log`.
+- `LLAMA_SPEC_TIMING` y `LLAMA_INPUT_TIMING` en `~/ProjectHub/llama.cpp-evidence/merge/srvlog-p40-*.log`.
 - Lectura del grafo (`src/models/qwen4exp.cpp`), de los inputs de host
   (`src/llama-kv-cache.cpp`, `src/llama-memory-hybrid-idx.cpp`), del bucle especulativo
   (`tools/server/server-context.cpp`, `common/speculative.cpp`) y del backend Vulkan
@@ -80,7 +80,7 @@ con el grafo del hook del draft, que también corre sobre 3 tokens. La verificac
 paso completo 64 ms, no 39.3; con 2.46 tokens por paso eso da los 38 t/s medidos. Las proporciones entre nodos
 de la tabla siguen siendo útiles; los milisegundos absolutos, no.
 
-Perf logger a 40k (`~/dbg/depth/strix-decode-prof-prof383.log`, `GGML_VK_PERF_LOGGER_FREQUENCY=1`,
+Perf logger a 40k (`~/ProjectHub/llama.cpp-evidence/depth/strix-decode-prof-prof383.log`, `GGML_VK_PERF_LOGGER_FREQUENCY=1`,
 que serializa cada nodo: sus sumas son cotas superiores). Un paso = un grafo de verificación del
 target (3 tokens) más los grafos del draft (2 tokens): 39.3 ms de GPU por paso, ~1.5 tokens
 aceptados por paso → 38-41 t/s medidos en producción.
@@ -217,8 +217,8 @@ backend.
 ## 5. Medición del solape de expertos (decode, punto 1)
 
 Herramienta: `LLAMA_MOE_IDS_LOG=<archivo>` (common/common.cpp), volcado de los expertos que
-elige cada capa por ubatch; estadísticas con `~/dbg/merge/moe_ids_stats.py`. Corrida: rig de
-profundidad a 40k con MTP n-max 2 (`~/dbg/depth/moe-ids-40k.txt`, 45305 líneas, 2026-09-09).
+elige cada capa por ubatch; estadísticas con `~/ProjectHub/llama.cpp-evidence/merge/moe_ids_stats.py`. Corrida: rig de
+profundidad a 40k con MTP n-max 2 (`~/ProjectHub/llama.cpp-evidence/depth/moe-ids-40k.txt`, 45305 líneas, 2026-09-09).
 El callback parte el grafo en cada nodo observado, así que los tiempos de esa corrida no son
 comparables (prefill 273 t/s, decode 26-32 t/s); las selecciones sí.
 
@@ -290,7 +290,7 @@ slot, ctx 65536, sin mmproj, pesos en memoria anónima (`--load-mode none`) y PL
 `pread` desde un pool de hilos (`--lazy-mode on-direct`). Su lanzador de producción añade MTP
 n-max 3 con un draft Q8_0 de 2.8 GB que comparte `token_embd` y `output` con el target. Los
 nuestros son el server con el feature set de producción (Vulkan, ubatch 2048, KV q8_0, MTP
-n-max 2, mmproj, checkpoints): rigs `~/dbg/depth/depth-p40-{mtp,nomtp}.log`,
+n-max 2, mmproj, checkpoints): rigs `~/ProjectHub/llama.cpp-evidence/depth/depth-p40-{mtp,nomtp}.log`,
 `depth-merge-rev-125k.log` y `depth-chunk125.log`.
 
 | Medida | pwilkin, HIP, ubatch 16384 | Nuestro, Vulkan, ubatch 2048 |
@@ -356,10 +356,10 @@ exactos, producción descargada.
 
 ## 7. Quant nl3s-oproj8: gate y up de expertos en IQ3_S sin recuantizar (2026-09-16)
 
-Origen: el registro del requant de producción (`~/dbg/imatrix/requant.log`, 2026-09-01) muestra que
+Origen: el registro del requant de producción (`~/ProjectHub/llama.cpp-evidence/imatrix/requant.log`, 2026-09-01) muestra que
 nl-oproj8 se construyó desde unsloth UD-IQ4_XS, donde gate y up de los expertos vienen en IQ3_S (47
 capas) e IQ4_XS (blk.2), y los infló a IQ4_NL con `--allow-requantize`: 42.2 GiB para guardar 32.4 GiB
-de información, más un paso de cuantización. La receta nueva (`~/dbg/imatrix/pipeline-nl3s.sh`) es la
+de información, más un paso de cuantización. La receta nueva (`~/ProjectHub/llama.cpp-evidence/imatrix/pipeline-nl3s.sh`) es la
 misma con `--tensor-type 'blk\.([013-9]|[1-4][0-9])\.ffn_(gate|up)_exps\.=iq3_s'`: llama-quantize copia
 sin tocar los tensores que ya tienen el tipo destino, blk.2 sigue a IQ4_NL, el resto es idéntico.
 Archivo `NL3S/qwen4exp-nl3s-oproj8.gguf`, 83.5 GiB (93.3 antes); residente con lazy 56.5 GiB (66.5).
@@ -454,7 +454,7 @@ construir la lista por token desde los índices del selector QSA en vez de barre
 
 ## 10. Vía 8 medida: la ponderación por los pesos del router en el epílogo del MUL_MAT_ID (2026-09-16, build 380)
 
-Perfil fresco del build 378 (perf logger, ubatch 2048, MTP, `~/dbg/merge/prof_nodes.py`): GPU 4.0 s por
+Perfil fresco del build 378 (perf logger, ubatch 2048, MTP, `~/ProjectHub/llama.cpp-evidence/merge/prof_nodes.py`): GPU 4.0 s por
 ubatch, 80.3 s por prefill de 39.5k sobre 88.8 s de pared. Por familia: MUL_MAT_ID 28.4 s (gate/up
 IQ3_S 19.3, down IQ4_NL 8.4), MUL_MAT 22.4, FA 9.7, MUL 3.05, RMS_NORM_MUL 2.5, HC_GATED_MEAN 1.9,
 HC_INJECT 1.6, MULTI_ADD 1.6. El MUL de 3.05 s es `ffn_moe_weighted`: `experts` [2560, 10, 2048] ×
@@ -1478,7 +1478,7 @@ Lecturas:
   tope, −0.7 s por imagen de 2048×2048); es un rodeo en el grafo para un límite del kernel y lo decide el Director.
 - `graph_diff4` se recompiló contra los headers actuales (el binario del 2026-09-09 se caía con rc 139 al cambiar
   `common_params`); una herramienta fuera del árbol que usa `common.h` se recompila con cada cambio de esa estructura.
-  Compilación (en `~/dbg/merge`, con `L` = el fork y producción descargada): `g++ -O2 -std=c++17 -I $L/include
+  Compilación (en `~/ProjectHub/llama.cpp-evidence/merge`, con `L` = el fork y producción descargada): `g++ -O2 -std=c++17 -I $L/include
   -I $L/common -I $L/ggml/include graph_diff4.cpp -L $L/build/bin -lllama-common -lllama -lggml -lggml-base
   -Wl,-rpath,$L/build/bin -o graph_diff4`.
 
@@ -1560,7 +1560,7 @@ concurrente, perf logger serial y otra vez sin instrumentar. Cada carga hace el 
 de 1024 tokens sobre ese prefijo (384 con el logger): greedy y el muestreo de producción (temp 0.7, top_k 20, top_p
 0.95), con `ignore_eos` para que cada carga decodifique los mismos tokens. Relojes, actividad y potencia de la GPU
 muestreados cada segundo con `amdgpu_top -gm`. Cero timeouts de anillo; producción recargada con el probe idéntico al
-de v26. Herramientas en `~/dbg/merge`: `decode_budget.py` (rig), `budget_parse.py` (línea de tiempo de host),
+de v26. Herramientas en `~/ProjectHub/llama.cpp-evidence/merge`: `decode_budget.py` (rig), `budget_parse.py` (línea de tiempo de host),
 `vk_budget_parse.py` (bloques del perf logger por ubatch), `vk_family.py` (familias), `power_sampler.py`.
 
 ### 28.1 El paso
@@ -1749,7 +1749,7 @@ las 2 sincronizaciones).
 Con `kernel.perf_event_paranoid=2` (puesto por el Director, no persistente), una carga NP=1 con la build de producción
 (fb27b714f), el prefill de 39.5k y dos turnos de 1024 tokens bajo `perf record -e cycles:u`: plano a 4999 Hz (turno
 greedy, 62.00 ms por paso) y con pilas DWARF a 999 Hz (turno de producción, 62.12 ms por paso; `perf` no cambia el
-paso). Clasificación por pila con `~/dbg/merge/perf_fold.py`, 402 pasos. El hilo principal del server está ocupado
+paso). Clasificación por pila con `~/ProjectHub/llama.cpp-evidence/merge/perf_fold.py`, 402 pasos. El hilo principal del server está ocupado
 34.1 ms por paso, de los que ~16 son la espera activa del fence mientras la GPU trabaja; el resto es trabajo real:
 
 | Actividad | ms por paso | Camino crítico |
@@ -1792,9 +1792,9 @@ solo responde si un 2× es físicamente posible.
 
 ### 29.1 Censo de bytes por paso de verificación y los cuants GSQ-RCO
 
-`~/dbg/merge/quant_census.py` lee solo el header del GGUF de producción (formas y tipos) y aplica a esas formas los
+`~/ProjectHub/llama.cpp-evidence/merge/quant_census.py` lee solo el header del GGUF de producción (formas y tipos) y aplica a esas formas los
 tipos por tensor que ISTA-DASLab publica en `tensor-allocation/*.rco-allocation.txt`
-(https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF; copias en `~/dbg/merge/gsq-rco/`). Gate + up y
+(https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF; copias en `~/ProjectHub/llama.cpp-evidence/merge/gsq-rco/`). Gate + up y
 hc down + inject, fusionados en nuestro archivo, se reparten por número de elementos. Los expertos cuentan ~27
 distintos por capa de 512 para 3 tokens, la estimación de la sección 24.1 que usa también la 28.3, así que en los
 expertos el censo no es una verificación independiente; las familias densas coinciden con los bytes exactos de la
@@ -2068,8 +2068,8 @@ dos slots a 262k se estiman bajo ~0.5 GiB (estimación, no medida). La reserva d
 cambia. El aviso "compute buffer size ... does not match expectation" al cerrar el server ya aparecía en ventanas
 anteriores (`srvlog-p40-mtp.log`, `srvlog-gu-base1.log`); no viene de este cambio.
 
-Adoptado en producción (build del árbol e579358ba). Fuentes: `~/dbg/merge/chain_v33.{sh,out}`, `budget-v33*.txt`,
-`gd-v33*.log`, `np2-v33p{b,n}.out`, `~/dbg/depth/srvlog-v33*.log`, `repeat-v33n2.log`.
+Adoptado en producción (build del árbol e579358ba). Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v33.{sh,out}`, `budget-v33*.txt`,
+`gd-v33*.log`, `np2-v33p{b,n}.out`, `~/ProjectHub/llama.cpp-evidence/depth/srvlog-v33*.log`, `repeat-v33n2.log`.
 
 ## 31. Presupuesto con la potencia nueva, NP=2 y lookup en la ronda MTP adoptado (2026-09-28, cadenas v34-v38)
 
@@ -2077,7 +2077,7 @@ Adoptado en producción (build del árbol e579358ba). Fuentes: `~/dbg/merge/chai
 
 Build del SP1, NP=1, ctx 57344, MTP n-max 2, dos turnos de 1024 tokens: 54.72 / 54.48 ms por paso (greedy /
 producción) con `LLAMA_INPUT_TIMING` y `LLAMA_SPEC_TIMING`; perf logger concurrente y serial en cargas aparte
-(`vk_family.py v34c v34s v34a`, `~/dbg/merge/family-v34.txt`).
+(`vk_family.py v34c v34s v34a`, `~/ProjectHub/llama.cpp-evidence/merge/family-v34.txt`).
 
 | Tramo | ms por paso |
 |---|---|
@@ -2112,7 +2112,7 @@ refutada.
 
 `ngram-simple` del fork junto a `draft-mtp` (`--spec-type ngram-simple`): cuando los últimos k tokens ya aparecieron en
 el contexto, la ronda propone los tokens que les siguieron (tiene prioridad sobre la cabeza MTP; el hook del MTP
-procesa las filas verificadas sea cual sea el draft). Rig `~/dbg/merge/lookup_rig.py`: una función de ~700 tokens
+procesa las filas verificadas sea cual sea el draft). Rig `~/ProjectHub/llama.cpp-evidence/merge/lookup_rig.py`: una función de ~700 tokens
 (`common_ngram_simple_draft`) en el prompt y las tareas de sushi (copiarla, renombrar una variable, corregir un bug
 plantado, tool call `write_file`, código nuevo, prosa, y el renombrado detrás del texto de ~39k), sin pensamiento, en
 greedy y con el muestreo de producción; A = solo MTP, B = MTP + lookup, A B B A.
@@ -2167,8 +2167,8 @@ código nuevo y prosa (−3 a 0 % hoy), y una clave más larga que la ventana, q
 3. Draft dentro de la verificación (SP5): el draft es 5.9 ms de GPU por paso (11 %).
 4. SP2 y SP3 al final: el host en serie es ~2.6 ms por paso.
 
-Fuentes: `~/dbg/merge/chain_v3{4,5,7,8}.{sh,out}`, `lookup-v3{4,5,7}*.jsonl`, `family-v34.txt`, `np2-v38pl.out`,
-`~/dbg/depth/srvlog-v3{4,5,7}*.log`, `repeat-v37B1.log`, `power-v3{5,6,7}.log`, `cpu-v37.log`.
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v3{4,5,7,8}.{sh,out}`, `lookup-v3{4,5,7}*.jsonl`, `family-v34.txt`, `np2-v38pl.out`,
+`~/ProjectHub/llama.cpp-evidence/depth/srvlog-v3{4,5,7}*.log`, `repeat-v37B1.log`, `power-v3{5,6,7}.log`, `cpu-v37.log`.
 
 ## 32. Entradas del paso a 125k: dimensionamiento del SP2 (2026-09-29, cadena v39)
 
@@ -2176,7 +2176,7 @@ Ventana sin cambios de código (build de producción 1ea4ce5d8 en `build/bin`, a
 117-130 W. Tres cargas NP=1 con `LLAMA_INPUT_TIMING` y `LLAMA_SPEC_TIMING`, MTP n-max 2, el lookup en la ronda MTP
 (default del launcher desde la sección 31.3) y el mmproj cargado: 40k (ctx 57344, prompt de 39.5k), 125k (ctx 131072,
 prompt de 124.9k: los primeros 530944 caracteres de wikitext-2 test, el corpus del prompt de 40k,
-`~/dbg/merge/depth_prompt125.txt`) y otra vez 40k. Cada carga hace el prefill una vez y dos turnos de 1024 tokens con
+`~/ProjectHub/llama.cpp-evidence/merge/depth_prompt125.txt`) y otra vez 40k. Cada carga hace el prefill una vez y dos turnos de 1024 tokens con
 `ignore_eos` (greedy y muestreo de producción) sobre el prefijo en caché (`decode_budget.py`, que toma el prompt de
 `DEPTH_PROMPT`). Entradas por contexto y tamaño de ubatch con `input_depth_parse.py` (medianas sobre todos los ubatches
 del turno). Huella de la carga de 125k: 68 GiB calculados, 69 medidos (MemAvailable 110 → 41). Mínimos del guard
@@ -2262,8 +2262,8 @@ a 125k, creciente con el contexto de los agentes), cuesta 2-3 días y no necesit
 siendo un spike de riesgo alto con estimaciones del régimen de 85 W. SP4 y SP6 siguen primero: aplican a cualquier
 profundidad y valen más por día.
 
-Fuentes: `~/dbg/merge/chain_v39.{sh,out}`, `budget-v39{a,d,a2}.txt`, `inputs-v39{a,d,a2}.txt`, `input_depth_parse.py`,
-`depth_prompt125.txt`; `~/dbg/depth/budget-v39{a,d,a2}.jsonl`, `srvlog-v39{a,d,a2}.log`, `guard-v39*.log`,
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v39.{sh,out}`, `budget-v39{a,d,a2}.txt`, `inputs-v39{a,d,a2}.txt`, `input_depth_parse.py`,
+`depth_prompt125.txt`; `~/ProjectHub/llama.cpp-evidence/depth/budget-v39{a,d,a2}.jsonl`, `srvlog-v39{a,d,a2}.log`, `guard-v39*.log`,
 `power-v39.log`, `cpu-v39.log`.
 
 ## 33. SP2 del plan de decode: entradas del paso sin recorridos caros (2026-09-29, cadena v40)
@@ -2284,7 +2284,7 @@ Dos cambios de host, mismos valores que antes, sin tocar el grafo:
   a ellas se les aplica la prueba completa, que conserva la regla M-RoPE en la posición de la consulta.
 
 La atribución previa se hizo en la CPU, sin GPU, con las celdas reales (`llama_kv_cells`) y copias exactas del código
-anterior (`~/dbg/merge/sp2/`): a 125k celdas la agrupación QSA costaba 1.03-1.22 ms por ubatch de decode y la máscara
+anterior (`~/ProjectHub/llama.cpp-evidence/merge/sp2/`): a 125k celdas la agrupación QSA costaba 1.03-1.22 ms por ubatch de decode y la máscara
 0.09-0.1 ms por fila; la agrupación era el 75-80 % de las entradas de la verificación. Equivalencia bit a bit con el
 código anterior: 21 layouts × 20 semillas para la agrupación (celdas de imagen en orden de rango, huecos, celdas
 desordenadas, dos secuencias en un stream, una celda usada sin secuencia, ratios 3, 4, 5 y 8, caminos pooled y
@@ -2334,8 +2334,8 @@ tokens, `ignore_eos`) y a 125k, base contra base y nueva contra nueva también; 
 cambio medible (el rig corre a poca profundidad). Adoptado: la build queda en `build/bin`; producción estaba descargada
 al abrir la ventana y quedó descargada.
 
-Fuentes: `~/dbg/merge/chain_v40.{sh,out}`, `budget-v40*.txt`, `inputs-v40{nx,bx,db,dn}.txt`, `np2-v40p{b,n}.out`,
-`probe-v40.out`, `img-v40-prod.out`, `imgbig-v40-prod.out`, `gd-v40n.log`, `sp2/` (arnés de CPU); `~/dbg/depth/`
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v40.{sh,out}`, `budget-v40*.txt`, `inputs-v40{nx,bx,db,dn}.txt`, `np2-v40p{b,n}.out`,
+`probe-v40.out`, `img-v40-prod.out`, `imgbig-v40-prod.out`, `gd-v40n.log`, `sp2/` (arnés de CPU); `~/ProjectHub/llama.cpp-evidence/depth/`
 `budget-v40*.jsonl`, `srvlog-v40*.log`, `repeat-v40n2.log`, `power-v40.log`, `cpu-v40.log`.
 
 ## 34. Día 1 del SP3: qué corre el host con la GPU parada (2026-09-29, cadena v41)
@@ -2359,7 +2359,7 @@ del paso: 950 pasos, 24430 muestras. El paso con la instrumentación, 55.5 / 54.
 posiciones del draft rechazado, en la atención y en el indexador del target y en el caché del draft, aunque no haya
 nada que borrar: su costo sigue al tamaño del KV, no a la profundidad. Las cargas de prueba usan ctx 57344; producción
 usa 262144 celdas por slot, así que ahí cuesta ~4.6 veces más (~0.4 ms por paso, estimado a escala; una pasada aislada
-en la CPU cuesta 0.016 ms a 57k celdas y 0.074 a 262k, `~/dbg/merge/sp2/seqrm_bench.cpp`, y en el server la caché de CPU
+en la CPU cuesta 0.016 ms a 57k celdas y 0.074 a 262k, `~/ProjectHub/llama.cpp-evidence/merge/sp2/seqrm_bench.cpp`, y en el server la caché de CPU
 llega fría).
 
 Candidatos del SP3, todos con la misma salida:
@@ -2375,8 +2375,8 @@ Candidatos del SP3, todos con la misma salida:
 Las esperas de lectura dentro de los huecos (~0.2 ms) son trabajo de la GPU (copias a host), no del host. La
 restricción del muestreo sigue: mismos candidatos y mismo orden de empates, o el probe cambia.
 
-Fuentes: `~/dbg/merge/chain_v41.{sh,out}`, `gap_fold.py`, `gap-v41p.txt`, `perf-v41-fold.txt`, `budget-v41p.txt`;
-`~/dbg/depth/perf-v41.data`, `perf-v41.script`, `srvlog-v41p.log`, `budget-v41{w,p}.jsonl`.
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v41.{sh,out}`, `gap_fold.py`, `gap-v41p.txt`, `perf-v41-fold.txt`, `budget-v41p.txt`;
+`~/ProjectHub/llama.cpp-evidence/depth/perf-v41.data`, `perf-v41.script`, `srvlog-v41p.log`, `budget-v41{w,p}.jsonl`.
 
 ## 35. SP3 del plan de decode: huecos de host del paso (2026-09-29, cadenas v42-v46)
 
@@ -2392,7 +2392,7 @@ Tres cambios de la atribución de la sección 34, mismos valores que antes:
   indexador del target y en el caché del draft. Ahora toma las celdas de la secuencia en [p0, p1) de su índice
   (`llama_kv_cells::seq_cells_in`, el accessor de la primera fila de la máscara del SP2 generalizado a un rango). Mismas
   celdas, mismos conjuntos de secuencias y mismo head que el recorrido en 1500 borrados al azar
-  (`~/dbg/merge/sp2/seqrm_equiv.cpp`).
+  (`~/ProjectHub/llama.cpp-evidence/merge/sp2/seqrm_equiv.cpp`).
 - **Pool de comandos de Vulkan reseteado durante la espera siguiente** (`ggml-vulkan.cpp`, 7b0e8cf98). Cada contexto de
   backend tiene dos pools usados por turno: la limpieza tras la espera retira el actual y el grafo siguiente graba en el
   otro; el retirado se resetea al comienzo de la próxima espera del fence, con la GPU trabajando.
@@ -2454,8 +2454,8 @@ SP1 costaría ~1.2 ms por paso y no se revirtió. Las cargas de diagnóstico v43
 262144 celdas por slot) bajo la compuerta registrada con huella 66 GiB: debieron correr con contexto reducido (NP=2, ctx
 114688, huella 68) como pide la regla de pruebas.
 
-Fuentes: `~/dbg/merge/chain_v4{2,3,4,5,6,7,8,9}.{sh,out}`, `chain_v50.out`, `chain_v50b.out`, `chain_v51.out`,
-`sp2/seqrm_equiv.cpp`; `~/dbg/depth/budget-v4{2,3,4,5,6,7,8,9}*.jsonl`, `budget-v5{0,1}*.jsonl`, `srvlog-v4*.log`;
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v4{2,3,4,5,6,7,8,9}.{sh,out}`, `chain_v50.out`, `chain_v50b.out`, `chain_v51.out`,
+`sp2/seqrm_equiv.cpp`; `~/ProjectHub/llama.cpp-evidence/depth/budget-v4{2,3,4,5,6,7,8,9}*.jsonl`, `budget-v5{0,1}*.jsonl`, `srvlog-v4*.log`;
 el parche descartado de la hipótesis 1 en el scratchpad de la sesión (`discard_layout.patch`).
 
 ### 35.2 Causa y arreglo del defecto de la sección 35.1 (2026-09-29, cadenas v61-v71)
@@ -2513,7 +2513,7 @@ corrida de v66 hasheaba las fuentes enteras, pesos incluidos (la tabla PLE lazy,
 descargó el servidor al bajar MemAvailable a 21 GiB, sin consecuencias. El volcado corregido lee por trozos de 16 MiB y
 no toca pesos.
 
-Fuentes: `~/dbg/merge/chain_v6{1..9}.{sh,out}`, `chain_v70.{sh,out}`, `chain_v71.{sh,out}`, `logprob_diff.py`,
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v6{1..9}.{sh,out}`, `chain_v70.{sh,out}`, `chain_v71.{sh,out}`, `logprob_diff.py`,
 `dump_diff.py`, `ophash_diff.py`; los parches de diagnóstico (no commiteados) en el scratchpad de la sesión:
 `diag_reuse_verify.py`, `discard_layout_all.patch`.
 
@@ -2554,7 +2554,7 @@ mientras llega un prompt de 15k 16.41 → 16.64 chunks/s: sin cambio medible.
 Las 8 colas de una capa salen de un GET_ROWS sobre `x` (o sobre la historia concatenada con `x` cuando el ubatch tiene
 menos de 10 tokens) con una tabla de índices por forma de ubatch, y un CPY permutado las escribe en los 8 slots: 36
 GET_ROWS y 36 CPY en lugar de 288 CPY por verificación. La operación es exacta: idéntica byte a byte a las copias por
-slot en CPU y en Vulkan, con decode y con prefill, 1 y 2 secuencias (`~/dbg/merge/sp2/conv_tail_test.cpp`).
+slot en CPU y en Vulkan, con decode y con prefill, 1 y 2 secuencias (`~/ProjectHub/llama.cpp-evidence/merge/sp2/conv_tail_test.cpp`).
 
 En el modelo las respuestas difieren de la base (cadena v53: aceptación 563/925 contra 564/917). Con
 `GGML_VK_DISABLE_FUSION=1` base y nueva dan lo mismo; con el optimizador de grafos apagado siguen distintas (v54). El
@@ -2582,7 +2582,7 @@ tokens a 40k) y el diff de los conteos de ops por tipo de grafo, incluidos los u
 fuera de las que la fusión toca debe coincidir antes de gastar la medición A B B A. Reglas de diseño que salen de aquí:
 ninguna entrada nueva al grafo y ningún cambio de vecindad junto a las cadenas MULTI_ADD y RMS_NORM_MUL.
 
-Fuentes: `~/dbg/merge/chain_v5{2,3,4,5}.{sh,out}`, `sp2/conv_tail_test.cpp`; `~/dbg/depth/budget-v5{2,3,4,5}*.jsonl`,
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v5{2,3,4,5}.{sh,out}`, `sp2/conv_tail_test.cpp`; `~/ProjectHub/llama.cpp-evidence/depth/budget-v5{2,3,4,5}*.jsonl`,
 `srvlog-v55{b,n}.log`.
 
 ### 36.3 Fusión 3: los snapshots del GDN escritos directo en el caché (adoptada, 1d7cd0d16)
@@ -2631,12 +2631,12 @@ reescrita); `depth_repro` + `depth_repeat` idénticos; `graph_diff4` 72 de 11937
 valida la ruta sin fusión); probe idéntico a `probe-v26`, conversación texto → imagen → texto 5/5, imagen de 2048×2048
 en 12.8 s, producción nueva contra base recién cargadas idéntica, cero timeouts de anillo. Con las formas del modelo
 (S_v 128, 16 cabezas q/k, 48 v, 8 slots; decode, dos secuencias y un ubatch de 2048) la salida fusionada, la sin fusión
-y la del build anterior son idénticas byte a byte (`~/dbg/merge/sp4/gdn_snap_test.cpp`); casos GDN_SNAPSHOTS nuevos en
+y la del build anterior son idénticas byte a byte (`~/ProjectHub/llama.cpp-evidence/merge/sp4/gdn_snap_test.cpp`); casos GDN_SNAPSHOTS nuevos en
 `test-backend-ops` (kv_head > 0, mem_size > n_seqs, n_tokens menor y mayor que K, dos secuencias, KDA, K = 1) y los 36
 casos GATED_DELTA_NET existentes, 42/42.
 
-Fuentes: `~/dbg/merge/chain_v5{6,7,8,9}.{sh,out}`, `chain_v60.{sh,out}`, `v56_verify_ops.txt`, `verify_wait.py`,
-`opcount_gate.py`, `sp4/gdn_snap_test.cpp`; `~/dbg/depth/srvlog-v5{6d,7a1,7b,7a2,8b,8n,9d}.log`,
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v5{6,7,8,9}.{sh,out}`, `chain_v60.{sh,out}`, `v56_verify_ops.txt`, `verify_wait.py`,
+`opcount_gate.py`, `sp4/gdn_snap_test.cpp`; `~/ProjectHub/llama.cpp-evidence/depth/srvlog-v5{6d,7a1,7b,7a2,8b,8n,9d}.log`,
 `budget-v60*.jsonl`.
 
 ### 36.4 Candidatas restantes: techos y descartes (2026-09-30, cadenas v73-v75)
@@ -2660,7 +2660,7 @@ verificación (n = 3, `LLAMA_INPUT_TIMING`, NP=1 a 40k). Umbral para implementar
 Los casos TOPK_MOE de `test-backend-ops` fallan de forma intermitente también con el build adoptado (1-2 de 416 en 2 de
 3 corridas): no es de estos cambios.
 
-Fuentes: `~/dbg/merge/chain_v7{3,4,5}.{sh,out}`, `queue_run.sh`; los diagnósticos (no commiteados) en `bin-v73diag`,
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v7{3,4,5}.{sh,out}`, `queue_run.sh`; los diagnósticos (no commiteados) en `bin-v73diag`,
 `bin-v74diag`, `bin-v75diag`.
 
 ### 36.5 CONT de los mezcladores hc: descartada; cierre del SP4 (2026-09-30, cadenas v76-v78)
@@ -2695,8 +2695,8 @@ deriva ~0.7 ms, sección 36.1): **−0.66 (v52) − 2.16 (v60) ≈ −2.8 ms por
 meta del SP4 (44.2-44.5 t/s) no se alcanzó: las candidatas restantes no tenían techo o chocaban con la fragilidad de
 la disposición.
 
-Fuentes: `~/dbg/merge/chain_v7{6,7,8}.{sh,out}`, `opcount_gate.py` (ahora admite ops quitadas),
-`~/dbg/depth/srvlog-v78{b,n}.log`.
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v7{6,7,8}.{sh,out}`, `opcount_gate.py` (ahora admite ops quitadas),
+`~/ProjectHub/llama.cpp-evidence/depth/srvlog-v78{b,n}.log`.
 
 ### 36.6 CONT de los mezcladores hc: adoptada con la regla nueva (2026-09-30, cadena v79)
 
@@ -2737,7 +2737,7 @@ prompt de 15k 17.53 → 17.21 chunks/s.
 **Cierre del SP4 con la fusión 1, la fusión 3 y el CONT de los mezcladores hc:** sumando lo medido en cada cadena,
 −0.66 (v52) − 2.16 (v60) − 0.2 a 0.7 (v79) ≈ −3.0 a −3.5 ms por paso a 40k.
 
-Fuentes: `~/dbg/merge/chain_v79.{sh,out}`, `quality_gate.inc.sh`, `~/dbg/depth/ppl-v79q{b,r,n}.log`.
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v79.{sh,out}`, `quality_gate.inc.sh`, `~/ProjectHub/llama.cpp-evidence/depth/ppl-v79q{b,r,n}.log`.
 
 ## 37. SP6 del plan de decode: la tasa de los pesos en la verificación (2026-09-30, cadenas v80-v83)
 
@@ -2812,7 +2812,7 @@ decuantización de los pesos, así que agrupar tokens no puede ganar. La ruta de
 `dotPacked4x8`, el shader IQ4_NL de b9c196c1c que el selector del mat-vec nunca habilitó, vía 22 de la sección 3):
 down 110.6 → 109.7 µs, mezclador 324×10240 16.0 → 15.0, mezclador 10240×320 15.6 → 17.8 (el B se cuantiza en un
 dispatch aparte). Tampoco. Filas por workgroup (rm 2 u 8 en vez de 4) y el camino de tiles, peores (37.4).
-Los parches quedan en `~/dbg/merge/sp6/` (`shared-experts-diag.patch`, `grouped-experts-X.patch`); no entran al árbol.
+Los parches quedan en `~/ProjectHub/llama.cpp-evidence/merge/sp6/` (`shared-experts-diag.patch`, `grouped-experts-X.patch`); no entran al árbol.
 
 ### 37.6 La compuerta de calidad no veía el camino de decode
 
@@ -2878,12 +2878,12 @@ tiene poco que repartir: el workgroup grande lo lleva de ~108 a ~116 GB/s), y lo
 kernel: su costo por par es el trabajo por columna, no la lectura de los pesos (37.5). Lo que queda en la
 verificación son ~9.9 ms de gate/up y ~5.5 de down en el mat-vec-id, que solo bajarían con otro diseño de kernel (B
 en memoria compartida o en f16, varias filas por hilo) o con menos pares por paso; ninguno cabe en la ventana de 3-4
-días del SP6. Las herramientas quedan en `~/dbg/merge/sp6/`: `moe_ids.cpp` (expertos por token sobre el modelo),
+días del SP6. Las herramientas quedan en `~/ProjectHub/llama.cpp-evidence/merge/sp6/`: `moe_ids.cpp` (expertos por token sobre el modelo),
 `moe_bench.cpp` (el banco con pesos fuera de la MALL), `shared_test.cpp` (bit a bit entre kernels y contra la CPU),
 `perf_shapes.py` (tiempos por forma de los grafos de verificación).
 
-Fuentes: `~/dbg/merge/chain_v8{0,1,2,3,4}.{sh,out}`, `chain_v82q`, `chain_v79q`, `~/dbg/depth/srvlog-v8{0p,1p}.log`,
-`~/dbg/merge/sp6/`.
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v8{0,1,2,3,4}.{sh,out}`, `chain_v82q`, `chain_v79q`, `~/ProjectHub/llama.cpp-evidence/depth/srvlog-v8{0p,1p}.log`,
+`~/ProjectHub/llama.cpp-evidence/merge/sp6/`.
 
 ## 38. Vía 7 (D5): split_k en el modo compacto de la FA sparse, adoptada (2026-09-30, cadena v85, 7c05f19ab)
 
@@ -2935,7 +2935,7 @@ profundo, ubatches de 3 tokens sobre un trozo de 32k con la mitad evaluada a 16-
 0.0116 y top-1 95.80 %, nueva KL 0.0116 y 95.74 %. La corrida base de ese modo escribe ~8 GB de logits con el modelo
 cargado y bajó MemFree a 9 GiB: el guardia de `ppl_run` ahora sincroniza y suelta de la caché ese archivo cada ~5 s.
 
-Fuentes: `~/dbg/merge/chain_v85.{sh,out}`, `quality_gate.inc.sh`, `~/dbg/depth/ppl-v85q{p,d,D}{b,r,n}.log`.
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v85.{sh,out}`, `quality_gate.inc.sh`, `~/ProjectHub/llama.cpp-evidence/depth/ppl-v85q{p,d,D}{b,r,n}.log`.
 
 ## 39. Palancas 1 y 2 tras la vía 7 (2026-10-01, cadenas v86 y v87)
 
@@ -2949,7 +2949,7 @@ dispatch propio (4 histogramas de dígito, conteo, emisión), los histogramas pa
 colocada como la del original. Idéntico bit a bit al kernel de un workgroup (índices, orden y empates) con 1, 3 y 8
 filas, con los empates del modelo (4 celdas por bloque) y con los datos de test-backend-ops. Más lento: 151 µs con 16
 bloques de 64 invocaciones, 118 con 8 de 128 y 110 con 4 de 256, contra 77 del original (perf logger, 3 filas): los
-seis dispatches con barrera cuestan más que lo que reparten. Parche en `~/dbg/merge/sp6/topk-radix-split.patch`.
+seis dispatches con barrera cuestan más que lo que reparten. Parche en `~/ProjectHub/llama.cpp-evidence/merge/sp6/topk-radix-split.patch`.
 Variante no probada: dentro del mismo workgroup, compactar las candidatas después del segundo dígito para que los dos
 últimos histogramas recorran unas cientos de celdas en vez de 39680 (techo ~−0.3 ms por paso).
 
@@ -3020,7 +3020,7 @@ el archivo base es el mismo byte a byte (comprobado con un trozo de 4096 en 4 lo
 modo profundo tuvo MemFree mínimo 44 GiB. Para la base de v87 se usaron las librerías de 7c05f19ab con la herramienta
 nueva (`bin-v85tool`): la herramienta no toca el backend que se compara.
 
-Fuentes: `~/dbg/merge/chain_v8{6,7}.{sh,out}`, `chain_v87.out.fused`, `sp6/topk-radix-split.patch`,
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v8{6,7}.{sh,out}`, `chain_v87.out.fused`, `sp6/topk-radix-split.patch`,
 `sp6/topk_split_test.cpp`, `sp6/ppl_stream_check.sh`, `sp6/ab_stats.py`.
 
 ## 40. La atención del draft MTP: la caché en q8_0 y la vía 16 corregida (2026-10-01, cadenas v88 y v89)
@@ -3106,7 +3106,7 @@ selección del paso 1 guardada en el dispositivo por secuencia para el paso 2; r
 pasa los lotes de imagen al draft, así que su caché tiene huecos de posición; esos bloques quedan incompletos y siempre
 visibles). 3-5 días con las compuertas.
 
-Fuentes: `~/dbg/merge/chain_v8{8,8p,9}.{sh,out}`, `~/dbg/depth/srvlog-v88p{a,b}.log`, `sp6/ab_stats.py`; SGLang
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v8{8,8p,9}.{sh,out}`, `~/ProjectHub/llama.cpp-evidence/depth/srvlog-v88p{a,b}.log`, `sp6/ab_stats.py`; SGLang
 `python/sglang/srt/models/qwen4_exp_mtp.py` y `python/sglang/srt/configs/qwen4_exp.py`; blog de LMSYS
 `2026-08-26-qwen-flash-next`.
 
@@ -3114,7 +3114,7 @@ Fuentes: `~/dbg/merge/chain_v8{8,8p,9}.{sh,out}`, `~/dbg/depth/srvlog-v88p{a,b}.
 
 ### 41.1 El prototipo
 
-Parche `~/dbg/merge/sp6/via16-mtp-qsa-spike.patch` (worktree `~/dbg/wt-v16`, nunca en `build/bin`), activo con
+Parche `~/ProjectHub/llama.cpp-evidence/merge/sp6/via16-mtp-qsa-spike.patch` (worktree `~/dbg/wt-v16`, nunca en `build/bin`), activo con
 `LLAMA_MTP_QSA=1`: la capa MTP toma el ratio QSA del tronco (4) y carga sus pesos de indexador; el contexto del draft
 usa la memoria híbrida con indexador sin capas recurrentes (su `seq_rm` ignora el rechazo de la parte recurrente vacía
 y las posiciones salen de la caché de atención); el grafo del draft selecciona con su propio indexador en cada grafo
@@ -3171,8 +3171,8 @@ prototipo guardado. Lo que sí apareció: la agrupación QSA del host está en e
 verificación pasa 0.49 ms (40k) y 0.84 ms (125k) en `set_inputs` con la GPU parada (cadena v88); una agrupación
 incremental, persistente entre ubatches (opción no implementada del SP2), abarataría el target y cualquier draft QSA.
 
-Fuentes: `~/dbg/merge/chain_v9{0,1}.{sh,out}`, `acc_rig.py`, `acc_cmp.py`, `vk_draft_graphs.py`,
-`vk_draft_qsa_check.py`, `~/dbg/depth/acc-v90*.jsonl`, `srvlog-v91*.log`.
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v9{0,1}.{sh,out}`, `acc_rig.py`, `acc_cmp.py`, `vk_draft_graphs.py`,
+`vk_draft_qsa_check.py`, `~/ProjectHub/llama.cpp-evidence/depth/acc-v90*.jsonl`, `srvlog-v91*.log`.
 
 ## 42. El umbral de confianza del draft (`--spec-draft-p-min`): gana en greedy, pierde con muestreo (2026-10-01, cadena v92)
 
@@ -3203,7 +3203,7 @@ pero el código la aplica a cualquier muestreo del target. Un umbral global no s
 launcher. Un umbral solo para pedidos greedy ganaría ~+2.6 % en ellos y nada en los demás; ningún agente del Director
 pide temperatura 0 (2026-10-01), así que la palanca queda descartada.
 
-Fuentes: `~/dbg/merge/chain_v92.{sh,out}`, `acc_rig.py`, `acc_tps.py`, `~/dbg/depth/acc-v92*.jsonl`.
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v92.{sh,out}`, `acc_rig.py`, `acc_tps.py`, `~/ProjectHub/llama.cpp-evidence/depth/acc-v92*.jsonl`.
 
 ## 43. Fusiones de pesos chicos sin transformar el GGUF: sin ganancia en el modelo (2026-10-01, cadena v93)
 
@@ -3214,7 +3214,7 @@ exige que el loader arme un tensor con las filas de varios tensores del GGUF (no
 para modelos sin archivo) o una mat-vec del backend con varios pesos (no existe en Vulkan; solo bias y escala
 fusionados).
 
-Techo en el banco (`~/dbg/merge/sp7/fuse_bench.cpp`: 48 capas FFN y 36 GDN con un tensor por peso, fuera de la MALL,
+Techo en el banco (`~/ProjectHub/llama.cpp-evidence/merge/sp7/fuse_bench.cpp`: 48 capas FFN y 36 GDN con un tensor por peso, fuera de la MALL,
 grafo completo en tiempo real, 3 tokens): separado 3.03-3.06 ms, todo fusionado 2.72-2.78 ms; por grupo, gate+up
 −0.01 ms (las dos mat-vec ya corren en paralelo) y z+beta+alpha −0.26 a −0.29 ms (las dos de 48 filas son casi puro
 costo fijo de dispatch).
@@ -3227,8 +3227,8 @@ medida tiene un sesgo (con números erróneos el texto degenera, aceptación 0.9
 pero ese sesgo favorece a B, que no gana. Las fusiones de pesos sin transformar el GGUF quedan descartadas; no vale un
 cambio en el núcleo del loader por un ahorro que no aparece en el modelo.
 
-Fuentes: `~/dbg/merge/sp7/fuse_bench.cpp`, `sp7/zba-ceiling-diag.patch`, `chain_v93.{sh,out}`,
-`~/dbg/depth/srvlog-v93*.log`.
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/sp7/fuse_bench.cpp`, `sp7/zba-ceiling-diag.patch`, `chain_v93.{sh,out}`,
+`~/ProjectHub/llama.cpp-evidence/depth/srvlog-v93*.log`.
 
 ## 44. SP5 (el draft dentro de la pasada de verificación): cerrado sin implementar (2026-10-01)
 
@@ -3306,8 +3306,8 @@ rango hasta 32k. Todo prompt de más de ~18k tokens paga en sus primeros 16k ~2.
 que costaría la sparse (suma de los excesos por ubatch de 6k a 16k). Bajar el umbral para los lotes de prefill es un
 cambio chico del backend; mueve el redondeo (la regla del 2026-09-30) y a 4k la densa todavía gana (17.6 ms).
 
-Fuentes: `~/dbg/merge/chain_v94.{sh,out}`, `prefill_rig.py`, `~/dbg/depth/srvlog-v88pa.log`,
-`~/dbg/depth/prefill-v94*.jsonl`.
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v94.{sh,out}`, `prefill_rig.py`, `~/ProjectHub/llama.cpp-evidence/depth/srvlog-v88pa.log`,
+`~/ProjectHub/llama.cpp-evidence/depth/prefill-v94*.jsonl`.
 
 ## 46. La atención sparse desde 2 × la selección: adoptada, con una excepción aceptada en la compuerta de prefill (2026-10-02, cadenas v95-v98)
 
@@ -3352,7 +3352,7 @@ de varias filas y el sparse va token por token, así que el softmax online reesc
 decode los dos agrupan por token y redondean igual. La referencia de la compuerta (fusiones apagadas) perturba poco a
 16k (0.0027) frente a 32k (0.0105), y por eso P falla por 8.7× y la misma desviación a 32k queda en 2.15×.
 
-**Prueba de precisión contra la atención exacta** (2026-10-02, `~/dbg/merge/sp8/`): `fa_dump` (sobre la base) vuelca
+**Prueba de precisión contra la atención exacta** (2026-10-02, `~/ProjectHub/llama.cpp-evidence/merge/sp8/`): `fa_dump` (sobre la base) vuelca
 las entradas y la salida de tres atenciones QSA (capas 3, 27 y 47) del ubatch de prefill a 12288 celdas de un prompt de
 15.3k tokens (Q f32, la caché K/V q8_0, la máscara con la selección, 2051 celdas por fila, y las listas); `fa_replay`
 corre esas mismas entradas en la GPU por el camino denso (idéntico byte a byte a la salida del modelo) y por el sparse
@@ -3408,9 +3408,9 @@ servidores frescos) 65.66 → 63.85 s. El prompt de 15k del rig NP=2 (con el otr
 42.7 → 39.2 s. El decode a 40k no cambia (ahí los dos builds ya usaban el camino sparse); las respuestas difieren de
 la base (redondeo, informado) y son idénticas entre cargas del mismo build.
 
-Fuentes: `~/dbg/merge/chain_v9{5,6,7,8}.{sh,out}`, `prefill_cmp.py`, `quality_gate.inc.sh` (modos P y M),
-`~/dbg/merge/sp8/{fa_dump.cpp,fa_replay.cpp,fa_exact.py}`,
-`~/dbg/depth/ppl-v9{6,8}q*.log`, `ppl-v97*.log`, `~/dbg/merge/bin-v98new` (el build adoptado).
+Fuentes: `~/ProjectHub/llama.cpp-evidence/merge/chain_v9{5,6,7,8}.{sh,out}`, `prefill_cmp.py`, `quality_gate.inc.sh` (modos P y M),
+`~/ProjectHub/llama.cpp-evidence/merge/sp8/{fa_dump.cpp,fa_replay.cpp,fa_exact.py}`,
+`~/ProjectHub/llama.cpp-evidence/depth/ppl-v9{6,8}q*.log`, `ppl-v97*.log`, `~/ProjectHub/llama.cpp-evidence/merge/bin-v98new` (el build adoptado).
 
 ## 47. Un pensamiento ajeno al contexto en producción: ningún defecto que lo explique (2026-10-06/07)
 
@@ -3461,7 +3461,7 @@ vocabularios por cabeza recalculados con el código de referencia), puntaje del 
 del bloque, relu por cabeza), cola y `reasoning_effort` (la plantilla del GGUF es la oficial: `medium` no agrega
 instrucción) coinciden. Un desvío: la selección de ancho fijo (2051 celdas, igual en upstream) completa con 1-3 celdas
 de un bloque 513 los lugares que una cola de menos de 3 tokens deja libres; la referencia atiende 512 bloques más la
-cola. La selección exacta (`LLAMA_QSA_EXACT_BUDGET`, parche en `~/dbg/glitch-1006/qsa-exact-budget.patch`, no
+cola. La selección exacta (`LLAMA_QSA_EXACT_BUDGET`, parche en `~/ProjectHub/llama.cpp-evidence/glitch-1006/qsa-exact-budget.patch`, no
 adoptado) no cambia la calidad: KLD 0.026 contra la actual, ΔPPL +0.003 ± 0.007, y queda a la misma distancia de la CPU
 (0.0368 frente a 0.0374).
 
@@ -3476,7 +3476,7 @@ exacto en float64 (pesos descuantizados del GGUF, entrada del volcado; `mm_exact
 por el pipeline de coopmat con acumulador f16 (la elección de upstream con `GGML_PREC_DEFAULT` cuando el dispositivo
 admite acumular en f16) y las de expertos por las activaciones q8_1 de MMQ. Es el origen del 1.9 % de diferencia entre
 rutas en la capa 0 en GPU (`hc_down_inject`, 1 %: −19.094 frente a −19.141 exacto). Forzar acumulación f32
-(`GGML_VK_FORCE_F32_ACC`, parche en `~/dbg/glitch-1006/vk-force-f32-acc.patch`, no adoptado) baja las densas a
+(`GGML_VK_FORCE_F32_ACC`, parche en `~/ProjectHub/llama.cpp-evidence/glitch-1006/vk-force-f32-acc.patch`, no adoptado) baja las densas a
 5e-5-2.5e-4 y deja los expertos igual, sin una mejora de calidad consistente: ΔPPL +0.042 ± 0.008 en el chunk de
 wikitext y −0.001 ± 0.006 en uno de código, KLD 0.039 contra la CPU (producción, 0.034).
 
@@ -3500,7 +3500,7 @@ corrida de inferencia solo en CPU (`--device none`, 16 hilos con AVX-512 sosteni
 36-51 GiB y sin mensaje del kernel ni volcado de kdump: un corte de hardware, no un cuelgue por memoria. Las corridas en
 GPU no lo provocaron.
 
-Fuentes: la sesión de pi `2026-10-07T00-45-12-967Z_01a113d2-...jsonl` (entrada 17), `~/dbg/glitch-1006/` (el log del
+Fuentes: la sesión de pi `2026-10-07T00-45-12-967Z_01a113d2-...jsonl` (entrada 17), `~/ProjectHub/llama.cpp-evidence/glitch-1006/` (el log del
 servidor, `capture.mjs`, `score.py`, `dist.py`, `sample.py`, `path_diff.cpp`, `isolate.sh`, `exact_ab.sh`,
 `topk/topk_check.cpp`, `fused_check_gpu.sh`, `mm_exact.py`, `f32acc_*.sh` y sus salidas),
-`~/dbg/merge/probe-glitch1006.out`.
+`~/ProjectHub/llama.cpp-evidence/merge/probe-glitch1006.out`.

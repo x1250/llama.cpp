@@ -36,7 +36,7 @@ sección 5 de este plan.
 - Día 1 de cada SP: lectura del código y decisión de diseño entre las opciones listadas, sin GPU.
 - Build con `strix-halo/build-llama.sh`, producción descargada (`strix unload`, y
   `pgrep -x "llama-(server|bench|cli|perplexit)"` vacío). Nunca editar fuentes durante un build.
-- Cargas NP=1 (ctx 57344, MTP n-max 2, feature set de producción) con el rig `~/dbg/merge/decode_budget.py`: una a
+- Cargas NP=1 (ctx 57344, MTP n-max 2, feature set de producción) con el rig `~/ProjectHub/llama.cpp-evidence/merge/decode_budget.py`: una a
   la vez, compuerta de 40 GiB, MemFree ≥ huella y corte si baja de 6 GiB. Base (copia de `build/bin` por
   `LD_LIBRARY_PATH`, verificada en `/proc/<pid>/maps`) primero y último en la misma cadena.
 - Medida: ms por paso sin instrumentar, greedy y muestreo de producción (temp 0.7, top_k 20, top_p 0.95), dos turnos
@@ -47,7 +47,7 @@ sección 5 de este plan.
 - Exactitud (regla del Director del 2026-09-30): un cambio que mueve el redondeo es una optimización si sigue siendo
   determinista e igual de correcto. Se exige determinismo dentro del build (probe repetido idéntico, `depth_repeat` a
   40k, `graph_diff4` con los 72 nodos conocidos, compuerta de historia) y la compuerta de calidad
-  (`~/dbg/merge/quality_gate.inc.sh`: divergencia KL contra la base a lo sumo el doble de la de puro redondeo, la base
+  (`~/ProjectHub/llama.cpp-evidence/merge/quality_gate.inc.sh`: divergencia KL contra la base a lo sumo el doble de la de puro redondeo, la base
   con las fusiones apagadas, y acuerdo del token top-1 no menor que el de referencia menos 0.5 puntos, en tres modos:
   ubatches de 2048 tokens a 4096 de contexto, los kernels de tiles del prompt; ubatches de 3 tokens a 4096, los
   mat-vec de la verificación, que un ubatch de 2048 nunca toca; y ubatches de 3 tokens sobre un trozo de 32k, la
@@ -57,7 +57,7 @@ sección 5 de este plan.
   visión. Respuestas y probe contra la base se informan, no se exigen. Compuerta de historia
   (desde el 2026-09-30, sección 35.2 del documento de costos): a contexto reducido, el decode de 40k en el slot 0 con
   log-probs da lo mismo en un servidor recién cargado que en uno que procesó antes la imagen de 2048×2048 en el slot 1,
-  con MTP y lookup apagados y con los de producción (`~/dbg/merge/history_gate.inc.sh`).
+  con MTP y lookup apagados y con los de producción (`~/ProjectHub/llama.cpp-evidence/merge/history_gate.inc.sh`).
 - Producción recargada separada de la cadena (`setsid -f bash -c "./strix load qwen38flash"`, luego `/health`).
 - Un commit por cambio adoptado; una subsección del documento de costos por ventana; push a los dos repos al adoptar.
 

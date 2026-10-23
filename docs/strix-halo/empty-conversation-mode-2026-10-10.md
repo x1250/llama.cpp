@@ -2,8 +2,8 @@
 
 Investigación pedida por el Director tras una sesión de pi con Strata en producción en la que el pensamiento del modelo
 abrió con "The user's message is empty — there's no actual question or content beyond the conversation start marker"
-sobre una petición con un mensaje real. Herramientas y salidas: `~/dbg/strata/empty/` (reproductor, réplica de sesiones,
-muestreo) y `~/dbg/strata/empty/official/` (la referencia con el código oficial).
+sobre una petición con un mensaje real. Herramientas y salidas: `~/ProjectHub/llama.cpp-evidence/strata/empty/` (reproductor, réplica de sesiones,
+muestreo) y `~/ProjectHub/llama.cpp-evidence/strata/empty/official/` (la referencia con el código oficial).
 
 ## 0. Resultado
 
@@ -31,7 +31,7 @@ muestreo) y `~/dbg/strata/empty/official/` (la referencia con el código oficial
 ## 1. El síntoma
 
 La sesión (`~/.pi/agent/sessions/--home-daniel-ProjectHub-media-stack--/2026-10-10T01-37-19-261Z_01a12375-….jsonl`, copia
-en `~/dbg/strata/empty/session-media-stack-1010.jsonl`) tiene 11 turnos del asistente. Tres abren el pensamiento con el
+en `~/ProjectHub/llama.cpp-evidence/strata/empty/session-media-stack-1010.jsonl`) tiene 11 turnos del asistente. Tres abren el pensamiento con el
 modo: el turno 2 ("…the user hasn't responded"), el 8 ("The user's message is empty — … conversation start marker") y
 el 9 (el mismo texto). El modelo cita frases que no están en el prompt ("expert software engineer", "Always invoke a
 function call", "Understood. I will follow these instructions": 0 apariciones).
@@ -375,7 +375,7 @@ Signal 3.8 Flash Next (agentionai) es este modelo con otra capa de salida y no c
 
 ## Herramientas
 
-| Archivo (`~/dbg/strata/empty/`) | Qué hace |
+| Archivo (`~/ProjectHub/llama.cpp-evidence/strata/empty/`) | Qué hace |
 |---|---|
 | `render.py` | reconstruye las peticiones de pi de una sesión y las renderiza con el código del servidor de Strata |
 | `classify.py` | la expresión regular del modo, compartida |

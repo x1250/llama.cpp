@@ -2,7 +2,7 @@
 
 Evaluación pedida por el Director de https://huggingface.co/agentionai/Signal-3.8-Flash-Next-GGUF, hecha sin GPU (la
 máquina estaba ocupada): cabeceras de los GGUF y filas de tensores leídas por rangos HTTP, comparadas con el checkpoint
-oficial y con el GGUF de producción. Herramientas y salidas: `~/dbg/signal/`.
+oficial y con el GGUF de producción. Herramientas y salidas: `~/ProjectHub/llama.cpp-evidence/signal/`.
 
 ## 0. Resultado
 
@@ -111,7 +111,7 @@ penalización fija; el efecto real sobre un logit depende del estado oculto, y n
 
 Como el tronco de Signal es el del modelo base, su distribución en cada posición es el último estado oculto del modelo
 base pasado por su cabeza. `headcmp.py` toma los estados de la referencia oficial (`ref_forward.py` con el GGUF de
-producción sobre la petición 8, `~/dbg/strata/empty/official/dump-long/h47.npy`: las últimas 64 posiciones, cuya
+producción sobre la petición 8, `~/ProjectHub/llama.cpp-evidence/strata/empty/official/dump-long/h47.npy`: las últimas 64 posiciones, cuya
 continuación forzada es "<think>\nThe user hasn't asked anything substantive yet — the last message was just system
 instructions setting up my role as an expert software engineer helping the user solve problems. There's no actual
 task or question here."), aplica el mezclador final oficial en numpy y las tres cabezas. Validación: con la cabeza de
@@ -186,7 +186,7 @@ Sobre producción con la cabeza de Signal (sección 5), decisión del Director:
 
 ## Herramientas
 
-| Archivo (`~/dbg/signal/scripts/`) | Qué hace |
+| Archivo (`~/ProjectHub/llama.cpp-evidence/signal/scripts/`) | Qué hace |
 |---|---|
 | `gguf_head.py`, `compare.py` | la cabecera de un GGUF por rango HTTP; tipos y metadatos de varios archivos |
 | `tensor_cmp.py`, `delta.py`, `consist.py` | tensores float byte a byte; error contra los pesos oficiales; niveles Q6_K/Q4_K contra el redondeo de ggml |
