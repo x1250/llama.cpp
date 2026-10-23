@@ -3,7 +3,7 @@
 Evaluación pedida por el Director de https://x.com/BottleCapAI/status/2113300959690416219 (publicado hoy), hecha sin
 GPU (la máquina estaba ocupada): metadatos de los repositorios, cabeceras de los safetensors y de los GGUF, y ventanas
 de tensores leídas por rangos HTTP, comparadas con el checkpoint oficial y con el GGUF de producción. Herramientas y
-salidas: `~/dbg/thinkingcap/`.
+salidas: `~/ProjectHub/llama.cpp-evidence/thinkingcap/`.
 
 ## 0. Resultado
 
@@ -359,10 +359,19 @@ El 27B anticipa ~13 % en `medium` (sección 4), por debajo de ese umbral.
 
 ## Herramientas
 
-| Archivo (`~/dbg/thinkingcap/scripts/`) | Qué hace |
+| Archivo (`~/ProjectHub/llama.cpp-evidence/thinkingcap/scripts/`) | Qué hace |
 |---|---|
 | `st_diff.py`, `st_summary.py` | safetensors de ThinkingCap contra los oficiales: cabeceras, tensores enteros o por ventanas, resumen por tipo (`st_diff.tsv`) |
 | `delta_rank.py` | espectro del cambio de tensores enteros (`delta_rank.log`) |
 | `hdr_cmp.py`, `gguf_win.py`, `iq3check.py` | GGUF de ThinkingCap, de Unsloth y de producción: tipos, metadatos, bytes por ventanas, IQ3_S descuantizado contra el oficial |
 | `pi_thinking.py` | razonamiento en los turnos de pi de producción |
 | `~/ProjectHub/llama.cpp-evidence/signal/scripts/gguf_head.py` | cabecera de un GGUF por rango HTTP (`hdr/`) |
+
+En la misma carpeta también están:
+- `dl/`: los metadatos del modelo base y de ThinkingCap (configuración, plantilla, tokenizer, índice de los
+  safetensors) y las fichas de ThinkingCap (modelo y GGUF).
+- `agents/`: el material de los dos agentes:
+  - la reproducción de la sección 2 (`scripts/tensordiff.py`, `scripts/dense.py`, `tensordiff.json`,
+    `dense_*.json`);
+  - las fuentes del informe de la sección 6 (páginas de BottleCap, fichas, discusiones de Hugging Face y Reddit, y
+    el benchmark de OpenCode).
