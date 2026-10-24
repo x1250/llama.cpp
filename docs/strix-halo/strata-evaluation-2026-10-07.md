@@ -48,7 +48,7 @@ hasta el fin del chunk (21 s en total, 10.6).
 
 - Por defecto Strata copia todos los expertos a un arena de RAM fijada y además llena la caché de expertos de la GPU con
   `MemAvailable - 6 GiB` (`device_free_bytes`, `src/core/expert_cache.cpp`): en memoria unificada son dos copias.
-  Los expertos que la caché no tiene los calcula la CPU (AVX-512): prohibido aquí (CLAUDE.md, dos apagones).
+  Los expertos que la caché no tiene los calcula la CPU (AVX-512).
 - Configuración usada: `--mmap-experts` (el GGUF leído en su lugar), `--expert-cache 24576` (los 48 × 512 expertos en
   la GPU, sin aciertos fallidos: la CPU no pasó de 23 % en ninguna corrida), `--adapt-swaps 0`, `--no-prefill-borrow`.
 - Parche del fork (commit 310bfe4): `FileExpertSource::release` era solo de Windows; en Linux ahora desmapea

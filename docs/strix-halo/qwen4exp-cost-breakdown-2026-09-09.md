@@ -3495,10 +3495,11 @@ incertidumbre, cuya distribución este modelo mueve con cualquier diferencia num
 incertidumbre, no un valor único. Lo que no se pudo medir aquí: la pérdida de la cuantización del GGUF (expertos
 IQ3_S) frente al modelo original, que no cabe en la máquina.
 
-La máquina se apagó dos veces durante esta investigación (2026-10-06 23:51 y 2026-10-07 02:00), las dos en una
-corrida de inferencia solo en CPU (`--device none`, 16 hilos con AVX-512 sostenido, a los 1-3 minutos), con MemFree en
-36-51 GiB y sin mensaje del kernel ni volcado de kdump: un corte de hardware, no un cuelgue por memoria. Las corridas en
-GPU no lo provocaron.
+La máquina se apagó dos veces durante esta investigación (2026-10-06 23:51 y 2026-10-07 02:00), sin mensaje del
+kernel ni volcado de kdump: un corte de hardware, no un cuelgue por memoria. Las dos veces había un render de Blender en
+CPU en curso (el Director, 2026-10-24), y esa fue la causa. A la misma hora corría una inferencia solo en CPU de esta
+investigación (`--device none`, 16 hilos), y esta sección la culpó primero, por error: la inferencia nunca apagó la
+máquina.
 
 Fuentes: la sesión de pi `2026-10-07T00-45-12-967Z_01a113d2-...jsonl` (entrada 17), `~/ProjectHub/llama.cpp-evidence/glitch-1006/` (el log del
 servidor, `capture.mjs`, `score.py`, `dist.py`, `sample.py`, `path_diff.cpp`, `isolate.sh`, `exact_ab.sh`,
