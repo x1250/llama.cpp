@@ -141,9 +141,12 @@ contexto o los slots de producción está fuera de la orden vigente (262144 × 2
 
 - **Dos peticiones a la vez.** El decode conjunto de gufo con MTP sube de 35.7 t/s con una sesión a 61.3 con dos. Strata,
   con dos slots, rinde menos que llama.cpp: 42 contra 57 t/s (`strata-evaluation-2026-10-07.md` §0 y §10.9).
-- **Las lecturas cortas.** Para lo que hoy lee a 108-286 t/s, la revisión del 2026-10-20 ya dejó propuestas dos
-  variables de Strata sin aplicar: `STRATA_PREFILL_STREAM_MIN=128` y `STRATA_PF_SWITCH_MIN_T=2048`
-  (`upstream-review-2026-10-20.md`).
+- **Las lecturas cortas.** Para lo que hoy lee a 108-286 t/s, la revisión del 2026-10-20 dejó propuestas dos variables de
+  Strata: `STRATA_PREFILL_STREAM_MIN=128` y `STRATA_PF_SWITCH_MIN_T=2048` (`upstream-review-2026-10-20.md`). Se
+  adoptaron el mismo 2026-10-31 (`short-reads-2026-10-31.md`):
+  - las lecturas de 300-800 tokens, −40 a −45 %;
+  - las de 2.4k-3.7k, −10 a −14 %;
+  - las de menos de ~136 tokens no cambian.
 
 ## 6. Lo que dicen los usuarios
 
