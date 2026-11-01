@@ -26,6 +26,8 @@ las sesiones de pi (solo los turnos de qwen38flash), el log del motor (`~/.strix
 | Al pasar los 262144 tokens, pi muestra un error en vez de compactar la conversación | El texto del error de contexto excedido no coincide con los patrones de pi (`serve/server.py:2920-2923`) | `2bf1d07c` | No |
 | Las imágenes fallan con el servidor arriba más de 10 días | `systemd-tmpfiles` limpia `/tmp` a los 10 días (`/usr/lib/tmpfiles.d/tmp.conf:11`), y el directorio de trabajo de `strata-vision` está ahí (`serve/server.py:1690`) | Una línea `x /tmp/strata-vision-*` en `/etc/tmpfiles.d`. Requiere privilegios: la aplica el Director | No |
 
+| Respuestas peores sobre fotos JPEG que sobre la misma foto en PNG | El decodificador JPEG de mtmd (stb_image, `mtmd-helper.cpp:408`) no da los mismos píxeles que PIL, el de la referencia: 2-3 niveles como máximo, en el 2-6 % de los píxeles. En 2 de los 3 JPEG de pi, el token más afectado queda en 0.46-0.58 de similitud con la referencia; la media, en 0.995-0.999 (`image-preprocessing-2026-11-01.md`, sección 3) | Decodificar los JPEG con PIL en el servidor de Strata y pasarle un PNG a `strata-vision` (ya convierte otros formatos, `serve/server.py:1778-1810`). Se verifica con `photo_check.py` | Medido en el codificador; ningún síntoma en las respuestas |
+
 - **Menores con el mismo veredicto:** #1620 (cancelar conserva la conversación), #1666, #1700 (el borde del
   contexto), `940011da` y `53f72571` (caché de conversaciones), `f332a855` (guarda de logits no finitos).
 - **Cómo aplicarlos:** los cherry-picks se simularon contra HEAD (`upstream-review-2026-10-20.md`, sección 3).

@@ -36,6 +36,8 @@ revisión indicada; lo que necesita la GPU está en la sección 3.
      y aplica limpio salvo un test.
    - **Es lo único que recomiendo tomar ya.** Las compuertas de imagen esperan a la GPU. Por ser un commit de horas,
      conviene mirar si upstream le agregó un arreglo antes de tomarlo.
+   - **Adoptado el 2026-11-01** (`image-preprocessing-2026-11-01.md`). Upstream no le agregó arreglos hasta el
+     2026-10-31. En producción, 18 de las 32 imágenes de pi entraban distintas a la referencia.
    - Otra diferencia, aparte y sin propuesta: nuestro tope es de 4096 tokens por imagen (`max_tokens` del codificador)
      y el de la referencia, de 16384 (`longest_edge` 16777216 px). Una foto de 3024×4032 da 4015 tokens aquí y 11844
      en la referencia.
@@ -214,6 +216,9 @@ y `--spec 6` fue peor.
 
 ### 2.2 Verdictos
 
+**Estado (2026-11-01):** `f711c8f30` está adoptado (`image-preprocessing-2026-11-01.md`). Los demás "tomar" quedan
+registrados en `latent-defects.md`, porque producción no corre llama-server desde el 2026-10-07.
+
 | Commit | Qué | Veredicto | Valor aquí |
 |---|---|---|---|
 | `f711c8f30` | resize de Qwen-VL como transformers | **tomar ya**; recompilar `strata-vision` y llama-server | sección 0, punto 1; afecta a los dos motores |
@@ -249,6 +254,8 @@ y `--spec 6` fue peor.
    - texto → imagen → texto;
    - `img_big.py` 2048 × 2048: debe quedar igual, porque 2048 es múltiplo de 32;
    - compuerta de historia de Strata.
+   - **Adoptado el 2026-11-01**, con `strata-vision` recompilado (`image-preprocessing-2026-11-01.md`). llama-server
+     no se recompiló: producción no lo usa.
 2. **Ventana de medición de Strata, sin cambiar código:**
    - las dos variables de lectura corta, con la compuerta de calidad;
    - el decode a la misma profundidad con 131072 y con 262144 por slot (el top-k).
