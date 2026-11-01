@@ -85,6 +85,9 @@ esquema de `render-config.py` se lee igual. Diferencias:
 
 ### 1.3 Defectos de nuestro HEAD que upstream corrige
 
+**Registrados, no aplicados (2026-11-01):** ninguno se observó en producción del 2026-10-07 al 10-31. Por decisión
+del Director, quedan en `latent-defects.md` con el síntoma de cada uno, y se toman si el síntoma aparece.
+
 | Upstream | Defecto en HEAD (verificado en el código) | Peso aquí | Compuertas |
 |---|---|---|---|
 | `7a0e3023` + `e372d4ff` (#606, #1448) | tres productores de q8_1 escriben `make_half2(d, sum)` sin acotar `d` (`fused_gr.cu:202`, `verify_kernels.cu:187`, `iq_kernels.cu:2330`). Un bloque con amax > ~8.3M da una escala inf/NaN, la fila de logits termina en NaN y el muestreador devuelve el id 0, `!`. La tabla de gfx1151 enciende `STRATA_QFUSE` (`src/core/arch_defaults.cpp:36`), que usa dos de ellos | bajo en probabilidad, alto si ocurre: el texto degenera y queda en el caché. Bits iguales en bloques normales | determinismo, historia |

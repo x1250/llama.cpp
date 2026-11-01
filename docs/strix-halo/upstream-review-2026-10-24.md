@@ -29,6 +29,8 @@ GPU.
    - El arreglo es exacto: solo cambia el orden en el host.
    - **Recomiendo tomarlo, adaptado, y extenderlo a los caminos batch**, que producción usa con dos slots y que
      upstream no arregló.
+   - **Registrado, no aplicado (2026-11-01):** no se observó en 19 arranques (2026-10-07 a 10-31). Por decisión del
+     Director, un defecto que no ocurre aquí se registra en `latent-defects.md` y no se arregla.
 3. **Un merge de Strata cambiaría un caso raro para pi, sin interruptor** (`70f42407`, sección 1.2).
    - Las llamadas a una herramienta no declarada volverían como texto.
    - Hoy pi recibe "Tool X not found" y el modelo reintenta; con el cambio, el turno terminaría con el markup crudo.
