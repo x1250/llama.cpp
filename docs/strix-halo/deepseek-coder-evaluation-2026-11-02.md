@@ -145,11 +145,15 @@ su decode ahí no es comparable.
   - Además rechaza la "k" minúscula.
   - qwen38flash, con la misma pregunta y razonamiento "medium": respuesta en español, el módulo 11 correcto, la "k"
     minúscula aceptada, 3750 tokens en 53 s.
+- **No es Strata:**
+  - El servidor tokeniza los prompts de la prueba igual que llama.cpp (26 y 57 ids idénticos).
+  - La misma pregunta, en modo chat y greedy, por llama.cpp upstream en CPU (`cpu-explain.sh`), sin nada de Strata en
+    el camino, también cambia de idioma y mezcla francés: "usando una función hash pour convertir a cada key into an
+    index (bucket) in an array…".
 - **La causa probable:** la poda. RCO conservó la mitad de los expertos, elegidos con datos de código. La perplejidad
   en otros idiomas está bien (6.24), pero generar texto fuera del código perdió capacidad. Strata ya medía en el set
   IQ1_M de ISTA (1.75 bpw, sin podar), contra el modelo original, +14 % de perplejidad en otros idiomas y +53 % en
-  prosa en inglés. El motor está descartado
-  como causa (sección 3).
+  prosa en inglés.
 
 ## 6. Memoria y lo que hubo que resolver en el motor
 
@@ -176,6 +180,8 @@ su decode ahí no es comparable.
    - **Lo que pasó:** el fusible cortó la carga con DSpark en ese paso.
    - **Por qué sobra acá:** los 8064 expertos ya están en la GPU y el carril de CPU está vacío, así que solo copiaba
      expertos a la misma memoria unificada.
+   - **El bench sin drafter** corrió antes de este ajuste: la store quedó configurada pero vacía, porque todavía no
+     había perfil (el RSS del motor se mantuvo en 4.8 GiB). Sus cifras no cambian.
 3. **Las filas del Engram se leen por la caché de páginas.** No se corrigió: es caché limpia que el kernel recupera.
    La lectura directa solo existe en Windows (`ds4_model.cu:2867`). La caché del Engram llegó a 8.8 GiB después de
    ~100k tokens. Una sesión larga la hace crecer hasta que el kernel la recupera, y una carga posterior necesita
@@ -202,7 +208,9 @@ prueba cuesta poco: el pack y el motor quedan listos, el servidor arranca en 27 
 - el build (`build-dsv41.sh` y su `.out`) y la paridad (`iq_test.out`);
 - el pack (`pack.sh`, `pack.out`) y la verificación de la descarga (`verify.sh`, `verify.out`);
 - los puntajes (`set.ids.json`, `score-*.tsv`, `compare-*.txt`);
-- el bench y la prueba en español (`bench-*.jsonl`, `probe-*.jsonl`, `chain-*.out`, `server-*.log`, `engine-*.log`);
+- el bench y la prueba en español (`bench-*.jsonl`, `probe-*.jsonl`, `chain-*.out`, `server-*.log`, `engine-*.log`),
+  la referencia de qwen38flash (`qwen/`), la comparación de tokenizadores (`tokcmp.py`) y la respuesta de llama.cpp en
+  CPU (`cpu-explain.sh`, `.out`);
 - las trazas de memoria (`memmon-*.log`).
 
 La corrección del loader es `14d42f1a` en `~/ProjectHub/strata-wt-dsv41`, rama `dsv41-upstream`, sin push.
