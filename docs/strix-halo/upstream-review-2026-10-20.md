@@ -261,7 +261,8 @@ registrados en `latent-defects.md`, porque producción no corre llama-server des
    - el decode a la misma profundidad con 131072 y con 262144 por slot (el top-k).
 3. **Cherry-picks al fork de Strata:**
    - las seis correcciones de 1.3;
-   - `82922f55` + `6ef23b89` + `b6ccf873`, si el punto 2 muestra la ganancia.
+   - `82922f55` + `6ef23b89` + `b6ccf873`, si el punto 2 muestra la ganancia. Adoptados el 2026-11-02
+     (`qsa-topk-2026-11-02.md`).
    - Compuertas: las de la sección 10 del documento de Strata, con el cliente Vulkan de ruido.
    - Simulados contra HEAD con `git merge-tree --merge-base=<c>^`:
      - **Limpios:** `e372d4ff`, `a6830008`, `2bf1d07c` y el top-k (`82922f55`, `6ef23b89`, `b6ccf873`). El kernel

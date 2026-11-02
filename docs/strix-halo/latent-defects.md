@@ -30,7 +30,8 @@ las sesiones de pi (solo los turnos de qwen38flash), el log del motor (`~/.strix
 
 - **Menores con el mismo veredicto:** #1620 (cancelar conserva la conversación), #1666, #1700 (el borde del
   contexto), `940011da` y `53f72571` (caché de conversaciones), `f332a855` (guarda de logits no finitos).
-- **Cómo aplicarlos:** los cherry-picks se simularon contra HEAD (`upstream-review-2026-10-20.md`, sección 3).
+- **Cómo aplicarlos:** los cherry-picks se simularon contra `c195c0c4`, el HEAD de entonces
+  (`upstream-review-2026-10-20.md`, sección 3); producción avanzó después a `9c012d0b` (`qsa-topk-2026-11-02.md`).
   `e372d4ff`, `a6830008` y `2bf1d07c` aplican limpios; el resto lleva conflictos chicos, a mano. Las compuertas son
   las de la sección 10 de `strata-evaluation-2026-10-07.md`, con el cliente Vulkan de ruido.
 - **Detalle:** `upstream-review-2026-10-20.md` (sección 1.3) y `upstream-review-2026-10-24.md` (secciones 1.1 y 3).
