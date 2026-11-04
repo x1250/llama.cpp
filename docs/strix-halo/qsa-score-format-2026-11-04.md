@@ -196,6 +196,10 @@ bits, como LSA. Guardarlas en una pieza fp16 lo reduce a la mitad, pero ese form
 bench; si pasara la de calidad, el techo sería ~1-1.5 % del decode. Lo que falta saber primero es cuánto de ese 4.5 %
 es puntaje y cuánto top-k, que el perfil no separa.
 
+Se midió el mismo día (`qsa-decode-scores-2026-11-04.md`): el puntaje del decode no estaba limitado por la memoria
+sino por sus reducciones entre hilos, que pasaban por la LDS (`ds_bpermute`). Con DPP, los mismos bits y −26 a −32 % de
+puntaje + top-k por ventana pasados los 125k (~1.2 % del decode de producción).
+
 ## Evidencia
 
 `~/ProjectHub/llama.cpp-evidence/idxprec/`:
