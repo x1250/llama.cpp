@@ -12,9 +12,11 @@ memoria: sus reducciones entre hilos pasaban por la LDS.
   cada producto punto con la misma mariposa de 32 hilos, pero sus movimientos entre hilos son DPP y `permlanex16`
   en lugar de `ds_bpermute` (`s26_tsum.cuh`, ya usado en cuatro archivos de kernels).
 - **Velocidad:**
-  - el puntaje de una ventana, por capa, a 246k: 68 → 40 µs con 1 consulta, 192 → 88 con 3, 320 → 140 con 5;
+  - el puntaje de una ventana, por capa, a 246k: 68 → 40 µs con 1 consulta, 192 → 88 con 3, 320 → 140 con 5 (en el
+    bench, con las claves en la caché de la GPU);
   - en el motor, puntaje + top-k por ventana: −26 % a 125k, −32 % a 192k, −26 % a 226k;
-  - en producción, con su distribución de profundidad: ~1.2 % del tiempo de decode, ~1 % del tiempo del motor.
+  - en producción, con su distribución de profundidad: ~1.2 % del tiempo de decode, ~1 % del tiempo del motor
+    (estimado desde la corrida perfilada, sección 3).
 - **Exactitud:** los puntajes son bit a bit los del kernel por consulta (1 474 575 comparaciones). En el motor, las
   respuestas y las filas de log-probs son idénticas a producción en todas las compuertas (sección 4).
 
@@ -59,7 +61,9 @@ referencia bit a bit.
 | 246k, 5 | 320.4 µs | 140.5 µs | 312.4 µs |
 
 En cada punto, los puntajes del kernel nuevo son bit a bit los del kernel por consulta, y los ids del top-k los de la
-referencia.
+referencia. Los tiempos del bench son con las claves en la caché de la GPU: a 246k una consulta lee 31.5 MB en 68 µs,
+~460 GB/s, más que el pico de la memoria; en el motor las claves de cada capa no quedan en caché entre ventanas, y el
+efecto real es el de la tabla siguiente.
 
 **En el motor** (`chain-prof.sh`: la conversación de `depth_profile.py`, de 0 a ~248k en lecturas de ~16k y respuestas
 de 64 tokens, con `STRATA_VERIFY_PROFILE`; producción primero y último):
@@ -79,8 +83,10 @@ cliente de la GPU en esos minutos.
 
 **En producción:** con el ahorro por ventana de cada profundidad y la distribución del decode de producción
 (`topk/decode_depth.out`: 7 % del decode bajo 32k, 19 % a 32-64k, 18 % a 64-96k, 15 % a 96-128k, 27 % a 128-192k,
-14 % pasados 192k), ~1.2 % del tiempo de decode: 2.6 % pasados 192k, 1.8 % entre 128k y 192k. Es una cota baja: las
-ventanas de producción verifican 3.1 tokens (2.5-2.9 en esta conversación) y el ahorro crece con ellos.
+14 % pasados 192k), ~1.2 % del tiempo de decode: 2.6 % pasados 192k, 1.8 % entre 128k y 192k. Es una estimación: el
+perfil apaga el solapamiento del stream compartido, y en la corrida libre (`chain-ab.sh`) la velocidad de decode quedó
+dentro del ruido (+3 % a 192k, +0.6 % a 226k, ±0.5 % a menor profundidad). Las ventanas de producción verifican 3.1
+tokens (2.5-2.9 en esta conversación), lo que la sube; el solapamiento puede bajarla.
 
 ## 4. Compuertas
 
@@ -120,9 +126,9 @@ El cambio da los mismos bits, así que se exigió lo mismo que al top-k: todo id
   reutilización dependa de cómo terminó la última ventana (drafts aceptados más allá del corte) es la hipótesis que
   explica los logs; no está verificada en el código.
 - **En producción:** de las 5905 respuestas de qwen38flash en las sesiones de pi, 3 terminaron por longitud (las demás,
-  por llamada a herramienta, fin de turno, error o cancelación). Queda en `latent-defects.md`. Para las compuertas: las conversaciones de varios turnos
-  comparadas entre cargas no deben cortar respuestas por `max_tokens` a mitad de la conversación, o deben fijar la
-  política (`STRATA_LOOKUP_CHAIN_FIXED` fija solo la cadena).
+  por llamada a herramienta, fin de turno, error o cancelación). Queda en `latent-defects.md`. Para las compuertas:
+  las conversaciones de varios turnos comparadas entre cargas no deben cortar respuestas por `max_tokens` a mitad de la
+  conversación, o deben fijar la política (`STRATA_LOOKUP_CHAIN_FIXED` fija solo la cadena).
 
 ## 7. Adopción
 
