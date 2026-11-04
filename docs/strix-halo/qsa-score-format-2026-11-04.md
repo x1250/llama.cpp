@@ -12,15 +12,14 @@ pasó todas las compuertas.
 - **Qué cambia:** el puntaje de bloques que usa la lectura de prompts (no el decode) multiplica cada valor partido en
   dos piezas fp16 (3 productos WMMA) en lugar de tres piezas bf16 (6 productos).
 - **Velocidad:**
-  - la fase "qsa select" (puntaje + top-k) de la lectura baja 27-30 % entre 17k y 226k celdas;
+  - la fase "qsa select" (puntaje + top-k) de la lectura baja 26-30 % entre 17k y 226k celdas;
   - con los mismos tokens en las tres cargas (sección 4): leer 180k desde cero, +7.0 %; chunks de 3008 entre 183k y
     229k, +4.8 %; hasta 47k, dentro del ruido (+0.7 % en total);
   - **en producción**, sobre las lecturas del log del motor: ahorra 1.2 % del tiempo de lectura, 0.2 % del tiempo del
-    motor.
-    Las lecturas que empiezan pasados los 128k ganan 2.4 %. La ganancia es chica porque casi todas las lecturas
+    motor. Las lecturas que empiezan pasados los 128k ganan 2.4 %. La ganancia es chica porque casi todas las lecturas
     profundas de pi son cortas y en ellas pesa poco la selección.
-- **Calidad:** contra producción, la KL agregada es 1.06 veces la de la referencia (el kernel FP32 de antes, otro
-  redondeo de la selección que producción ya aceptó) y el argmax queda 0.21 puntos debajo. El criterio permite 2 veces y
+- **Calidad:** contra producción, la KL agregada es 1.06 veces la de la referencia (el kernel FP32, el default de
+  Strata: otro redondeo de la misma selección) y el argmax queda 0.21 puntos debajo. El criterio permite 2 veces y
   0.5 puntos (sección 5).
 - **Determinismo:** idéntico a sí mismo entre cargas, después de una imagen en el otro slot (con y sin drafts), a 146k
   junto a otro cliente de la GPU, en dos slots y en las relecturas.
@@ -48,7 +47,8 @@ tres piezas bf16 y suma seis productos para reproducir FP32 (`qsa_select.cu`).
 ## 2. Dónde está el tiempo
 
 Producción a 262144 con un slot, una conversación que crece de a ~16k tokens (`depth_profile.py`), con los perfiles de
-fases del motor (`STRATA_PREFILL_TIMING`, `STRATA_VERIFY_PROFILE`):
+fases del motor (`STRATA_PREFILL_TIMING`, `STRATA_VERIFY_PROFILE`). El perfil del decode apaga el solapamiento del
+stream compartido, así que sus porcentajes son una estimación:
 
 | Lectura desde | "qsa select" en la lectura | Puntaje + top-k en la ventana de decode |
 |---|---|---|
@@ -101,9 +101,9 @@ Las claves y consultas del indexador salen de una norma RMS, así que |x| ≤ �
 | 176k | 2345 ms | 1653 ms |
 | 226k | 3437 ms | 2505 ms |
 
-Las dos corridas de producción coinciden en esa fase dentro de ~1 %. Las velocidades de lectura de esta prueba no
-sirven para comparar: las respuestas de f16x2 son otras desde el primer turno, así que los turnos siguientes leen otro
-texto y otros expertos.
+Las dos corridas de producción coinciden en esa fase dentro de ~1 %; f16x2 la baja 26 % a 17k y 27-30 % desde 34k.
+Las velocidades de lectura de esta prueba no sirven para comparar: las respuestas de f16x2 son otras desde el primer
+turno, así que los turnos siguientes leen otro texto y otros expertos.
 
 **Con los mismos tokens** (las lecturas forzadas de la compuerta de calidad, sin el cliente de ruido):
 
@@ -113,11 +113,12 @@ texto y otros expertos.
 | 16 chunks de 3008, de 183k a 229k | 47.8 s | 45.6 s | +4.8 % |
 | 38 chunks de 3008 y 6016, de 7k a 47k | 134.4 s | 133.5 s | +0.7 % |
 
-El kernel FP32 de antes, en la misma prueba, lee los chunks profundos 25 % más lento que producción.
+El kernel FP32 (el default de Strata), en la misma prueba, lee los chunks profundos 25 % más lento que producción.
 
 **En producción** (`weight_prod.py`): f16x2 ahorra 2.36e-7 ms por token leído y por celda de profundidad (29 % del
-"qsa select"). Aplicado a las 1726 lecturas de más de 64 tokens del log del motor (las de 64 o menos van por las
-ventanas de verificación, que no cambian):
+"qsa select"). Aplicado a las 1726 lecturas de más de 64 tokens del log del motor (`~/.strix-engine.log`, 2736
+peticiones del 2026-10-07 al 2026-11-04; las lecturas de 64 tokens o menos van por las ventanas de verificación, que no
+cambian):
 
 | Lecturas que empiezan en | Lecturas | Tiempo | Ahorro |
 |---|---|---|---|
@@ -133,8 +134,9 @@ Total: 1.05 min de 86.3 de lectura (1.2 %), 0.2 % de lectura más decode.
 **El criterio, fijado antes de medir:** la regla del Director del 2026-09-30, con el método de
 `short-reads-2026-10-31.md` (sección 3): la KL contra producción a lo sumo el doble de la de una referencia de
 redondeo, el argmax a lo sumo 0.5 puntos debajo, Δ ln p sin empeorar más allá de su error estándar. La referencia es
-el kernel FP32 del puntaje (`STRATA_SELECT_WMMA=0`), el que producción usaba hasta la evaluación del 2026-10-07: otro
-redondeo de la misma selección, ya aceptado.
+el kernel FP32 del puntaje (`STRATA_SELECT_WMMA=0`), el default de Strata: otro redondeo de la misma selección.
+Producción usa el WMMA desde que pasó a Strata (strix-halo `f6b98ca`, 2026-10-07); la referencia mide cuánto movió
+las filas ese cambio.
 
 **Método** (`chain-quality.sh`, `band_logpos.py`): el motor solo a 262144, filas de log-probs (top 20) de las
 ventanas que siguen a cada chunk leído por la ruta de prompt; wiki y código en chunks de 3008 y 6016 hasta ~47k, y
@@ -186,12 +188,13 @@ Con la rama y `f16x2`:
 
 ## 8. Lo que queda: la selección en el decode
 
-El decode no se tocó. Su puntaje + top-k pesa 4.7 % de la ventana a 99k y 8.3 % a 226k; con la distribución de
-profundidad del decode de producción (`topk/decode_depth.out`) es ~4.5 % del tiempo de decode. El puntaje del decode
-(`qsa_block_scores`, FP32) lee las claves agrupadas en fp32: 29 MB por capa y por ventana a 226k. Bajar ese tráfico
-requiere guardar las claves con menos bits, como LSA. Guardarlas en una pieza fp16 lo reduce a la mitad, pero ese
-formato falla la compuerta de precisión del bench; si pasara la de calidad, el techo sería ~1-1.5 % del decode.
-Medirlo es un proyecto aparte.
+El decode no se tocó. Su puntaje + top-k pesa 4.7 % de la ventana a 99k y 8.3 % a 226k (con el perfil, sección 2);
+con la distribución de profundidad del decode de producción (`topk/decode_depth.out`) es ~4.5 % del tiempo de decode,
+~3.7 % del tiempo del motor (lo que ahorra f16x2 es 0.2 %). El puntaje del decode (`qsa_block_scores`, FP32) lee las
+claves agrupadas en fp32: 29 MB por capa y por ventana a 226k. Bajar ese tráfico requiere guardar las claves con menos
+bits, como LSA. Guardarlas en una pieza fp16 lo reduce a la mitad, pero ese formato falla la compuerta de precisión del
+bench; si pasara la de calidad, el techo sería ~1-1.5 % del decode. Lo que falta saber primero es cuánto de ese 4.5 %
+es puntaje y cuánto top-k, que el perfil no separa.
 
 ## Evidencia
 
