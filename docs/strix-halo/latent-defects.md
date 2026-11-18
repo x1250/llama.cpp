@@ -52,8 +52,17 @@ siguen sin aplicar. Los que tienen un síntoma visible:
 
 - El resto de los "tomar" de esa sección (`23b0202a1`, `8e1642198`, `1a3011cc0`, `436f6f89e` y los arreglos de Vulkan
   y ggml) no tienen un síntoma propio en producción. Sus compuertas están en esa sección.
-- El llama-server instalado (`~/.local/bin/llama-server`) es `dac7b4e4c`, un commit que no está en master. Antes de
-  volver a usarlo como respaldo, se compila desde master y pasa sus compuertas (`CLAUDE.md`).
+- **El crecimiento de los checkpoints con MTP ocurre con `apex35b`** (2026-11-18, `apex-35b-2026-11-17.md`, sección 5).
+  - Medido: 63 MiB + 2069 B por token cada checkpoint, dos por turno; a 228k cada turno sumó ~1.05 GiB.
+  - Con 12 por slot llega a 13.6 GiB a 262k con dos slots, y `kv_gb` 38 lo cubre.
+  - El arreglo de la fila no se tomó: el presupuesto alcanza, y el arreglo cambia el fork y lleva sus compuertas.
+- El llama-server instalado (`~/.local/bin/llama-server`) se compiló desde master `2e26bae3f` el 2026-11-17
+  (`build-llama.sh --install`). Antes el lanzador de 91 KB decía `dac7b4e4c`, un commit que no está en master, pero las
+  bibliotecas de `build/bin` eran las del build adoptado v98 (`b69e48204`). Contra `bin-v98new`, `libggml-vulkan`,
+  `libggml`, `libggml-cpu`, `libllama` y `libllama-server-impl` son idénticas byte a byte; `libggml-base` y
+  `libllama-common` difieren solo en el commit que llevan escrito; `libmtmd` trae `e0ba28426`, el preprocesado de
+  imágenes de Qwen-VL como la referencia. Las compuertas de qwen38flash como respaldo (`ENGINE=llama`: la de historia
+  y la de calidad) no se corrieron con este build; antes de usarlo como respaldo, se corren.
 
 ## Arreglados
 
