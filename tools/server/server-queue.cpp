@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cinttypes>
 #include <thread>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -115,9 +114,7 @@ void server_queue::pop_deferred_task(int id_slot) {
 
 void server_queue::wait_until_no_sleep() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    if (!sleeping) {
-        return;
-    } else {
+    if (sleeping) {
         if (!req_stop_sleeping) {
             QUE_DBG("%s", "requesting to stop sleeping\n");
             req_stop_sleeping = true;
@@ -128,6 +125,13 @@ void server_queue::wait_until_no_sleep() {
             return !sleeping;
         });
     }
+    n_inflight++;
+}
+
+void server_queue::release_inflight() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    GGML_ASSERT(n_inflight > 0);
+    n_inflight--;
 }
 
 void server_queue::terminate() {
@@ -290,24 +294,18 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     constexpr auto max_wait_time = std::chrono::seconds(1);
     auto should_sleep = [&]() -> bool {
         // caller must hold mutex_tasks
-        if (idle_sleep_ms < 0) {
+        if (idle_sleep_ms < 0 || n_inflight > 0) {
             return false;
         }
         int64_t now = ggml_time_ms();
         return (now - time_last_task) >= idle_sleep_ms;
     };
 
-    // LLAMA_SPEC_TIMING=1: where the loop spends its time between two update_slots (ms per iteration)
-    static const bool loop_timing = getenv("LLAMA_SPEC_TIMING") != nullptr;
-    int64_t lt_iters = 0, lt_prev_end = 0; double lt_tasks = 0, lt_update = 0, lt_wait = 0, lt_between = 0;
-
     while (true) {
         QUE_DBG("%s", "processing new tasks\n");
-        const int64_t lt_t0 = loop_timing ? ggml_time_us() : 0;
         if (process_new_tasks(false)) {
             break; // terminate
         }
-        const int64_t lt_t1 = loop_timing ? ggml_time_us() : 0;
 
         // all tasks in the current loop is processed, slots data is now ready
         QUE_DBG("%s", "update slots\n");
@@ -315,16 +313,6 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         // this will run the main inference process for all slots
         const int64_t t_update_slots = ggml_time_ms();
         callback_update_slots();
-        const int64_t lt_t2 = loop_timing ? ggml_time_us() : 0;
-        if (loop_timing) {
-            lt_tasks += (lt_t1 - lt_t0) / 1000.0; lt_update += (lt_t2 - lt_t1) / 1000.0;
-            if (lt_prev_end) { lt_between += (lt_t0 - lt_prev_end) / 1000.0; }
-            lt_iters++;
-            if (lt_iters % 256 == 0) {
-                QUE_INF("loop timing: %" PRId64 " iterations | per iteration ms: tasks %.2f + update_slots %.2f + wait %.2f + between %.2f\n",
-                        lt_iters, lt_tasks / lt_iters, lt_update / lt_iters, lt_wait / lt_iters, lt_between / lt_iters);
-            }
-        }
         {
             // update_slots() may take a while to finish, we need to make sure it's not counted as idle
             // shift instead of reset, so that non-task_resets_idle_timer tasks do not delay the sleep
@@ -334,11 +322,9 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         }
 
         QUE_DBG("%s", "waiting for new tasks\n");
-        const int64_t lt_t3 = loop_timing ? ggml_time_us() : 0;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
             if (!running || !queue_tasks.empty()) {
-                if (loop_timing) { const int64_t now = ggml_time_us(); lt_wait += (now - lt_t3) / 1000.0; lt_prev_end = now; }
                 break; // go back to process new tasks or terminate
             }
 
@@ -467,6 +453,7 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
 }
 
 server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_results);
 
@@ -478,7 +465,7 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
             }
         }
 
-        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
+        std::cv_status cr_res = condition_results.wait_until(lock, deadline);
         if (!running) {
             RES_DBG("%s : queue result stop\n", __func__);
             std::terminate(); // we cannot return here since the caller is HTTP code
@@ -536,23 +523,23 @@ void server_response_reader::post_task(server_task && task, bool front) {
     GGML_ASSERT(!task.is_parent() && "not supported, use post_tasks() instead");
     task.index = 0;
     id_tasks.insert(task.id);
-    states.push_back(task.create_state());
+    states.push_back(task_result_state());
     queue_results.add_waiting_task_id(task.id);
     queue_tasks.post(std::move(task), front);
 }
 
-void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool front) {
+void server_response_reader::post_tasks(std::vector<server_task> && tasks, const common_chat_session & session, bool front) {
     GGML_ASSERT(id_tasks.empty() && "post_tasks() can only be called once per reader");
     id_tasks = server_task::get_list_id(tasks);
     states.reserve(tasks.size());
     size_t index = 0;
     for (auto & task : tasks) {
         task.index = index++;
-        states.push_back(task.create_state());
+        states.push_back(task_result_state(session));
         // for child tasks
         for (auto & child_task : task.child_tasks) {
             child_task.index = index++;
-            states.push_back(child_task.create_state());
+            states.push_back(task_result_state(session));
         }
     }
     GGML_ASSERT(states.size() == id_tasks.size());

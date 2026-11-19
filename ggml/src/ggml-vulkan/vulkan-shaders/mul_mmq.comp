@@ -6,6 +6,8 @@
 
 #extension GL_EXT_integer_dot_product : require
 
+#define KVALUES_IQ4NL_I8
+
 #ifdef FLOAT16
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
@@ -35,8 +37,7 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
-layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
-layout (binding = 5) readonly buffer Scale {D_TYPE data_scale[];};
+layout (binding = 4) readonly buffer RowMap {uint data_row_map[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -58,8 +59,7 @@ layout (push_constant) uniform parameter
     uint nbi1;
     uint ne11;
     uint n_experts;
-    uint hoist_row_ids;
-    uint fusion_flags;
+    uint row_ids_offset;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -88,7 +88,7 @@ layout (constant_id = 10) const uint WARP = 32;
 #include "mul_mmq_shmem_types.glsl"
 
 #ifdef MUL_MAT_ID
-#define BK_STEP 2
+#define BK_STEP 1
 #else
 #ifndef BK_STEP
 #define BK_STEP 4
@@ -105,19 +105,22 @@ block_b_cache cache_b;
 #define LOAD_VEC_A (4 * QUANT_R_MMQ)
 #define LOAD_VEC_B 16
 
-#define NUM_WARPS (BLOCK_SIZE / WARP)
 
 #include "mul_mm_id_funcs.glsl"
 #include "mul_mmq_funcs.glsl"
 
 void main() {
-    const uint ic = gl_WorkGroupID.y;
-
 #ifdef MUL_MAT_ID
-    const uint expert_idx = gl_WorkGroupID.z;
-    if (ic * BN >= data_expert_count[expert_idx]) {
+    const uint tile_idx = gl_WorkGroupID.y + gl_WorkGroupID.z * gl_NumWorkGroups.y;
+    if (tile_idx >= data_row_map[0]) {
         return;
     }
+    const uint expert_idx = data_row_map[1 + 2 * tile_idx];
+    const uint row_begin = tile_idx * BN;
+    _ne1 = data_row_map[2 + 2 * tile_idx];
+    const uint ic = 0;
+#else
+    const uint ic = gl_WorkGroupID.y;
 #endif
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
@@ -161,34 +164,7 @@ void main() {
     const uint loadstride_b = BLOCK_SIZE * LOAD_VEC_B / BK;
 
 #ifdef MUL_MAT_ID
-    if (p.hoist_row_ids != 0) {
-        load_row_ids_hoisted(expert_idx, ic);
-    } else {
-#ifdef MUL_MAT_ID_USE_SUBGROUPS
-        if (bitCount(p.nei0) == 1) {
-            load_row_ids(expert_idx, true, ic);
-        } else {
-            load_row_ids(expert_idx, false, ic);
-        }
-#else
-        _ne1 = 0;
-        for (uint ii1 = 0; ii1 < p.nei1 && _ne1 < (ic + 1) * BN; ii1++) {
-            for (uint ii0 = 0; ii0 < p.nei0 && _ne1 < (ic + 1) * BN; ii0++) {
-                if (data_ids[ii1*p.nbi1 + ii0] == expert_idx) {
-                    if (_ne1 >= ic * BN) {
-                        row_ids[_ne1 - ic * BN] = u16vec2(ii0, ii1);
-                    }
-                    _ne1++;
-                }
-            }
-        }
-
-        barrier();
-#endif
-    }
-
-    // Workgroup has no work
-    if (ic * BN >= _ne1) return;
+    load_row_ids(row_begin);
 #endif
 
 #ifdef MUL_MAT_ID
@@ -218,15 +194,6 @@ void main() {
         sums[i] = ACC_TYPE(0.0f);
     }
 
-#ifdef MUL_MAT_ID
-    // the columns past the expert's rows hold zeros and the store drops them: the warp runs only the
-    // column iterations that reach a row (uniform per warp: warp_c and wsic are the same for its threads)
-    const uint cols_left   = _ne1 - ic * BN;   // > 0: the workgroups without rows returned
-    const uint wniter_used = warp_c * WN >= cols_left ? 0 : min(WNITER, (cols_left - warp_c * WN + WSUBN - 1) / WSUBN);
-#else
-    const uint wniter_used = WNITER;
-#endif
-
     for (uint block = start_k; block < end_k; block += BK * BK_STEP) {
         [[unroll]] for (uint l = 0; loadc_a + l < BM; l += loadstride_a) {
             const uint buf_ib = loadc_a + l;
@@ -234,9 +201,7 @@ void main() {
             const uint iqs = loadr_a;
 
             [[unroll]] for (uint k_step = 0; k_step < BK_STEP; k_step++) {
-                if (block + k_step * BK < end_k) {
-                    block_a_to_shmem(k_step * BM + buf_ib, ib + k_step, iqs);
-                }
+                block_a_to_shmem(k_step * BM + buf_ib, ib + k_step, iqs, block + k_step * BK < end_k);
             }
         }
         [[unroll]] for (uint l = 0; loadc_b + l < BN; l += loadstride_b) {
@@ -250,15 +215,8 @@ void main() {
 #endif
             const uint iqs = loadr_b;
 
-#ifdef MUL_MAT_ID
-            // the columns past the expert's rows have no row id: zeros instead of a gather at a stale index
-            const bool col_in_bounds = ic * BN + buf_ib < _ne1;
-#else
-            const bool col_in_bounds = true;
-#endif
-
             [[unroll]] for (uint k_step = 0; k_step < BK_STEP; k_step++) {
-                block_b_to_shmem(k_step * BN + buf_ib, ib + k_step, iqs, col_in_bounds && block + k_step * BK < end_k);
+                block_b_to_shmem(k_step * BN + buf_ib, ib + k_step, iqs, block + k_step * BK < end_k);
             }
         }
 
@@ -279,20 +237,16 @@ void main() {
             }
 
             [[unroll]] for (uint wsic = 0; wsic < WNITER; wsic++) {
-                // a uniform branch inside the unrolled loop (the switch of unrolled copies that helps the
-                // coopmat shader is slower here: 7.62 vs 7.43 ms on the down node)
-                if (wsic < wniter_used) {
-                    [[unroll]] for (uint cc = 0; cc < TN; cc++) {
-                        const uint ib = k_step * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc;
-                        block_b_to_registers(ib);
+                [[unroll]] for (uint cc = 0; cc < TN; cc++) {
+                    const uint ib = k_step * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc;
+                    block_b_to_registers(ib);
 
-                        [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
-                            [[unroll]] for (uint cr = 0; cr < TM; cr++) {
-                                const uint cache_a_idx = wsir * TM + cr;
-                                const uint sums_idx = (wsic * TN + cc) * (WMITER * TM) + wsir * TM + cr;
+                    [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
+                        [[unroll]] for (uint cr = 0; cr < TM; cr++) {
+                            const uint cache_a_idx = wsir * TM + cr;
+                            const uint sums_idx = (wsic * TN + cc) * (WMITER * TM) + wsir * TM + cr;
 
-                                sums[sums_idx] += mmq_dot_product(cache_a_idx);
-                            }
+                            sums[sums_idx] += mmq_dot_product(cache_a_idx);
                         }
                     }
                 }
@@ -320,13 +274,12 @@ void main() {
                 if (row_i >= _ne1) break;
 
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
-                const D_TYPE scale = (p.fusion_flags & MAT_MAT_ID_FUSION_FLAGS_SCALE) != 0 ? data_scale[row_idx.y * p.nei0 + row_idx.x] : D_TYPE(1);
 #endif // MUL_MAT_ID
                 [[unroll]] for (uint cr = 0; cr < TM; cr++) {
                     const uint sums_idx = (wsic * TN + cc) * WMITER * TM + wsir * TM + cr;
 #ifdef MUL_MAT_ID
                     if (dr_warp + cr < p.M) {
-                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + cr] = D_TYPE(sums[sums_idx].x) * scale;
+                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + cr] = D_TYPE(sums[sums_idx].x);
                     }
 #else
                     if (dr_warp + cr < p.M && dc_warp + cc < p.N) {

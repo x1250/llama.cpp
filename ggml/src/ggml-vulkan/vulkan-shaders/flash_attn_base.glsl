@@ -24,6 +24,12 @@ const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
+// Sparse: gather binding-7 indices instead of scanning [0,KV); p.split_kv = n_kv_max.
+const bool USE_SPARSE      = (Flags & 16) != 0;
+const bool Q_IN_REGS       = (Flags & 32) != 0;
+// coopmat1: subgroups own Q rows, O in coopmat accumulators. K/V staged in LDS, or loaded from global memory with FLIP_DIRECT.
+const bool FLIP            = (Flags & 64) != 0;
+const bool FLIP_DIRECT     = (Flags & 128) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -70,12 +76,6 @@ layout (push_constant) uniform parameter {
     uint32_t gqa_ratio;
     uint32_t split_kv;
     uint32_t k_num;
-#ifdef FA_SPARSE
-    // sparse K/V: the cell lists written by flash_attn_sparse_idx.comp, one per list_rows mask rows
-    uint32_t list_stride;
-    uint32_t list_tiles;
-    uint32_t list_rows;
-#endif
 } p;
 
 #define SINK_ENABLE_BIT (1<<24)
@@ -88,11 +88,12 @@ layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
-#ifdef FA_SPARSE
-// counts[n_lists] then lists[n_lists][list_stride]: for every tile of list_rows mask rows, the cells
-// (ascending) whose mask entry is finite for at least one row of the tile
-layout (binding = 7) readonly buffer IDX {uint32_t data_idx[];};
-#endif
+layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
+
+// Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, e.g. when computing Mold-M.
+#define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
+// Lowest finite f16, mask value for inactive sparse KV slots
+#define NEG_FLT16_MAX -65504.0
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2
@@ -102,18 +103,12 @@ layout (binding = 7) readonly buffer IDX {uint32_t data_idx[];};
 
 #include "fa_types.glsl"
 
-// the output accumulates in f32 unless f16 accumulation was requested: with F32 precision asked for,
-// the f16 output accumulator of the coopmat1 path rounded every row and amplified sub-ulp effects
-// of the product (see col_seen in flash_attn_cm1.comp)
-#if defined(BFLOAT16) || !defined(FA_F16ACC)
+#if defined(BFLOAT16)
 #define O_TYPE float
 #define O_TYPEV4 vec4
 #else
 #define O_TYPE FLOAT_TYPE
 #define O_TYPEV4 FLOAT_TYPEV4
-#if defined(FLOAT_TYPE_MAX)
-#define O_TYPE_MAX FLOAT_TYPE_MAX
-#endif
 #endif
 
 // These can't be `const` globals because GLSL forbids function calls in global
@@ -123,8 +118,8 @@ layout (binding = 7) readonly buffer IDX {uint32_t data_idx[];};
 #define BLOCK_SIZE_V fa_block_elems(FaTypeV)
 // F16 reads f16 elements directly from the binding; everything else routes
 // through dequantize4 / the MMQ helpers to unpack from the packed block layout.
-#define USE_DECODE_K (FaTypeK != FA_TYPE_F16)
-#define USE_DECODE_V (FaTypeV != FA_TYPE_F16)
+#define USE_DECODE_K (FaTypeK != GGML_TYPE_F16)
+#define USE_DECODE_V (FaTypeV != GGML_TYPE_F16)
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
@@ -162,7 +157,7 @@ ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC
 
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
-         q_stride, k_stride, v_stride, m_stride;
+         q_stride, k_stride, v_stride, m_stride, sparse_base;
 
 void init_indices()
 {
@@ -226,28 +221,34 @@ void init_indices()
     // that prevents the compiler from folding the "&" through the select
     // and breaking the alignment detection.
     m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+
+    // Sparse: the tile shares one mask row (gqa heads, or Br==1). split_k
+    // partitions the n_kv_max blocks.
+    if (USE_SPARSE) {
+        uint32_t qrow = (p.gqa_ratio > 1) ? gqa_iq1 : (i * Br);
+        sparse_base = (((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 + qrow) * p.split_kv;
+
+        uint32_t total_blocks = CEIL_DIV(p.split_kv, Bc);
+        uint32_t per_blocks   = CEIL_DIV(total_blocks, p.k_num);
+        start_j = min(split_k_index * per_blocks, total_blocks);
+        end_j   = min((split_k_index + 1) * per_blocks, total_blocks);
+    }
 }
 
-#ifdef FA_SPARSE
-uint32_t list_base;
-
-// Attend the query tile's cell list instead of the whole cache: KV becomes the list length and
-// the split_k range indexes the list. m_stride keeps the mask row stride set by init_indices.
-void init_sparse()
-{
-    // the workgroup's list: its tile's, or with grouped query attention the one holding its
-    // token's row (list_rows = 1: the token's own cells)
-    const uint32_t row_tile = (p.gqa_ratio > 1) ? (gqa_iq1 / p.list_rows) : i;
-    const uint32_t li       = ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.list_tiles + row_tile;
-    const uint32_t n_lists  = p.list_tiles * p.nem2 * p.nem3;
-
-    KV        = min(data_idx[li], p.list_stride);
-    list_base = n_lists + li * p.list_stride;
-
-    start_j = split_k_index * p.split_kv / Bc;
-    end_j   = CEIL_DIV(min(KV, (split_k_index + 1) * p.split_kv), Bc);
+// Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).
+bool fa_kv_index(uint lin, out uint kv_col) {
+    if (USE_SPARSE) {
+        if (lin >= p.split_kv) {
+            kv_col = 0;
+            return false;
+        }
+        int idx = data_sparse[sparse_base + lin];
+        kv_col = idx >= 0 ? uint(idx) : 0;
+        return idx >= 0;
+    }
+    kv_col = lin;
+    return !KV_bounds_check || lin < KV;
 }
-#endif
 
 // Bias applied to softmax to stay in fp16 range.
 // Based on ggml-cuda issue https://github.com/ggml-org/llama.cpp/issues/18606
