@@ -1477,6 +1477,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
+        weights_shared.insert(ggml_get_name(&t_meta));
     } else {
         n_created++;
     }
@@ -1778,6 +1779,17 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    // a tensor the host reads from the mapping: allocated into an mmap buffer below (no data yet), or already placed
+    // inside the mapping when its buffer was created over it
+    auto aliases_mapping = [&](const ggml_tensor * cur, const llama_tensor_weight * weight) {
+        if (cur->data == nullptr) {
+            return true;
+        }
+        const auto & mapping = mappings.at(weight->idx);
+        const uint8_t * base = (const uint8_t *) mapping->addr();
+        return (const uint8_t *) cur->data >= base && (const uint8_t *) cur->data < base + mapping->size();
+    };
+
     // staging buffer for non-host buffers without async uploads, reused because a fresh allocation per tensor page faults on every load
     // allocated from the CPU buffer type, which uses vm_allocate on Apple platforms, so freeing it returns its pages to the OS right away
     ggml_backend_buffer_ptr read_buf;
@@ -1839,9 +1851,11 @@ bool llama_model_loader::load_all_data(
 
                 // uploaded to a device buffer: the file pages are a second copy that only competes with the
                 // memory the device is pinning (on a UMA desktop a load exhausted the free memory and froze
-                // the machine); drop them now. Kept while the host still needs them: an async validation
-                // reads them, and mlock expects a contiguous mapping.
-                if (!check_tensors && !lmlocks) {
+                // the machine); drop them now. Kept while the host still needs them: the tensor lives in the
+                // mapping, another tensor reads the same weight (a tied output head next to the token embedding
+                // read on the host, possibly in another buffer type's context), an async validation reads them,
+                // or mlock expects a contiguous mapping.
+                if (!check_tensors && !lmlocks && !aliases_mapping(cur, weight) && !weights_shared.count(ggml_get_name(cur))) {
                     mapping->drop_fragment(weight->offs, weight->offs + n_size);
                 }
             }

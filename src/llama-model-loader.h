@@ -121,6 +121,10 @@ struct llama_model_loader {
 
     llama_mmaps mappings;
 
+    // weights read by more than one tensor: a duplicated tensor (TENSOR_DUPLICATED) in another buffer type's context.
+    // Their file pages stay mapped after an upload, since the other tensor may read them from the mapping
+    std::set<std::string> weights_shared;
+
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
