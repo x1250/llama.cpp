@@ -723,13 +723,15 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t H;
     uint32_t n_tokens;
     uint32_t n_seqs;
-    uint32_t s_off;
     uint32_t sq1, sq2, sq3;
     uint32_t sv1, sv2, sv3;
     uint32_t sb1, sb2, sb3;
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t snap_off;
+    uint32_t snap_seq_stride;
+    uint32_t snap_slot_stride;
 };
 
 struct vk_op_ssm_scan_push_constants {

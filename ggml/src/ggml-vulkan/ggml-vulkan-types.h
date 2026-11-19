@@ -564,6 +564,9 @@ static constexpr std::initializer_list<ggml_op> rms_norm_view_set_rows_pattern {
 
 static constexpr std::initializer_list<ggml_op> rope_view_set_rows_pattern { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
+static constexpr std::initializer_list<ggml_op> gdn_view_cpy_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
+static constexpr std::initializer_list<ggml_op> gdn_view_cpy_short_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_CPY };
+
 // scale_out*sigmoid(scale_in*x) as the hc_post weights (qwen4exp hc_combine)
 static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
 
@@ -668,6 +671,17 @@ static constexpr std::initializer_list<std::array<int, 3>> rms_norm_mul_rope_vie
 static constexpr std::initializer_list<std::array<int, 3>> rms_norm_view_set_rows_edges {
     { 1, 0, 0 }, // view->src[0]     == rms_norm
     { 2, 0, 1 }, // set_rows->src[0] == view
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> gdn_view_cpy_edges {
+    { 1, 0, 0 }, // view of the snapshots->src[0] == gated_delta_net
+    { 3, 0, 1 }, // cpy->src[0]                   == view of the snapshots
+    { 3, 1, 2 }, // cpy->src[1]                   == view of the destination
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> gdn_view_cpy_short_edges {
+    { 1, 0, 0 }, // view of the snapshots->src[0] == gated_delta_net
+    { 2, 0, 1 }, // cpy->src[0]                   == view of the snapshots
 };
 
 static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
@@ -1325,6 +1339,8 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    // gated delta net writing its state snapshots through the copy that follows it
+    bool fused_gdn_snapshots {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER
