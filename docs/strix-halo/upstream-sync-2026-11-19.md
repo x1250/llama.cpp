@@ -127,6 +127,12 @@ genera recibe 20.4 chunks por segundo con 0.4 y 1.5 sin el parche; el prompt aje
   `Qwen3.8-27B-DFlash2-Q4_K_M.no-rope-sections.gguf.orig`). Con la rotación solo en la dimensión temporal, el texto
   rota igual que con NeoX: la aceptación quedó idéntica (DaisyRose 2.710 / 2.408 aceptados por paso, Qwen3.8-27B
   2.728 / 2.336), y la imagen de 2048 × 2048 (19 s) y la conversación texto → imagen → texto (5/5) pasan en los dos.
+- **Gemma 4 31B no arrancaba** (crash en el `GET_ROWS` del warmup, que el manejador de crash dejaba colgado): el cargador
+  portado soltaba las páginas de los tensores que el host lee del mapeo cuando el upstream actual los hace pasar por la
+  rama de subida (ya ubicados dentro del mapeo, o un peso compartido por un tensor duplicado en otro contexto, como la
+  salida atada al embedding). Arreglado en `0374d50a6`; gemma31b, gemma12b y qwen38-27b-unc pasan razonamiento, tool
+  call, determinismo y las dos pruebas de imagen con el binario instalado. Los `kv_gb` de qwen38-27b-unc (16 → 49, KV
+  f16) y gemma12b (16 → 22) también se corrigieron desde lo medido.
 - **Respaldo de qwen38flash (`ENGINE=llama`)**: corre el qwen4exp de upstream. Sin MTP carga y responde (prueba de humo a
   32k: razonamiento, tool call, determinismo, 32.5 t/s); con MTP no carga, porque el draft externo que exportó el fork no
   tiene la cabeza de hyper-connections que el MTP de upstream exige (`latent-defects.md`).
