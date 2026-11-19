@@ -71,6 +71,10 @@ GGML_API bool ggml_gallocr_reserve_n(
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
+// forget the layout of the last graph: the next graph is laid out for its own shapes, instead of reusing that layout
+// as a graph with the same number of nodes and leafs whose tensors fit in it otherwise does
+GGML_API void ggml_gallocr_discard_layout(ggml_gallocr_t galloc);
+
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
 // Utils
