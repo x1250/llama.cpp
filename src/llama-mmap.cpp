@@ -394,6 +394,11 @@ struct llama_file::impl {
         return fp_win32_direct != INVALID_HANDLE_VALUE && alignment > 1;
     }
 
+    void drop_cache(size_t offs, size_t len) const {
+        GGML_UNUSED(offs);
+        GGML_UNUSED(len);
+    }
+
     ~impl() {
         if (fp_win32_direct != INVALID_HANDLE_VALUE) {
             CloseHandle(fp_win32_direct);
@@ -621,6 +626,21 @@ struct llama_file::impl {
         return fd != -1 && alignment > 1;
     }
 
+    void drop_cache(size_t offs, size_t len) const {
+#ifdef __linux__
+        const int cache_fd = fd != -1 ? fd : (fp ? fileno(fp) : -1);
+        if (cache_fd == -1 || len == 0) {
+            return;
+        }
+        if (posix_fadvise(cache_fd, offs, len, POSIX_FADV_DONTNEED)) {
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(errno));
+        }
+#else
+        GGML_UNUSED(offs);
+        GGML_UNUSED(len);
+#endif
+    }
+
     ~impl() {
         if (fd != -1) {
             close(fd);
@@ -655,6 +675,7 @@ size_t llama_file::size() const { return pimpl->size; }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+void llama_file::drop_cache(size_t offs, size_t len) const { pimpl->drop_cache(offs, len); }
 
 int llama_file::file_id() const {
 #ifdef _WIN32
@@ -708,10 +729,13 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
+    int fd = -1;
+    llama_mmap::ranges lazy_ranges;
 
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         size = file->size();
-        int fd = file->file_id();
+        fd = file->file_id();
+        this->lazy_ranges = lazy_ranges;
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
@@ -726,19 +750,6 @@ struct llama_mmap::impl {
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
-
-        // page-aligned madvise over [beg, end), clamped to the file
-        auto advise = [&](size_t beg, size_t end, int advice, const char * name) {
-            const size_t page_size = sysconf(_SC_PAGESIZE);
-            beg = beg & ~(page_size - 1);
-            end = std::min((end + page_size - 1) & ~(page_size - 1), file->size());
-            if (beg >= end) {
-                return;
-            }
-            if (posix_madvise((char *) addr + beg, end - beg, advice)) {
-                LLAMA_LOG_WARN("warning: posix_madvise(.., %s) failed: %s\n", name, strerror(errno));
-            }
-        };
 
         if (prefetch > 0) {
             for (const auto & range : ranges_complement(lazy_ranges, std::min(file->size(), prefetch))) {
@@ -773,37 +784,80 @@ struct llama_mmap::impl {
     void unmap_fragment(size_t first, size_t last) {
         int page_size = sysconf(_SC_PAGESIZE);
         align_range(&first, &last, page_size);
-        size_t len = last - first;
 
-        if (len == 0) {
+        if (last <= first) {
             return;
         }
 
         GGML_ASSERT(first % page_size == 0);
         GGML_ASSERT(last % page_size == 0);
-        GGML_ASSERT(last > first);
 
-        void * next_page_start = (uint8_t *) addr + first;
-
-        if (munmap(next_page_start, len)) {
-            LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
-        }
-
+        // unmap only what is still mapped: a fragment dropped earlier is a hole in the address space that the
+        // kernel may already have reused for another mapping (a device buffer, another model's file)
         std::vector<std::pair<size_t, size_t>> new_mapped_fragments;
         for (const auto & frag : mapped_fragments) {
-            if (frag.first < first && frag.second > last) {
-                new_mapped_fragments.emplace_back(frag.first, first);
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first < first && frag.second > first) {
-                new_mapped_fragments.emplace_back(frag.first, first);
-            } else if (frag.first < last && frag.second > last) {
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first >= first && frag.second <= last) {
-            } else {
+            const size_t beg = std::max(frag.first, first);
+            const size_t end = std::min(frag.second, last);
+            if (beg >= end) {
                 new_mapped_fragments.push_back(frag);
+                continue;
+            }
+            if (munmap((uint8_t *) addr + beg, end - beg)) {
+                LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
+            }
+            if (frag.first < beg) {
+                new_mapped_fragments.emplace_back(frag.first, beg);
+            }
+            if (end < frag.second) {
+                new_mapped_fragments.emplace_back(end, frag.second);
             }
         }
         mapped_fragments = std::move(new_mapped_fragments);
+    }
+
+    // page-aligned madvise over [beg, end), clamped to the file
+    void advise(size_t beg, size_t end, int advice, const char * name) const {
+        const size_t page_size = sysconf(_SC_PAGESIZE);
+        beg = beg & ~(page_size - 1);
+        end = std::min((end + page_size - 1) & ~(page_size - 1), size);
+        if (beg >= end) {
+            return;
+        }
+        if (posix_madvise((char *) addr + beg, end - beg, advice)) {
+            LLAMA_LOG_WARN("warning: posix_madvise(.., %s) failed: %s\n", name, strerror(errno));
+        }
+    }
+
+    void advise_willneed(size_t first, size_t last) const {
+        last = std::min(last, size);
+        if (first >= last) {
+            return;
+        }
+        // only what is still mapped (dropped fragments are holes) and not lazy (read on demand later)
+        for (const auto & range : ranges_complement(lazy_ranges, last)) {
+            for (const auto & frag : mapped_fragments) {
+                const size_t beg = std::max({range.first, frag.first, first});
+                const size_t end = std::min(range.second, frag.second);
+                if (beg < end) {
+                    advise(beg, end, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
+                }
+            }
+        }
+    }
+
+    void drop_fragment(size_t first, size_t last) {
+        const size_t page_size = sysconf(_SC_PAGESIZE);
+        align_range(&first, &last, page_size);
+        if (last <= first) {
+            return;
+        }
+        unmap_fragment(first, last);
+#ifdef __linux__
+        // clean pages that this process no longer maps: drop them from the page cache right away
+        if (posix_fadvise(fd, first, last - first, POSIX_FADV_DONTNEED)) {
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(errno));
+        }
+#endif
     }
 
     ~impl() {
@@ -870,6 +924,15 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    void advise_willneed(size_t first, size_t last) const {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
+
+    void drop_fragment(size_t first, size_t last) {
+        unmap_fragment(first, last);
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -900,6 +963,18 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    void advise_willneed(size_t first, size_t last) const {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
+
+    void drop_fragment(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+
+        throw std::runtime_error("mmap not supported");
+    }
 #endif
 
     void * addr;
@@ -914,6 +989,8 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+void llama_mmap::advise_willneed(size_t first, size_t last) { pimpl->advise_willneed(first, last); }
+void llama_mmap::drop_fragment(size_t first, size_t last) { pimpl->drop_fragment(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
