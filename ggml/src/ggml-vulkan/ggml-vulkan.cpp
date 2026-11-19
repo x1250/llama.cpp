@@ -8621,7 +8621,10 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
         pvsh = Br * osh_stride * pvsh_elem_size;
     }
 
-    uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + params.limit_occupancy_shmem * 16;
+    // col_seen: one uint per (column, row group of 4), col_any: one per column
+    const uint32_t col_seen = (Bc * (Br / 4) + Bc) * sizeof(uint32_t);
+
+    uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + col_seen + params.limit_occupancy_shmem * 16;
 
     if (params.flip) {
         const uint32_t d_pad = std::max(hsk_pad, hsv_pad);
