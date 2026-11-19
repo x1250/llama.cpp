@@ -37,33 +37,37 @@ las sesiones de pi (solo los turnos de qwen38flash), el log del motor (`~/.strix
   las de la sección 10 de `strata-evaluation-2026-10-07.md`, con el cliente Vulkan de ruido.
 - **Detalle:** `upstream-review-2026-10-20.md` (sección 1.3) y `upstream-review-2026-10-24.md` (secciones 1.1 y 3).
 
-## llama.cpp (respaldo, `ENGINE=llama`)
+## llama.cpp (respaldo de qwen38flash, `ENGINE=llama`, y los modelos de llama-server)
 
-Producción no corre llama-server desde el 2026-10-07. Los "tomar" de `upstream-review-2026-10-20.md` (sección 2.2)
-siguen sin aplicar. Los que tienen un síntoma visible:
+Desde el 2026-11-19 el código sigue a upstream más seis parches del fork (`upstream-sync-2026-11-19.md`).
 
 | Síntoma | Causa | Arreglo |
 |---|---|---|
-| Con MTP, la memoria crece con cada checkpoint (~2 KB por token de contexto en cada uno, hasta 8 por slot) | Cada checkpoint copia el KV entero del draft: los flags `PARTIAL_ONLY` se ignoran (`llama-kv-cache.cpp:2105`) | El hunk de `llama-kv-cache.cpp` de `e467e5b5e` |
-| Con dos prompts a la vez, la aceptación del draft MTP cae. La salida no cambia | El hook MTP lee las filas NextN por índice de lote y el fork las extrae en orden de ubatch (`common/speculative.cpp:1617, 1680`) | `4453b535f` |
-| Tokens aceptados de un draft después del fin de la respuesta | `common/sampling.cpp:704` corta solo por desacuerdo | `d280808f5`, más el mismo corte en la variante `dists` del fork |
-| La compuerta de historia con drafts compara solo el token elegido en los tokens aceptados | El servidor no devuelve log-probs de los tokens aceptados de un draft | `ead9f3205` |
-| La selección QSA toma 1-3 celdas del bloque 513 en 3 de cada 4 posiciones con más de ~2k de contexto. Magnitud sin medir | Top-k de ancho 2051 sobre celdas, con la cola sesgada a 1e9, en lugar de los 512 mejores bloques más la cola de la referencia | `66e0c17ee` (sección 2.3 de esa revisión) |
+| Con `ENGINE=llama` y MTP, qwen38flash no carga: `check_tensor_dims: tensor 'blk.48.nextn.hc_head_norm.weight' not found` (2026-11-19, la prueba de humo de la sincronización) | El MTP de qwen4exp de upstream (`c061df198`, #29761) lleva la cabeza de hyper-connections en la capa NextN (`nextn.hc_head_norm/down/up`); el draft externo `Qwen3.8-Flash-Next-MTP-GGUF` lo exportó el fork para su propio puerto del MTP, sin esos tensores | Volver a exportar la cabeza MTP del checkpoint oficial con el conversor de upstream. Mientras tanto, `ENGINE=llama MTP=0` carga y responde (32.5 t/s a 32k, determinista) |
 
-- El resto de los "tomar" de esa sección (`23b0202a1`, `8e1642198`, `1a3011cc0`, `436f6f89e` y los arreglos de Vulkan
-  y ggml) no tienen un síntoma propio en producción. Sus compuertas están en esa sección.
-- **El crecimiento de los checkpoints con MTP ocurre con `apex35b`** (2026-11-18, `apex-35b-2026-11-17.md`, sección 5).
-  - Medido: 63 MiB + 2069 B por token cada checkpoint, dos por turno; a 228k cada turno sumó ~1.05 GiB.
-  - Con 12 por slot llega a 13.6 GiB a 262k con dos slots, y `kv_gb` 38 lo cubre.
-  - El arreglo de la fila no se tomó: el presupuesto alcanza, y el arreglo cambia el fork y lleva sus compuertas.
-- El llama-server instalado (`~/.local/bin/llama-server`) se compiló desde master `2e26bae3f` el 2026-11-17
-  (`build-llama.sh --install`). Antes el lanzador de 91 KB decía `dac7b4e4c`, un commit que no está en master, pero las
-  bibliotecas de `build/bin` eran las del build adoptado v98 (`b69e48204`). Contra `bin-v98new`, `libggml-vulkan`,
-  `libggml`, `libggml-cpu`, `libllama` y `libllama-server-impl` son idénticas byte a byte; `libggml-base` y
-  `libllama-common` difieren solo en el commit que llevan escrito; `libmtmd` trae `e0ba28426`, el preprocesado de
-  imágenes de Qwen-VL como la referencia. Las compuertas de qwen38flash como respaldo (`ENGINE=llama`: la de historia
-  y la de calidad) no se corrieron con este build; antes de usarlo como respaldo, se corren.
+- El respaldo con `ENGINE=llama` corre ahora el qwen4exp de upstream, no el del fork: sin la FA dispersa ni el PLE lazy
+  del fork, ni sus compuertas de historia y de calidad. La prueba de humo a 32k sin MTP pasó razonamiento, tool call y
+  determinismo; producción (262144 × 2 slots) con este build no se midió.
 
 ## Arreglados
 
-Ninguno todavía. Una fila que se arregla pasa aquí con su commit, la fecha y el síntoma que lo disparó.
+Una fila que se arregla pasa aquí con su commit, la fecha y el síntoma que lo disparó.
+
+Por la sincronización con upstream del 2026-11-19 (merge `705d46bf4`): los arreglos que esta sección de llama.cpp
+registraba ya estaban en upstream, y entraron con el árbol. Ninguno lo disparó un síntoma de producción.
+
+| Síntoma | Arreglo (upstream) |
+|---|---|
+| Con MTP, la memoria crece con cada checkpoint: cada uno copiaba el KV entero del draft (en `apex35b`, hasta 13.6 GiB a 262k con dos slots) | `e467e5b5e`, `PARTIAL_ONLY` en el caché KV simple |
+| Con dos prompts a la vez, la aceptación del draft MTP caía: el hook leía las filas NextN por índice de lote | `4453b535f` |
+| Tokens aceptados de un draft después del fin de la respuesta | `d280808f5` |
+| La compuerta de historia con drafts comparaba solo el token elegido en los tokens aceptados | `ead9f3205` |
+| La selección QSA tomaba celdas del bloque 513 | `66e0c17ee` |
+| Sin síntoma propio: `23b0202a1`, `8e1642198`, `1a3011cc0`, `436f6f89e` | en upstream |
+
+Disparado por la prueba del build instalado (2026-11-19):
+
+| Síntoma | Arreglo |
+|---|---|
+| Con DFlash2, toda petición con imagen falla con HTTP 500 (`inconsistent sequence positions` en el contexto del draft) | El draft con `dflash.rope.dimension_sections` (`upstream-sync-2026-11-19.md`, sección 5) |
+

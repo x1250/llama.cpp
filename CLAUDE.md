@@ -6,6 +6,13 @@ IMPORTANT: Ensure you’ve thoroughly reviewed the [AGENTS.md](AGENTS.md) file b
 - A successful optimization (every gate passed, adopted in production) is committed and pushed to both repos (fork and strix-halo) without asking; each push stays a separate command.
 - Pending work is emptied, not left as recommendations; but a defect that does not occur in our use is not fixed (the Director, 2026-11-01). It is recorded in `docs/strix-halo/latent-defects.md` with its symptom, cause and fix; when a production symptom appears, check that registry first.
 
+# The code follows upstream, plus the patches that still pay (the Director, 2026-11-19)
+
+- Since the merge `705d46bf4` the tree is upstream llama.cpp (`08c252e22` at that merge) plus `docs/strix-halo/`, this file and the fork patches the llama-server models still need, one commit each on top of the merge: the loader of freeze #9 (bounded read-ahead, uploaded tensors dropped from the page cache), `--decode-share`, the scheduler-reset layout (`9f3e99782`, determinism across server histories), the one-pass first KQ mask row and the gated delta net snapshot fusion (`GDN_SNAPSHOTS`, the CPY of every verification step). Everything else of the fork (qwen4exp, QSA, sparse FA, the gfx1151 matmul tuning, `--spec-draft-adaptive`) was dropped: qwen38flash runs on Strata since 2026-10-07, and upstream's kernels measured equal or faster on these models (`docs/strix-halo/upstream-sync-2026-11-19.md`).
+- Updating is `git merge upstream/master` taking upstream's side for every file except `docs/strix-halo/` and this `CLAUDE.md`, then reapplying the kept patches; a fork patch comes back only with a measured gain on the llama-server models (A/B against the build before it, the chain's baseline first and last).
+- The bullets below that name qwen4exp, QSA, sparse attention, the lazy PLE, the graph slots, `graph_diff4`'s 72 nodes or the decode plan describe the fork before 2026-11-19; they are history, and the tools they cite apply to the Strata engine or to `ENGINE=llama` on qwen38flash, which now runs upstream's qwen4exp.
+- Upstream resolves `--lazy-mode auto` to OFF on an iGPU only when mmap is off (#31943, `src/llama-model.cpp`); the launcher passes `-lm mmap`, so the lazy tensors stay lazy.
+
 # Resource safety on the Strix Halo desktop (mandatory)
 
 - Before ANY model load or GPU-heavy run: compute the footprint (weights + KV + compute buffers; for a rig run before, its measured drop of MemAvailable) and require `MemAvailable - footprint >= 20 GiB`. Abort otherwise. The Director lowered it from 40 GiB on 2026-10-08: production runs for weeks with 21-25 GiB of MemAvailable, and freeze #7 left ~15.
