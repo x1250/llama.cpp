@@ -95,7 +95,6 @@ Fork primero y último en la misma cadena (`ab-port.sh`, `fa-check.sh`, `acc_tes
 | Apex, aceptados por paso greedy / muestreo | 1.22 / 1.14 | 1.22 / 1.22 |
 | Determinismo (3 peticiones idénticas) | OK | OK en los tres modelos |
 | MemFree mínima en la carga (DaisyRose / Apex / Qwen3.8-27B) | 33 / 41 / 41 GiB | 33.7 / 40.7 / 36.2 GiB |
-| Reasignaciones de grafo durante las pruebas | 0 | 0 |
 
 `acc_test.py`: seis prompts greedy y dos con el muestreo de producción y cuatro semillas, 256 tokens cada uno. La
 aceptación más baja que mostró el A/B de una muestra por categoría (Apex 1.45 contra 1.53 aceptados por paso en
