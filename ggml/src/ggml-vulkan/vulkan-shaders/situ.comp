@@ -1,0 +1,18 @@
+#version 450
+
+#include "glu_head.glsl"
+
+// tanh without the overflow of exp(2x) - 1 over exp(2x) + 1, as the unary shader computes it
+float tanh_safe(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+// SiTU (Inkling 2): beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta), up as it is for linear_beta 0
+float op(float a, float b) {
+    const float beta = p.alpha;
+    const float linear_beta = p.limit;
+    const float act = beta * tanh_safe(a / beta) / (1.0f + exp(-a));
+    return act * (linear_beta > 0.0f ? linear_beta * tanh_safe(b / linear_beta) : b);
+}
+
+#include "glu_main.glsl"

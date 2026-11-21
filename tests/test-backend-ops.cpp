@@ -2432,6 +2432,61 @@ struct test_swiglu_oai : public test_case {
     }
 };
 
+// GGML_GLU_OP_SITU
+struct test_situ : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne_a;
+    int v; // view (1 : non-contiguous a and b, as the gate and up halves of a fused gate_up)
+    float beta;
+    float linear_beta;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, ne_a, v, beta, linear_beta);
+    }
+
+    test_situ(ggml_type type = GGML_TYPE_F32,
+              std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
+              int v = 0,
+              float beta = 4.0f,
+              float linear_beta = 25.0f)
+        : type(type), ne_a(ne_a), v(v), beta(beta), linear_beta(linear_beta) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        ggml_tensor * b;
+        if (v & 1) {
+            auto ne = ne_a; ne[0] *= 2;
+            ggml_tensor * ab = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_param(ab);
+            ggml_set_name(ab, "ab");
+
+            a = ggml_view_4d(ctx, ab, ne_a[0], ne_a[1], ne_a[2], ne_a[3], ab->nb[1], ab->nb[2], ab->nb[3], 0);
+            ggml_set_name(a, "view_of_a");
+            b = ggml_view_4d(ctx, ab, ne_a[0], ne_a[1], ne_a[2], ne_a[3], ab->nb[1], ab->nb[2], ab->nb[3], ne_a[0]*ab->nb[0]);
+            ggml_set_name(b, "view_of_b");
+        } else {
+            a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+            ggml_set_param(a);
+            ggml_set_name(a, "a");
+
+            b = ggml_new_tensor(ctx, type, 4, ne_a.data());
+            ggml_set_param(b);
+            ggml_set_name(b, "b");
+        }
+
+        ggml_tensor * out = ggml_situ(ctx, a, b, beta, linear_beta);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -150.f, 150.f);
+        }
+    }
+};
+
 struct test_swiglu_clamp : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
@@ -11087,6 +11142,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_swiglu_clamp(type, { 128, 2, 2, 2 }, v, limit));
             }
         }
+    }
+
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
+        for (int v : {0, 1}) {
+            for (float linear_beta : {0.0f, 25.0f}) {
+                test_cases.emplace_back(new test_situ(type, { 128, 2, 2, 2 }, v, 4.0f, linear_beta));
+            }
+        }
+        // Inkling-2-Mini's expert activation: n_ff 1152 by 8 experts used
+        test_cases.emplace_back(new test_situ(type, { 1152, 8, 3, 1 }, 1, 4.0f, 25.0f));
     }
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {

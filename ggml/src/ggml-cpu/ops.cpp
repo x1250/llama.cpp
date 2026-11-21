@@ -3694,6 +3694,81 @@ static void ggml_compute_forward_swiglu_clamp_half(const ggml_compute_params * p
     }
 }
 
+// ggml_compute_forward_situ
+
+static inline float ggml_situ_f32(float gate, float up, float beta, float linear_beta) {
+    const float act = beta*tanhf(gate/beta) / (1.f + expf(-gate));
+    return act * (linear_beta > 0.f ? linear_beta*tanhf(up/linear_beta) : up);
+}
+
+template <typename T>
+static void ggml_compute_forward_situ_t(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0   = dst->src[0];
+    const ggml_tensor * src1   = dst->src[1];
+    char *              src0_d = (char *) src0->data;
+    char *              src1_d = (char *) (src1 ? src1->data : src0->data);
+    const size_t        src0_o = src0->nb[1];
+    const size_t        src1_o = src1 ? src1->nb[1] : src0->nb[1];
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+
+    if (src1) {
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+        GGML_ASSERT(src0->type == src1->type);
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int nr = ggml_nrows(src0);
+
+    GGML_ASSERT(dst->ne[0] == nc);
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+
+    const int32_t swapped     = ggml_get_op_params_i32(dst, 1);
+    const float   beta        = ggml_get_op_params_f32(dst, 2);
+    const float   linear_beta = ggml_get_op_params_f32(dst, 3);
+
+    const int dr  = (nr + nth - 1) / nth;
+    const int ir0 = dr * ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        T * src0_p = (T *) (src0_d + i1 * src0_o);
+        T * src1_p = (T *) (src1_d + i1 * src1_o);
+        T * dst_p  = (T *) ((char *) dst->data + i1 * (dst->nb[1]));
+
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+
+        for (int k = 0; k < nc; k++) {
+            const float gate = type_conversion_table<T>::to_f32(src0_p[k]);
+            const float up   = type_conversion_table<T>::to_f32(src1_p[k]);
+            dst_p[k]         = type_conversion_table<T>::from_f32(ggml_situ_f32(gate, up, beta, linear_beta));
+        }
+    }
+}
+
+static void ggml_compute_forward_situ(const ggml_compute_params * params, ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            ggml_compute_forward_situ_t<float>(params, dst);
+            break;
+        case GGML_TYPE_F16:
+            ggml_compute_forward_situ_t<ggml_fp16_t>(params, dst);
+            break;
+        case GGML_TYPE_BF16:
+            ggml_compute_forward_situ_t<ggml_bf16_t>(params, dst);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
 static void ggml_compute_forward_swiglu_clamp(const ggml_compute_params * params, ggml_tensor * dst) {
     switch (dst->src[0]->type) {
         case GGML_TYPE_F32:
@@ -10529,6 +10604,10 @@ void ggml_compute_forward_glu(
         case GGML_GLU_OP_SWIGLU_CLAMP:
             {
                 ggml_compute_forward_swiglu_clamp(params, dst);
+            } break;
+        case GGML_GLU_OP_SITU:
+            {
+                ggml_compute_forward_situ(params, dst);
             } break;
         default:
             {
