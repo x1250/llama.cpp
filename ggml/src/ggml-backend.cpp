@@ -71,8 +71,10 @@ static ggml_backend_buft_alloc_buffer_n_plan_t ggml_backend_buft_alloc_buffer_n_
             this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
         }
 
-        // flush the current buffer if adding this tensor would exceed max_size
-        if (cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
+        // flush the current buffer if adding this tensor would exceed max_size; a view, with no size of its own, stays in
+        // the current one: after a tensor larger than max_size it would open an item of size 0, and a last item of size
+        // 0 is never allocated, so the views at the end of the list would never be initialized
+        if (this_size > 0 && cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
             plan.push_back({ cur_buf_size, first, i });
             cur_buf_size = this_size;
             first        = i;

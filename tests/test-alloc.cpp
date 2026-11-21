@@ -823,6 +823,31 @@ static void test_buft_alloc_buffer_n_views() {
     GGML_ASSERT(view->data == base->data);
 }
 
+// Check that views after tensors larger than max_size are initialized: each tensor gets a buffer of its own, and the
+// views at the end of the list (the per-stream views of a KV cache's last layer) belong to the last one
+static void test_buft_alloc_buffer_n_views_after_oversized() {
+    dummy_backend backend      = dummy_backend_init(8);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * k  = make_input_with_size(ctx, 16);
+    ggml_tensor * v  = make_input_with_size(ctx, 16);
+    ggml_tensor * k0 = ggml_view_1d(ctx, k, 2, 0);
+    ggml_tensor * v0 = ggml_view_1d(ctx, v, 2, 0);
+    ggml_tensor * k1 = ggml_view_1d(ctx, k, 2, 2*sizeof(float));
+    ggml_tensor * v1 = ggml_view_1d(ctx, v, 2, 2*sizeof(float));
+    assign_names(ctx);
+
+    ggml_tensor * tensors[6] = { k, v, k0, v0, k1, v1 };
+    ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer_n(&backend.buffer_type, tensors, 6));
+    GGML_ASSERT(buffer != nullptr);
+    GGML_ASSERT(backend.context->buffers.size() == 2);
+    GGML_ASSERT(!memory_overlap(k, v));
+    for (ggml_tensor * view : { k0, v0, k1, v1 }) {
+        GGML_ASSERT(view->buffer != nullptr);
+        GGML_ASSERT(view->data == (char *) view->view_src->data + view->view_offs);
+    }
+}
+
 // Check that the reported size matches the allocated size in various scenarios:
 // single buffer, multi buffer, and views
 static void test_alloc_ctx_tensors_from_buft_size_matches() {
@@ -1126,6 +1151,7 @@ int main() {
     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);
     run("test_buft_alloc_buffer_n_already_allocated", test_buft_alloc_buffer_n_already_allocated);
     run("test_buft_alloc_buffer_n_views", test_buft_alloc_buffer_n_views);
+    run("test_buft_alloc_buffer_n_views_after_oversized", test_buft_alloc_buffer_n_views_after_oversized);
     run("test_alloc_ctx_tensors_from_buft_size_matches", test_alloc_ctx_tensors_from_buft_size_matches);
     run("test_buft_alloc_buffer_n_custom_override", test_buft_alloc_buffer_n_custom_override);
     run("test_buft_get_alloc_size_n_single_buffer", test_buft_get_alloc_size_n_single_buffer);
