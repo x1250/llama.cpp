@@ -19,17 +19,22 @@ están en `~/ProjectHub/llama.cpp-evidence/inkling2mini/`.
 - 1048576 × 2 slots, KV q8_0, ubatch 512 (sección 4).
 - Muestreo de Unsloth: temp 1.0, top_p 1.0, top_k 0, min_p 0.
 
-**Velocidad** (llama-bench, NVFP4 + Q8_0, contexto corto; cada cifra del build final con la base medida al inicio y al
-final de la misma cadena):
+**Velocidad** (llama-bench, contexto corto, `final-ab.sh`): el build instalado (master `6fb6b6ed7`) contra la base
+medida al inicio y al final de la misma cadena. La base es b12603 con el arreglo de SCALE (punto 1 de la sección 2),
+el mismo GGUF y el sesgo denso de upstream.
 
-| | Upstream b12603 | Final (`caf63394a`) |
+| | Base | Instalado |
 |---|---|---|
-| Decode tg128 | 16.6 t/s con el UD-Q8_K_XL; 31.3 con el GGUF propio | 35.3 t/s |
-| Prefill pp2048, ubatch 2048 | 454 t/s | 1031-1035 t/s |
-| Prefill pp2048, ubatch 512 (producción) | 500 t/s | 926-930 t/s |
+| Prefill pp2048, ubatch 512 (producción) | 500 t/s | 931 t/s |
+| Prefill pp2048, ubatch 2048 | 448-451 t/s | 1035 t/s |
+| Decode tg128 | 30.7-31.4 t/s | 35.2-35.4 t/s |
 
-**A 131k de profundidad** (ubatch 2048): prefill de 298 t/s y decode de 17.0 t/s (18.0 con KV q8_0). El decode a
-profundidad está en el límite de memoria: cada atención global lee 537 MB por token a ~210 GB/s.
+Upstream tal cual, con el UD-Q8_K_XL de Unsloth y sin el arreglo de SCALE, decodificaba a 16.6 t/s. En el server, con
+el muestreo de producción y 2 slots, el decode es de 32-33 t/s.
+
+**A 131k de profundidad** (con ubatch 2048, no el 512 de producción): prefill de 298 t/s y decode de 17.0 t/s (18.0 con
+KV q8_0). El decode a profundidad está en el límite de memoria: cada atención global lee 537 MB por token a
+~210 GB/s.
 
 **Memoria:** se carga con 53.9 GiB y deja 48 GiB de MemAvailable (sección 5).
 
@@ -159,7 +164,9 @@ Producción usa 512, el único que entra en el timeout al contexto nativo (-10 %
   - **Tool call:** `get_weather` con `{"city":"Santiago"}`.
   - **Prompt cache:** una petición, otra en el mismo slot y la primera otra vez dan la misma respuesta greedy; la tercera
     evalúa 4 de 19 tokens y lee el resto del caché. Esta es la petición que abortaba antes del punto 8.
-  - **Dos a la vez:** 43.5 t/s en total.
+  - **Dos a la vez:** 43.9 t/s en total con ubatch 512 y 46.4 con 2048 (`vision_check.py`).
+  - **Lectura de imagen:** una imagen de 1024 × 768 con "CODE 4817 BLUE" escrito. La respuesta es "4817 BLUE" con
+    ubatch 512 y con 2048 (`vision_check.py`).
   - **Velocidad del server**, muestreo de producción, 512 tokens con `reasoning_effort` none: 32.2 t/s en código y 32.3
     en prosa.
   - **Imagen de 2048 × 2048 en el slot 1:** 2734 tokens en 9.2 s (442 t/s). Con ubatch 512 no aborta: el encoder de
