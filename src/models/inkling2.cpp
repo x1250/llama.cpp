@@ -251,15 +251,16 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     return ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
 }
 
-// mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
+// mix a cross-pass message into a looped layer input: (1 - tanh(forget))*cur + tanh(gain)*message, forget and gain
+// projected from cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
     ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
-    ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
-    ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
+    ggml_tensor * gain   = build_lora_mm(loop.ctrl_gain[ctrl],   gate);
+    ggml_tensor * forget = build_lora_mm(loop.ctrl_forget[ctrl], gate);
 
-    return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
+    return ggml_tanh_blend(ctx0, cur, message, forget, gain);
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_inputs() {

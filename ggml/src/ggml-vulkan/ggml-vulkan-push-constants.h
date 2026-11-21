@@ -817,6 +817,13 @@ struct vk_op_ssm_conv_push_constants {
     float scale;
 };
 
+// ggml_tanh_blend: row strides and offsets in floats (tanh_blend.comp)
+struct vk_op_tanh_blend_push_constants {
+    uint32_t ne0, n_rows;
+    uint32_t a_stride, b_stride, f_stride, g_stride, d_stride;
+    uint32_t a_offset, b_offset, f_offset, g_offset, d_offset;
+};
+
 // ggml_depth_attn: strides and offsets in floats, states beyond n_states unused (depth_attn.comp)
 #define VK_DEPTH_ATTN_MAX_STATES 9
 #define VK_DEPTH_ATTN_MAX_QUERY  4

@@ -1,0 +1,43 @@
+#version 450
+
+// ggml_tanh_blend: a*(1 - tanh(f)) + b*tanh(g), as (a - tanh(f)*a) + tanh(g)*b, one invocation per element of rows of
+// contiguous floats; each tensor has its own row stride and offset (in floats)
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) readonly buffer F {float data_f[];};
+layout (binding = 3) readonly buffer G {float data_g[];};
+layout (binding = 4) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint ne0;
+    uint n_rows;
+    uint a_stride; uint b_stride; uint f_stride; uint g_stride; uint d_stride;
+    uint a_offset; uint b_offset; uint f_offset; uint g_offset; uint d_offset;
+} p;
+
+// the tanh of unary.comp
+float op_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+void main() {
+    const uint i0  = gl_GlobalInvocationID.x;
+    const uint row = gl_WorkGroupID.y + gl_WorkGroupID.z * gl_NumWorkGroups.y;
+
+    if (i0 >= p.ne0 || row >= p.n_rows) {
+        return;
+    }
+
+    const float a = data_a[p.a_offset + row * p.a_stride + i0];
+    const float b = data_b[p.b_offset + row * p.b_stride + i0];
+
+    // precise: no contraction, the rounding of the separate tanh, mul, sub, mul and add
+    precise const float forget_a = op_tanh(data_f[p.f_offset + row * p.f_stride + i0]) * a;
+    precise const float gain_b   = op_tanh(data_g[p.g_offset + row * p.g_stride + i0]) * b;
+    precise const float kept     = a - forget_a;
+
+    data_d[p.d_offset + row * p.d_stride + i0] = kept + gain_b;
+}

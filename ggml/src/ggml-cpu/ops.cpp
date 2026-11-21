@@ -9808,6 +9808,47 @@ void ggml_compute_forward_depth_attn(
     }
 }
 
+// ggml_compute_forward_tanh_blend
+
+void ggml_compute_forward_tanh_blend(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * f = dst->src[2];
+    const ggml_tensor * g = dst->src[3];
+
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne1 = dst->ne[1];
+    const int64_t ne2 = dst->ne[2];
+    const int64_t nr  = ggml_nrows(dst);
+
+    // the row of tensor t at i1, i2, i3
+    auto row = [](const ggml_tensor * t, int64_t i1, int64_t i2, int64_t i3) {
+        return (const float *) ((const char *) t->data + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3]);
+    };
+
+    for (int64_t ir = params->ith; ir < nr; ir += params->nth) {
+        const int64_t i3 = ir/(ne2*ne1);
+        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
+        const int64_t i1 = ir - i3*ne2*ne1 - i2*ne1;
+
+        const float * ra = row(a, i1, i2, i3);
+        const float * rb = row(b, i1, i2, i3);
+        const float * rf = row(f, i1, i2, i3);
+        const float * rg = row(g, i1, i2, i3);
+        float * rd = (float *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+            const float forget_a = tanhf(rf[i0])*ra[i0];
+            const float gain_b   = tanhf(rg[i0])*rb[i0];
+            rd[i0] = (ra[i0] - forget_a) + gain_b;
+        }
+    }
+}
+
 // ggml_compute_forward_flash_attn_back
 
 static void ggml_compute_forward_flash_attn_back_f32(

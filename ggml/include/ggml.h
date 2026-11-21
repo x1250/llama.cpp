@@ -401,6 +401,7 @@ extern "C" {
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_EXT_REL,
         GGML_OP_DEPTH_ATTN,
+        GGML_OP_TANH_BLEND,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2323,6 +2324,16 @@ extern "C" {
             int                   n_states,
             float                 eps,
             float                 scale);
+
+    // a and b blended by two tanh gates: a*(1 - tanh(f)) + b*tanh(g), computed as (a - tanh(f)*a) + tanh(g)*b
+    // used in inkling 2 (the loop controllers: a the layer input, b the cross-pass message)
+    // a, b, f, g: F32 of the same shape, contiguous rows; result: F32 of that shape
+    GGML_API struct ggml_tensor * ggml_tanh_blend(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * f,
+            struct ggml_tensor  * g);
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);

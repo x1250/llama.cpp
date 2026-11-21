@@ -9371,6 +9371,52 @@ struct test_depth_attn : public test_case {
     }
 };
 
+// GGML_OP_TANH_BLEND
+struct test_tanh_blend : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool view; // b and g as views of wider rows
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, view);
+    }
+
+    test_tanh_blend(std::array<int64_t, 4> ne = {2304, 3, 1, 1}, bool view = false)
+        : ne(ne), view(view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * f = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * b;
+        ggml_tensor * g;
+        if (view) {
+            const std::array<int64_t, 4> wide = { 2*ne[0], ne[1], ne[2], ne[3] };
+            ggml_tensor * bw = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, wide.data());
+            ggml_tensor * gw = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, wide.data());
+            b = ggml_view_4d(ctx, bw, ne[0], ne[1], ne[2], ne[3], bw->nb[1], bw->nb[2], bw->nb[3], ne[0]*sizeof(float));
+            g = ggml_view_4d(ctx, gw, ne[0], ne[1], ne[2], ne[3], gw->nb[1], gw->nb[2], gw->nb[3], 0);
+        } else {
+            b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            g = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        }
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(f, "f");
+        ggml_set_name(g, "g");
+
+        ggml_tensor * out = ggml_tanh_blend(ctx, a, b, f, g);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // gates past the saturation of tanh too
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -6.0f, 6.0f);
+        }
+    }
+};
+
 struct test_flash_attn_ext_rel : public test_case {
     const int64_t hs;    // K and V head size
     const int64_t nh;    // num K/V heads
@@ -13613,6 +13659,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_depth_attn(2304, 33, 4, 3, true));
+
+    for (int64_t n_tokens : {1, 3, 512}) {
+        test_cases.emplace_back(new test_tanh_blend({2304, n_tokens, 1, 1}));
+    }
+    test_cases.emplace_back(new test_tanh_blend({2304, 7, 1, 1}, true));
+    test_cases.emplace_back(new test_tanh_blend({100, 5, 3, 2}));
     test_cases.emplace_back(new test_depth_attn(100,  65, 7, 2, true));
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the

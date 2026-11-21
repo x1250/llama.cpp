@@ -4269,6 +4269,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     } else {
         ggml_vk_create_pipeline(device, device->pipeline_depth_attn_f32, "depth_attn_f32", depth_attn_f32_len, depth_attn_f32_data, "main", 2 + VK_DEPTH_ATTN_MAX_STATES, sizeof(vk_op_depth_attn_push_constants), {1, 1, 1}, {64, device->subgroup_size}, 1);
     }
+    ggml_vk_create_pipeline(device, device->pipeline_tanh_blend_f32, "tanh_blend_f32", tanh_blend_f32_len, tanh_blend_f32_data, "main", 5, sizeof(vk_op_tanh_blend_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_residual_f32,  "ssm_conv_residual_f32",  ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1}, 1);
@@ -11589,6 +11590,41 @@ void ggml_vk_depth_attn(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_
         pc, { wg_x, CEIL_DIV(n_tokens, wg_x), 1 });
 }
 
+void ggml_vk_tanh_blend(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * f = dst->src[2];
+    const ggml_tensor * g = dst->src[3];
+
+    vk_pipeline pipeline = ctx->device->pipeline_tanh_blend_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    auto stride = [](const ggml_tensor * t) { return (uint32_t) (t->nb[1] / sizeof(float)); };
+    auto offset = [&](const ggml_tensor * t) { return (uint32_t) (get_misalign_bytes(ctx, t) / sizeof(float)); };
+
+    vk_op_tanh_blend_push_constants pc {};
+    pc.ne0      = (uint32_t) dst->ne[0];
+    pc.n_rows   = (uint32_t) ggml_nrows(dst);
+    pc.a_stride = stride(a);
+    pc.b_stride = stride(b);
+    pc.f_stride = stride(f);
+    pc.g_stride = stride(g);
+    pc.d_stride = stride(dst);
+    pc.a_offset = offset(a);
+    pc.b_offset = offset(b);
+    pc.f_offset = offset(f);
+    pc.g_offset = offset(g);
+    pc.d_offset = offset(dst);
+
+    // the rows past the dispatch limit of y in z
+    const uint32_t rows_y = std::min(pc.n_rows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, a, true), ggml_vk_tensor_subbuffer(ctx, b, true),
+          ggml_vk_tensor_subbuffer(ctx, f, true), ggml_vk_tensor_subbuffer(ctx, g, true),
+          ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { pc.ne0, rows_y, CEIL_DIV(pc.n_rows, rows_y) });
+}
+
 void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * conv = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = conv->src[0];
@@ -14020,6 +14056,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_DEPTH_ATTN:
         ggml_vk_depth_attn(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_TANH_BLEND:
+        ggml_vk_tanh_blend(ctx, compute_ctx, node);
 
         break;
 
@@ -17522,6 +17562,18 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_TANH_BLEND:
+            {
+                // tanh_blend.comp: one row stride per tensor, the rows past the dispatch limit of y in z
+                for (int j = 0; j < 4; ++j) {
+                    const ggml_tensor * t = op->src[j];
+                    if (t->nb[2] != t->nb[1]*t->ne[1] || t->nb[3] != t->nb[2]*t->ne[2]) {
+                        return false;
+                    }
+                }
+                return ggml_nrows(op) <= (int64_t) device->properties.limits.maxComputeWorkGroupCount[1] *
+                                         (int64_t) device->properties.limits.maxComputeWorkGroupCount[2];
+            }
         case GGML_OP_DEPTH_ATTN:
             // depth_attn.comp: up to 9 states and 4 queries, one workgroup per token
             return ggml_get_op_params_i32(op, 0) <= VK_DEPTH_ATTN_MAX_STATES && op->src[0]->ne[1] <= VK_DEPTH_ATTN_MAX_QUERY &&

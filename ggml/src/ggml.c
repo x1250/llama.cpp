@@ -1085,6 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_EXT_REL",
     "DEPTH_ATTN",
+    "TANH_BLEND",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
@@ -1121,7 +1122,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1203,6 +1204,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_ext(x)",
     "flash_attn_ext_rel(x)",
     "depth_attn(x)",
+    "tanh_blend(a,b,f,g)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
@@ -1239,7 +1241,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5597,6 +5599,30 @@ struct ggml_tensor * ggml_depth_attn(
     result->src[0] = query;
     for (int j = 0; j < n_states; ++j) {
         result->src[1 + j] = states[j];
+    }
+
+    return result;
+}
+
+// ggml_tanh_blend
+
+struct ggml_tensor * ggml_tanh_blend(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * f,
+        struct ggml_tensor  * g) {
+    struct ggml_tensor * srcs[4] = { a, b, f, g };
+    for (int j = 0; j < 4; ++j) {
+        GGML_ASSERT(srcs[j]->type == GGML_TYPE_F32 && srcs[j]->nb[0] == sizeof(float));
+        GGML_ASSERT(ggml_are_same_shape(srcs[j], a));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
+
+    result->op = GGML_OP_TANH_BLEND;
+    for (int j = 0; j < 4; ++j) {
+        result->src[j] = srcs[j];
     }
 
     return result;
