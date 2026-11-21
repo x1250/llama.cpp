@@ -14546,6 +14546,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
     }
 
+    // Inkling 2's global attention at 32k: 24 query heads on 8 K/V heads, a prompt ubatch of 512 and of 2048, with the
+    // in-kernel relative bias and, for comparison, without it
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int nb : {512, 2048}) {
+            test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 32768, nb, 1, 1025, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 32768, nb, true, true, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        }
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));

@@ -9190,8 +9190,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // flipped coopmat1 path reads K/V rows with 16-byte loads
         const bool kv_16b = use_dequant_kv ||
             (((uintptr_t)k->data | (uintptr_t)v->data | nbk2_eff | nbk3_eff | nbv2_eff | nbv3_eff) % 16) == 0;
-        // the flipped variant has no relative bias
-        if (!aligned || use_sparse || gqa_ratio != 1 || !kv_16b || rel) {
+        if (!aligned || use_sparse || gqa_ratio != 1 || !kv_16b) {
             tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio, false);
             alignment = tuning_params.block_cols;
             aligned = fa_aligned(tuning_params);

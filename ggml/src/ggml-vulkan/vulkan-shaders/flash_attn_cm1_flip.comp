@@ -349,6 +349,12 @@ void main() {
             }
         }
 
+        if (REL_ENABLE) {
+            [[unroll]] for (uint32_t k = 0; k < FL_CPL; ++k) {
+                s[k] += relBias(sg * 16 + lr, j * Bc + lc * FL_CPL + k);
+            }
+        }
+
         float mx = s[0];
         [[unroll]] for (uint32_t k = 1; k < FL_CPL; ++k) {
             mx = max(mx, s[k]);
