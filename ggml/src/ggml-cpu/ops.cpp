@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -9691,6 +9692,78 @@ void ggml_compute_forward_flash_attn_ext(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_depth_attn
+
+void ggml_compute_forward_depth_attn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * query = dst->src[0];
+
+    const int   n_states = ggml_get_op_params_i32(dst, 0);
+    const float eps      = ggml_get_op_params_f32(dst, 1);
+    const float scale    = ggml_get_op_params_f32(dst, 2);
+
+    const int64_t n_embd   = query->ne[0];
+    const int64_t n_query  = query->ne[1];
+    const int64_t n_tokens = dst->ne[1];
+
+    GGML_ASSERT(n_states > 0 && n_states <= GGML_MAX_SRC - 1);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    std::vector<float> weight(n_query * n_states); // weight of state j for query i, times its 1/rms
+    std::vector<float> score(n_states);
+
+    for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
+        const float * s[GGML_MAX_SRC];
+        for (int j = 0; j < n_states; ++j) {
+            s[j] = (const float *) ((const char *) dst->src[1 + j]->data + t*dst->src[1 + j]->nb[1]);
+        }
+
+        float inv_rms[GGML_MAX_SRC];
+        for (int j = 0; j < n_states; ++j) {
+            ggml_float sum = 0.0;
+            for (int64_t e = 0; e < n_embd; ++e) {
+                sum += (ggml_float) s[j][e]*s[j][e];
+            }
+            inv_rms[j] = 1.0f/sqrtf((float) (sum/n_embd) + eps);
+        }
+
+        for (int64_t i = 0; i < n_query; ++i) {
+            const float * q = (const float *) ((const char *) query->data + i*query->nb[1]);
+
+            float max = -INFINITY;
+            for (int j = 0; j < n_states; ++j) {
+                ggml_float dot = 0.0;
+                for (int64_t e = 0; e < n_embd; ++e) {
+                    dot += (ggml_float) q[e]*s[j][e];
+                }
+                score[j] = scale*inv_rms[j]*(float) dot;
+                max = MAX(max, score[j]);
+            }
+
+            float sum = 0.0f;
+            for (int j = 0; j < n_states; ++j) {
+                score[j] = expf(score[j] - max);
+                sum += score[j];
+            }
+            for (int j = 0; j < n_states; ++j) {
+                weight[i*n_states + j] = score[j]/sum*inv_rms[j];
+            }
+        }
+
+        for (int64_t i = 0; i < n_query; ++i) {
+            float * d = (float *) ((char *) dst->data + t*dst->nb[1] + i*dst->nb[2]);
+            for (int64_t e = 0; e < n_embd; ++e) {
+                float acc = 0.0f;
+                for (int j = 0; j < n_states; ++j) {
+                    acc += weight[i*n_states + j]*s[j][e];
+                }
+                d[e] = acc;
+            }
+        }
     }
 }
 

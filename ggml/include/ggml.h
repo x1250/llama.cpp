@@ -399,6 +399,7 @@ extern "C" {
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_EXT_REL,
+        GGML_OP_DEPTH_ATTN,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2299,6 +2300,20 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // attention over depth (Inkling 2's attention residuals): for each token and query, a softmax over the states of
+    // scale * query . norm(state), with norm(x) = x / sqrt(mean(x^2) + eps), and the sum of the normalized states with
+    // those weights
+    // query:  [n_embd, n_query]
+    // states: n_states (at most GGML_MAX_SRC - 1) tensors [n_embd, n_tokens], F32, contiguous rows
+    // result: [n_embd, n_tokens, n_query] F32
+    GGML_API struct ggml_tensor * ggml_depth_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * query,
+            struct ggml_tensor ** states,
+            int                   n_states,
+            float                 eps,
+            float                 scale);
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);

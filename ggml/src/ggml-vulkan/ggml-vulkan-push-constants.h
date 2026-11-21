@@ -816,6 +816,17 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+// ggml_depth_attn: strides and offsets in floats, states beyond n_states unused (depth_attn.comp)
+#define VK_DEPTH_ATTN_MAX_STATES 9
+#define VK_DEPTH_ATTN_MAX_QUERY  4
+struct vk_op_depth_attn_push_constants {
+    uint32_t n_embd, n_tokens, n_states, n_query;
+    float eps, scale;
+    uint32_t q_stride, q_offset, d_offset;
+    uint32_t s_stride[VK_DEPTH_ATTN_MAX_STATES];
+    uint32_t s_offset[VK_DEPTH_ATTN_MAX_STATES];
+};
+
 struct vk_op_conv2d_push_constants {
     uint32_t Cout;
     uint32_t Cin;

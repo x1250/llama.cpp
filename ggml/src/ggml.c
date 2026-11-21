@@ -1083,6 +1083,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_EXT_REL",
+    "DEPTH_ATTN",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
@@ -1119,7 +1120,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1199,6 +1200,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "flash_attn_ext(x)",
     "flash_attn_ext_rel(x)",
+    "depth_attn(x)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
@@ -1235,7 +1237,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5538,6 +5540,42 @@ struct ggml_tensor * ggml_flash_attn_ext_rel(
     result->src[6] = rel;
     result->src[7] = pos_q;
     result->src[8] = pos_k;
+
+    return result;
+}
+
+// ggml_depth_attn
+
+struct ggml_tensor * ggml_depth_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * query,
+        struct ggml_tensor ** states,
+        int                   n_states,
+        float                 eps,
+        float                 scale) {
+    GGML_ASSERT(n_states > 0 && n_states <= GGML_MAX_SRC - 1);
+    GGML_ASSERT(query->type == GGML_TYPE_F32 && query->nb[0] == sizeof(float));
+    GGML_ASSERT(query->ne[2] == 1 && query->ne[3] == 1);
+
+    const int64_t n_embd   = query->ne[0];
+    const int64_t n_tokens = states[0]->ne[1];
+    for (int j = 0; j < n_states; ++j) {
+        GGML_ASSERT(states[j]->type == GGML_TYPE_F32 && states[j]->nb[0] == sizeof(float));
+        GGML_ASSERT(states[j]->ne[0] == n_embd && states[j]->ne[1] == n_tokens);
+        GGML_ASSERT(states[j]->ne[2] == 1 && states[j]->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, query->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, n_states);
+    ggml_set_op_params_f32(result, 1, eps);
+    ggml_set_op_params_f32(result, 2, scale);
+
+    result->op     = GGML_OP_DEPTH_ATTN;
+    result->src[0] = query;
+    for (int j = 0; j < n_states; ++j) {
+        result->src[1 + j] = states[j];
+    }
 
     return result;
 }

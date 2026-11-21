@@ -9233,6 +9233,57 @@ struct test_leaky_relu : public test_case {
 // rel[d, head, query] for its distance d = pos_q - pos_k below n_rel - 1, and rel[n_rel - 1] for the farther, future
 // and empty cells. The cells hold positions in order, with a gap and some empty cells, or a rotated ring (the SWA
 // cache); the queries are the last nb positions.
+// GGML_OP_DEPTH_ATTN
+struct test_depth_attn : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const int n_states;
+    const int64_t n_query;
+    const bool views; // states as views with a row stride, a block of a larger tensor
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd, n_tokens, n_states, n_query, views);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_depth_attn(int64_t n_embd = 2304, int64_t n_tokens = 7, int n_states = 3, int64_t n_query = 1, bool views = false)
+        : n_embd(n_embd), n_tokens(n_tokens), n_states(n_states), n_query(n_query), views(views) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_query);
+        ggml_set_name(query, "query");
+
+        ggml_tensor * states[GGML_MAX_SRC];
+        for (int j = 0; j < n_states; ++j) {
+            if (views) {
+                ggml_tensor * block = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd + 5, n_tokens);
+                ggml_set_name(block, "block");
+                states[j] = ggml_view_2d(ctx, block, n_embd, n_tokens, block->nb[1], 3*sizeof(float));
+            } else {
+                states[j] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            }
+            ggml_set_name(states[j], "state");
+        }
+
+        ggml_tensor * out = ggml_depth_attn(ctx, query, states, n_states, 1e-6f, 1.0f/sqrtf((float) n_embd));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // states of different scales, so that the normalization matters, and queries that make the softmax uneven
+        int i = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t), ++i) {
+            const float a = t->op == GGML_OP_NONE && strcmp(t->name, "query") == 0 ? 4.0f : 0.5f + 3.0f*(i % 4);
+            init_tensor_uniform(t, -a, a);
+        }
+    }
+};
+
 struct test_flash_attn_ext_rel : public test_case {
     const int64_t hs;    // K and V head size
     const int64_t nh;    // num K/V heads
@@ -13447,6 +13498,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 1536, 256, 1, 1025, type_KV, true));
         test_cases.emplace_back(new test_flash_attn_ext_rel(64,  4, 1, 300,  7,   1, 17,   type_KV));
     }
+
+    // Inkling 2's attention residuals: 1 to 9 states, one query per mix, three for the Q/K/V inputs, four for the loop
+    // messages; a decode token, a verification batch and a prompt batch
+    for (int64_t n_tokens : {1, 3, 512}) {
+        for (int n_states : {1, 2, 5, 9}) {
+            for (int64_t n_query : {1, 3, 4}) {
+                test_cases.emplace_back(new test_depth_attn(2304, n_tokens, n_states, n_query));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_depth_attn(2304, 33, 4, 3, true));
+    test_cases.emplace_back(new test_depth_attn(100,  65, 7, 2, true));
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.

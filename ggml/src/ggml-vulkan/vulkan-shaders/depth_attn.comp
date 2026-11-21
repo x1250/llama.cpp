@@ -1,0 +1,190 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#if USE_SUBGROUP_ADD
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+// attention over depth (ggml_depth_attn), one workgroup per token: the first pass sums the squares of every state and its
+// dot products with the queries, a fixed-order reduction combines the threads (subgroup sums, then the subgroups in
+// order; or a tree in shared memory), and the second pass mixes the states with the softmax weights times their 1/rms
+
+#define MAX_STATES 9
+#define MAX_QUERY  4
+#define N_SUMS     (MAX_STATES * (1 + MAX_QUERY))
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 64;
+layout(constant_id = 1) const uint SUBGROUP_SIZE = 32;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0)  readonly buffer Q  {float data_q[];};
+layout (binding = 1)  readonly buffer S0 {float data_s0[];};
+layout (binding = 2)  readonly buffer S1 {float data_s1[];};
+layout (binding = 3)  readonly buffer S2 {float data_s2[];};
+layout (binding = 4)  readonly buffer S3 {float data_s3[];};
+layout (binding = 5)  readonly buffer S4 {float data_s4[];};
+layout (binding = 6)  readonly buffer S5 {float data_s5[];};
+layout (binding = 7)  readonly buffer S6 {float data_s6[];};
+layout (binding = 8)  readonly buffer S7 {float data_s7[];};
+layout (binding = 9)  readonly buffer S8 {float data_s8[];};
+layout (binding = 10) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter
+{
+    uint n_embd;
+    uint n_tokens;
+    uint n_states;
+    uint n_query;
+    float eps;
+    float scale;
+    uint q_stride;
+    uint q_offset;
+    uint d_offset;
+    uint s_stride[MAX_STATES];
+    uint s_offset[MAX_STATES];
+} p;
+
+#if USE_SUBGROUP_ADD
+shared float sums[N_SUMS][BLOCK_SIZE / SUBGROUP_SIZE];
+shared float totals[N_SUMS];
+#else
+shared float sums[N_SUMS][BLOCK_SIZE];
+#endif
+
+float state(const uint j, const uint e, const uint t) {
+    const uint idx = p.s_offset[j] + t * p.s_stride[j] + e;
+    switch (j) {
+        case 0: return data_s0[idx];
+        case 1: return data_s1[idx];
+        case 2: return data_s2[idx];
+        case 3: return data_s3[idx];
+        case 4: return data_s4[idx];
+        case 5: return data_s5[idx];
+        case 6: return data_s6[idx];
+        case 7: return data_s7[idx];
+        default: return data_s8[idx];
+    }
+}
+
+void main() {
+    const uint t   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    if (t >= p.n_tokens) {
+        return;
+    }
+
+    float ss[MAX_STATES];
+    float dots[MAX_STATES][MAX_QUERY];
+    [[unroll]] for (uint j = 0; j < MAX_STATES; ++j) {
+        ss[j] = 0.0;
+        [[unroll]] for (uint i = 0; i < MAX_QUERY; ++i) {
+            dots[j][i] = 0.0;
+        }
+    }
+
+    for (uint e = tid; e < p.n_embd; e += BLOCK_SIZE) {
+        float q[MAX_QUERY];
+        [[unroll]] for (uint i = 0; i < MAX_QUERY; ++i) {
+            q[i] = i < p.n_query ? data_q[p.q_offset + i * p.q_stride + e] : 0.0;
+        }
+        [[unroll]] for (uint j = 0; j < MAX_STATES; ++j) {
+            if (j < p.n_states) {
+                const float v = state(j, e, t);
+                ss[j] = fma(v, v, ss[j]);
+                [[unroll]] for (uint i = 0; i < MAX_QUERY; ++i) {
+                    dots[j][i] = fma(v, q[i], dots[j][i]);
+                }
+            }
+        }
+    }
+
+#if USE_SUBGROUP_ADD
+    const uint sg = tid / SUBGROUP_SIZE;
+    [[unroll]] for (uint j = 0; j < MAX_STATES; ++j) {
+        const float r = subgroupAdd(ss[j]);
+        if (gl_SubgroupInvocationID == 0) {
+            sums[j][sg] = r;
+        }
+        [[unroll]] for (uint i = 0; i < MAX_QUERY; ++i) {
+            const float d = subgroupAdd(dots[j][i]);
+            if (gl_SubgroupInvocationID == 0) {
+                sums[MAX_STATES + j * MAX_QUERY + i][sg] = d;
+            }
+        }
+    }
+    barrier();
+    if (tid < N_SUMS) {
+        float total = 0.0;
+        for (uint k = 0; k < BLOCK_SIZE / SUBGROUP_SIZE; ++k) {
+            total += sums[tid][k];
+        }
+        totals[tid] = total;
+    }
+    barrier();
+#define TOTAL(v) totals[v]
+#else
+    [[unroll]] for (uint j = 0; j < MAX_STATES; ++j) {
+        sums[j][tid] = ss[j];
+        [[unroll]] for (uint i = 0; i < MAX_QUERY; ++i) {
+            sums[MAX_STATES + j * MAX_QUERY + i][tid] = dots[j][i];
+        }
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint v = 0; v < N_SUMS; ++v) {
+                sums[v][tid] += sums[v][tid + s];
+            }
+        }
+        barrier();
+    }
+#define TOTAL(v) sums[v][0]
+#endif
+
+    // the weight of state j for query i, times its 1/rms
+    float inv_rms[MAX_STATES];
+    [[unroll]] for (uint j = 0; j < MAX_STATES; ++j) {
+        inv_rms[j] = j < p.n_states ? 1.0 / sqrt(TOTAL(j) / float(p.n_embd) + p.eps) : 0.0;
+    }
+    float weight[MAX_STATES][MAX_QUERY];
+    [[unroll]] for (uint i = 0; i < MAX_QUERY; ++i) {
+        float score[MAX_STATES];
+        float max_score = -1.0 / 0.0;
+        [[unroll]] for (uint j = 0; j < MAX_STATES; ++j) {
+            score[j] = p.scale * inv_rms[j] * TOTAL(MAX_STATES + j * MAX_QUERY + i);
+            if (j < p.n_states) {
+                max_score = max(max_score, score[j]);
+            }
+        }
+        float sum = 0.0;
+        [[unroll]] for (uint j = 0; j < MAX_STATES; ++j) {
+            score[j] = j < p.n_states ? exp(score[j] - max_score) : 0.0;
+            sum += score[j];
+        }
+        [[unroll]] for (uint j = 0; j < MAX_STATES; ++j) {
+            weight[j][i] = score[j] / sum * inv_rms[j];
+        }
+    }
+
+    for (uint e = tid; e < p.n_embd; e += BLOCK_SIZE) {
+        float acc[MAX_QUERY];
+        [[unroll]] for (uint i = 0; i < MAX_QUERY; ++i) {
+            acc[i] = 0.0;
+        }
+        [[unroll]] for (uint j = 0; j < MAX_STATES; ++j) {
+            if (j < p.n_states) {
+                const float v = state(j, e, t);
+                [[unroll]] for (uint i = 0; i < MAX_QUERY; ++i) {
+                    acc[i] = fma(weight[j][i], v, acc[i]);
+                }
+            }
+        }
+        [[unroll]] for (uint i = 0; i < MAX_QUERY; ++i) {
+            if (i < p.n_query) {
+                data_d[p.d_offset + (i * p.n_tokens + t) * p.n_embd + e] = acc[i];
+            }
+        }
+    }
+}

@@ -4262,6 +4262,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
+    // one token's states are 9 x n_embd floats at most: 256 threads with subgroup sums, 64 with a shared-memory tree
+    if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
+        ggml_vk_create_pipeline(device, device->pipeline_depth_attn_f32, "depth_attn_f32", depth_attn_subgroup_f32_len, depth_attn_subgroup_f32_data, "main", 2 + VK_DEPTH_ATTN_MAX_STATES, sizeof(vk_op_depth_attn_push_constants), {1, 1, 1}, {256, device->subgroup_size}, 1, true, true);
+    } else {
+        ggml_vk_create_pipeline(device, device->pipeline_depth_attn_f32, "depth_attn_f32", depth_attn_f32_len, depth_attn_f32_data, "main", 2 + VK_DEPTH_ATTN_MAX_STATES, sizeof(vk_op_depth_attn_push_constants), {1, 1, 1}, {64, device->subgroup_size}, 1);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
 
@@ -11535,6 +11541,47 @@ void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_te
         pc, elements);
 }
 
+void ggml_vk_depth_attn(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * query = dst->src[0];
+    const uint32_t n_states = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(n_states >= 1 && n_states <= VK_DEPTH_ATTN_MAX_STATES);
+
+    vk_pipeline pipeline = ctx->device->pipeline_depth_attn_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_op_depth_attn_push_constants pc {};
+    pc.n_embd   = (uint32_t) query->ne[0];
+    pc.n_tokens = (uint32_t) dst->ne[1];
+    pc.n_states = n_states;
+    pc.n_query  = (uint32_t) query->ne[1];
+    pc.eps      = ggml_get_op_params_f32(dst, 1);
+    pc.scale    = ggml_get_op_params_f32(dst, 2);
+    pc.q_stride = (uint32_t) (query->nb[1] / sizeof(float));
+    pc.q_offset = get_misalign_bytes(ctx, query) / sizeof(float);
+    pc.d_offset = get_misalign_bytes(ctx, dst) / sizeof(float);
+
+    const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, query, true);
+    std::array<vk_subbuffer, VK_DEPTH_ATTN_MAX_STATES> s_buf;
+    for (uint32_t j = 0; j < VK_DEPTH_ATTN_MAX_STATES; ++j) {
+        if (j < n_states) {
+            const ggml_tensor * s = dst->src[1 + j];
+            s_buf[j] = ggml_vk_tensor_subbuffer(ctx, s, true);
+            pc.s_stride[j] = (uint32_t) (s->nb[1] / sizeof(float));
+            pc.s_offset[j] = get_misalign_bytes(ctx, s) / sizeof(float);
+        } else {
+            s_buf[j] = q_buf;
+        }
+    }
+
+    // one workgroup per token, the tokens past the dispatch limit of x in y
+    const uint32_t n_tokens = pc.n_tokens;
+    const uint32_t wg_x = std::min(n_tokens, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { q_buf, s_buf[0], s_buf[1], s_buf[2], s_buf[3], s_buf[4], s_buf[5], s_buf[6], s_buf[7], s_buf[8],
+          ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { wg_x, CEIL_DIV(n_tokens, wg_x), 1 });
+}
+
 void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * conv = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = conv->src[0];
@@ -13945,6 +13992,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_SSM_CONV:
         ggml_vk_ssm_conv(ctx, compute_ctx, cgraph, node_idx);
+
+        break;
+
+    case GGML_OP_DEPTH_ATTN:
+        ggml_vk_depth_attn(ctx, compute_ctx, node);
 
         break;
 
@@ -17408,6 +17460,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_DEPTH_ATTN:
+            // depth_attn.comp: up to 9 states and 4 queries, one workgroup per token
+            return ggml_get_op_params_i32(op, 0) <= VK_DEPTH_ATTN_MAX_STATES && op->src[0]->ne[1] <= VK_DEPTH_ATTN_MAX_QUERY &&
+                   op->ne[1] <= (int64_t) device->properties.limits.maxComputeWorkGroupCount[0] *
+                                (int64_t) device->properties.limits.maxComputeWorkGroupCount[1];
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_COL2IM_1D:
