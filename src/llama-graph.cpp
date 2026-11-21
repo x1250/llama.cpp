@@ -2592,9 +2592,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // the down projection's expert scales go into the router weights: one pass less over the [n_embd, n_expert_used,
-    // n_tokens] expert outputs, and the weights' MUL follows the projection, which the backends fuse
+    // n_tokens] expert outputs, and the weights' MUL follows the projection, which the backends fuse. Not with a LoRA
+    // on the projection: its delta is added after the scale (build_lora_mm_id) and the router weights would scale it.
+    bool down_lora = false;
+    for (const auto & lora : *loras) {
+        down_lora = down_lora || lora.first->get_weight(down_exps) != nullptr;
+    }
     ggml_tensor * down_s = down_exps_s;
-    if (down_s && !weight_before_ffn && !down_exps_b && !post_exp_norm) {
+    if (down_s && !weight_before_ffn && !down_exps_b && !post_exp_norm && !down_lora) {
         weights = ggml_mul(ctx0, weights, build_expert_scale(ctx0, down_s, selected_experts));
         cb(weights, "ffn_moe_weights_down_scaled", il);
         ggml_build_forward_expand(gf, weights);
