@@ -4684,6 +4684,47 @@ void ggml_compute_forward_l2_norm(
     }
 }
 
+// ggml_compute_forward_l2_norm_clip
+
+void ggml_compute_forward_l2_norm_clip(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const float max_norm = ggml_get_op_params_f32(dst, 0);
+    const float eps      = ggml_get_op_params_f32(dst, 1);
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const char * x = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
+
+                ggml_float sum = 0.0;
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    const float xi = *(const float *) (x + i00*nb00);
+                    sum += (ggml_float)(xi * xi);
+                }
+
+                const float scale = fminf(1.0f, max_norm/(sqrtf(sum) + eps));
+
+                char * y = (char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3;
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    *(float *) (y + i00*nb0) = *(const float *) (x + i00*nb00) * scale;
+                }
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_out_prod
 
 static void ggml_compute_forward_out_prod_f32(

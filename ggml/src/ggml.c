@@ -1035,6 +1035,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RMS_NORM_BACK",
     "GROUP_NORM",
     "L2_NORM",
+    "L2_NORM_CLIP",
 
     "MUL_MAT",
     "MUL_MAT_ID",
@@ -1120,7 +1121,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1152,6 +1153,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rms_norm_back(x)",
     "group_norm(x)",
     "l2_norm(x)",
+    "l2_norm_clip(x)",
 
     "X*Y",
     "X[i]*Y",
@@ -1237,7 +1239,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3290,6 +3292,26 @@ struct ggml_tensor * ggml_l2_norm_inplace(
         struct ggml_tensor  * a,
         float                 eps) {
     return ggml_l2_norm_impl(ctx, a, eps, true);
+}
+
+// ggml_l2_norm_clip
+
+struct ggml_tensor * ggml_l2_norm_clip(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        float                 max_norm,
+        float                 eps) {
+    GGML_ASSERT(max_norm > 0.0f && eps >= 0.0f);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params_f32(result, 0, max_norm);
+    ggml_set_op_params_f32(result, 1, eps);
+
+    result->op     = GGML_OP_L2_NORM_CLIP;
+    result->src[0] = a;
+
+    return result;
 }
 
 // ggml_prec

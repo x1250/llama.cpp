@@ -351,6 +351,7 @@ extern "C" {
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
         GGML_OP_L2_NORM,
+        GGML_OP_L2_NORM_CLIP,
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
@@ -1260,6 +1261,14 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_l2_norm_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            float                 eps);
+
+    // scale each row down to an L2 norm of at most max_norm: a * min(1, max_norm / (||a|| + eps))
+    // used in inkling 2 (the q, k and relative-position clips)
+    GGML_API struct ggml_tensor * ggml_l2_norm_clip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 max_norm,
             float                 eps);
 
     // a - x

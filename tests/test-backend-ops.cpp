@@ -8952,6 +8952,54 @@ struct test_l2_norm : public test_case {
     }
 };
 
+// GGML_OP_L2_NORM_CLIP
+struct test_l2_norm_clip : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float max_norm;
+    const bool v; // a view with a row stride
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, max_norm, v);
+    }
+
+    test_l2_norm_clip(std::array<int64_t, 4> ne = {128, 24, 7, 1}, float max_norm = 5.0f, bool v = false)
+        : ne(ne), max_norm(max_norm), v(v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        if (v) {
+            a = ggml_view_4d(ctx, a, a->ne[0]/2, a->ne[1], a->ne[2], a->ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
+            ggml_set_name(a, "view of a");
+        }
+
+        ggml_tensor * out = ggml_l2_norm_clip(ctx, a, max_norm, 1e-6f);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // rows of growing scale, so that some are clipped and some are not
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            const int64_t n_rows = ggml_nrows(t);
+            std::vector<float> data(ggml_nelements(t));
+            std::mt19937 gen(1234);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            for (int64_t r = 0; r < n_rows; ++r) {
+                const float row_scale = 0.05f + 2.0f*(float) (r % 9)/8.0f;
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    data[r*t->ne[0] + i] = row_scale*dist(gen);
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+    }
+};
+
 // GGML_OP_ACC
 struct test_acc : public test_case {
     const ggml_type type;
@@ -12050,6 +12098,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // Inkling 2's clips: q and k [128, n_head, n_tokens], the relative-position projection [16, n_head, n_tokens]
+    for (int64_t n_tokens : {1, 3, 512}) {
+        test_cases.emplace_back(new test_l2_norm_clip({128, 24, n_tokens, 1}, 5.0f));
+        test_cases.emplace_back(new test_l2_norm_clip({128, 8,  n_tokens, 1}, 5.0f));
+        test_cases.emplace_back(new test_l2_norm_clip({16,  24, n_tokens, 1}, 2.0f));
+    }
+    test_cases.emplace_back(new test_l2_norm_clip({128, 24, 33, 2}, 5.0f, true));
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
