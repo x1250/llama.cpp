@@ -349,10 +349,18 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
         // project r on the bias table first, the attention reads it by distance: [extent + 1, n_head, n_tokens]
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
-
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
+        ggml_tensor * table;
+        if (n_tokens >= 32) {
+            // a prompt batch subtracts the sink in the product: one more row, -1 in the bias and t in r, instead of a pass
+            // over the [extent + 1, n_head, n_tokens] table
+            ggml_tensor * bias = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
+            bias = ggml_concat(ctx0, bias, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, bias->ne[1]), -1.0f), 0);
+            table = ggml_mul_mat(ctx0, bias, ggml_concat(ctx0, Rcur, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens), 0));
+        } else {
+            table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
+        }
         cb(table, "rel_table", il);
 
         sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
