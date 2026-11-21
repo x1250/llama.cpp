@@ -40,6 +40,7 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer RowMap {uint data_row_map[];};
+layout (binding = 5) readonly buffer RowScale {float data_row_scale[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -62,6 +63,7 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint n_experts;
     uint row_ids_offset;
+    uint fusion_flags;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -465,7 +467,7 @@ void main() {
 
                 const u16vec2 row_idx = row_ids[col_i - ic * BN];
                 const uint store_offset = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + row_g;
-                data_d[store_offset] = D_TYPE(sums[tile_idx * CM_ELEMS + e]);
+                data_d[store_offset] = D_TYPE(float(sums[tile_idx * CM_ELEMS + e]) * row_scale(row_idx));
             }
         }
     }

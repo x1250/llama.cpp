@@ -12826,12 +12826,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3, false, true));
 
     for (int bs : {1, 4, 512}) {
-        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 // test with mul after (ffn_moe_weighted)
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1, true));
             }
         }
+    }
+    // the matrix-matrix products of Inkling-2-Mini's experts with the per-row MUL of their scales and router weights
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_NVFP4}) {
+        test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 128, 8, false, 2304, 333, 1152, 1, true));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 128, 8, true,  2304, 333, 2304, 1, true));
     }
 
     for (ggml_type type_a : base_types) {
