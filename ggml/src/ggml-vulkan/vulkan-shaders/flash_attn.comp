@@ -462,6 +462,14 @@ void main() {
             }
         }
 
+        if (REL_ENABLE) {
+            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                    Sf[r][c] += ACC_TYPE(relBias(tile_row(r), j * Bc + c * cols_per_iter + col_tid));
+                }
+            }
+        }
+
         float eMf[rows_per_thread];
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             float rowmaxf = NEG_FLT_MAX_OVER_2;

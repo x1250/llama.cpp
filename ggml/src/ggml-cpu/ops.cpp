@@ -8869,6 +8869,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
+    // ggml_flash_attn_ext_rel: the relative bias table and the query and cell positions
+    const ggml_tensor * rel   = dst->src[6];
+    const ggml_tensor * pos_q = dst->src[7];
+    const ggml_tensor * pos_k = dst->src[8];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8902,6 +8906,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
+
+    GGML_ASSERT(!rel || !kv_rows);
+    const int64_t n_rel = rel ? rel->ne[0] : 0;
 
     // broadcast factors
     const int64_t rk2 = neq2/nek2;
@@ -8973,6 +8980,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
 
+        // the bias row of this query and head, its position and the positions of its stream's cells
+        const float   * rel_row = rel ? (const float *) ((const char *) rel->data + iq2*rel->nb[1] + iq1*rel->nb[2] + iq3*rel->nb[3]) : nullptr;
+        const int32_t   rel_pq  = rel ? *(const int32_t *) ((const char *) pos_q->data + iq1*pos_q->nb[0] + iq3*pos_q->nb[1]) : 0;
+        const int32_t * rel_pk  = rel ? (const int32_t *) ((const char *) pos_k->data + iq3*pos_k->nb[1]) : nullptr;
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -9000,6 +9012,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             }
 
             s += mv; // apply mask
+
+            if (rel_row) {
+                const int64_t d = (int64_t) rel_pq - rel_pk[ic];
+                s += rel_row[d >= 0 && d < n_rel - 1 ? d : n_rel - 1];
+            }
 
             const float Mold = M;
 
@@ -9553,7 +9570,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        // the tiled kernel has no relative bias (ggml_flash_attn_ext_rel)
+        bool use_tiled = !use_ref && !dst->src[6] &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&

@@ -398,6 +398,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_FLASH_ATTN_EXT_REL,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2266,6 +2267,26 @@ extern "C" {
             struct ggml_tensor  * v,
             struct ggml_tensor  * mask,
             struct ggml_tensor  * kv_rows,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+    // same as ggml_flash_attn_ext, plus a per-head relative-position bias read in the kernel, without a dense
+    // [n_kv, n_batch, n_head] bias tensor (Inkling 2):
+    // rel:   [n_rel,   n_head, n_batch, ne3] F32
+    // pos_q: [n_batch, ne3] I32, the positions of the queries
+    // pos_k: [n_kv,    ne3] I32, the positions of the K/V cells (INT32_MAX for an empty cell)
+    // score(kv, h, q, i3) += rel[d, h, q, i3], d = pos_q[q, i3] - pos_k[kv, i3] when it lies in [0, n_rel - 1),
+    // n_rel - 1 otherwise (farther, future and empty cells; the mask still excludes the last two)
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_rel(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * rel,
+            struct ggml_tensor  * pos_q,
+            struct ggml_tensor  * pos_k,
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);

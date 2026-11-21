@@ -9173,6 +9173,114 @@ struct test_leaky_relu : public test_case {
 };
 
 // GGML_OP_FLASH_ATTN_EXT
+// GGML_OP_FLASH_ATTN_EXT_REL
+// flash attention with a per-head relative-position bias read in the kernel (Inkling 2): the bias of a cell is
+// rel[d, head, query] for its distance d = pos_q - pos_k below n_rel - 1, and rel[n_rel - 1] for the farther, future
+// and empty cells. The cells hold positions in order, with a gap and some empty cells, or a rotated ring (the SWA
+// cache); the queries are the last nb positions.
+struct test_flash_attn_ext_rel : public test_case {
+    const int64_t hs;    // K and V head size
+    const int64_t nh;    // num K/V heads
+    const int64_t nr2;   // grouped-query ratio
+    const int64_t kv;    // kv size
+    const int64_t nb;    // batch size
+    const int64_t ns;    // streams
+    const int64_t n_rel; // distances in the table, the last one for every farther cell
+    const ggml_type type_KV;
+    const bool sinks;
+    const bool ring;     // the cells hold the positions rotated, as a sliding-window ring does
+
+    std::string vars() override {
+        return VARS_TO_STR10(hs, nh, nr2, kv, nb, ns, n_rel, type_KV, sinks, ring);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * nh*nr2 * nb * 2*hs * kv * ns;
+    }
+
+    test_flash_attn_ext_rel(int64_t hs = 128, int64_t nh = 8, int64_t nr2 = 3, int64_t kv = 512, int64_t nb = 8, int64_t ns = 1,
+                            int64_t n_rel = 65, ggml_type type_KV = GGML_TYPE_F16, bool sinks = false, bool ring = false)
+        : hs(hs), nh(nh), nr2(nr2), kv(kv), nb(nb), ns(ns), n_rel(n_rel), type_KV(type_KV), sinks(sinks), ring(ring) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hs_padded = GGML_PAD(hs, ggml_blck_size(type_KV));
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs_padded, nb, nh*nr2, ns);
+        ggml_set_name(q, "q");
+
+        // K and V are views of a larger cache
+        ggml_tensor * k0 = ggml_new_tensor_4d(ctx, type_KV, hs_padded, 2*kv, nh, ns);
+        ggml_tensor * v0 = ggml_new_tensor_4d(ctx, type_KV, hs_padded, 2*kv, nh, ns);
+        ggml_tensor * k = ggml_view_4d(ctx, k0, hs_padded, kv, nh, ns, k0->nb[1], k0->nb[2], k0->nb[3], 0);
+        ggml_tensor * v = ggml_view_4d(ctx, v0, hs_padded, kv, nh, ns, v0->nb[1], v0->nb[2], v0->nb[3], 0);
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * rel = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_rel, nh*nr2, nb, ns);
+        ggml_set_name(rel, "rel");
+
+        ggml_tensor * pos_q = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nb, ns);
+        ggml_set_name(pos_q, "pos_q");
+
+        ggml_tensor * pos_k = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, ns);
+        ggml_set_name(pos_k, "pos_k");
+
+        ggml_tensor * out = ggml_flash_attn_ext_rel(ctx, q, k, v, m, rel, pos_q, pos_k, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        if (sinks) {
+            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh*nr2);
+            ggml_set_name(s, "s");
+            ggml_flash_attn_ext_add_sinks(out, s);
+        }
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "pos_k") == 0) {
+                // positions 0..kv-1 with a gap of 7 after the first quarter and every 13th cell empty, or rotated
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t s = 0; s < ns; ++s) {
+                    for (int64_t i = 0; i < kv; ++i) {
+                        const int64_t j = ring ? (i + kv/3 + s) % kv : i;
+                        int32_t p = (int32_t) (j + (j >= kv/4 ? 7 : 0));
+                        if (!ring && i % 13 == 5) {
+                            p = INT32_MAX;
+                        }
+                        data[s*kv + i] = p;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "pos_q") == 0) {
+                // the last nb positions of the cache, so that the distances cover the band and beyond it
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t s = 0; s < ns; ++s) {
+                    for (int64_t i = 0; i < nb; ++i) {
+                        data[s*nb + i] = (int32_t) (kv + 7 - nb + i);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "rel") == 0 || strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_flash_attn_ext : public test_case {
     const int64_t hsk; // K head size
     const int64_t hsv; // V head size
@@ -13254,6 +13362,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {11, 22, 33, 44}, 1, 2, 3, 4, 5, 6, 7, 8, tfrm, circular));
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {11, 22, 33, 44}, 0, 2, 0, 4, 0, 6, 0, 8, tfrm, circular));
         }
+    }
+
+    // GGML_OP_FLASH_ATTN_EXT_REL: Inkling 2's shapes (24 query heads on 8 K/V heads, a 1025-distance table) and a short
+    // table, decode, verification and prompt batches, one and two streams, f16 and q8_0 K/V, a ring of cells, sinks
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 3, 4, 8, 32, 512}) {
+            for (int64_t ns : {1, 2}) {
+                test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2048, nb, ns, 1025, type_KV));
+                test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 512,  nb, ns, 33,   type_KV, false, true));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 1536, 4,   1, 1025, type_KV, true));
+        test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 1536, 256, 1, 1025, type_KV, true));
+        test_cases.emplace_back(new test_flash_attn_ext_rel(64,  4, 1, 300,  7,   1, 17,   type_KV));
     }
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the

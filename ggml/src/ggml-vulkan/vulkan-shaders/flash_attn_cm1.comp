@@ -446,6 +446,18 @@ void main() {
             barrier();
         }
 
+        if (REL_ENABLE) {
+            [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
+                uint32_t c = (idx + tid) / (Br / 4);
+                uint32_t r = (idx + tid) % (Br / 4);
+                if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
+                    const uint32_t kv = j * Bc + c;
+                    sfsh[c * sfshstride + r] += ACC_TYPEV4(relBias(r * 4, kv), relBias(r * 4 + 1, kv), relBias(r * 4 + 2, kv), relBias(r * 4 + 3, kv));
+                }
+            }
+            barrier();
+        }
+
         float eMf[rows_per_thread];
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             const uint r_vec  = tile_row(r) / 4;

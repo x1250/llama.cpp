@@ -19,6 +19,8 @@ layout (constant_id = 13) const uint32_t FaTypeV = 0;
 // sizeof(decode buffer): quants -> ggml block size; F32 -> 16 (decodeBufF32 vec4).
 layout (constant_id = 14) const uint32_t FaBlockBytesK = 2;
 layout (constant_id = 15) const uint32_t FaBlockBytesV = 2;
+// ggml_flash_attn_ext_rel: the distances of the relative bias table, 0 without one
+layout (constant_id = 16) const uint32_t RelN = 0;
 
 const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
@@ -30,6 +32,7 @@ const bool Q_IN_REGS       = (Flags & 32) != 0;
 // coopmat1: subgroups own Q rows, O in coopmat accumulators. K/V staged in LDS, or loaded from global memory with FLIP_DIRECT.
 const bool FLIP            = (Flags & 64) != 0;
 const bool FLIP_DIRECT     = (Flags & 128) != 0;
+const bool REL_ENABLE      = RelN != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -89,6 +92,11 @@ layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
+// ggml_flash_attn_ext_rel: the bias table [RelN, n_head, n_q, n_stream], the query positions [n_q, n_stream] and the
+// K/V cell positions [KV, n_stream]
+layout (binding =  8) readonly buffer REL  {float   data_rel[];};
+layout (binding =  9) readonly buffer POSQ {int32_t data_posq[];};
+layout (binding = 10) readonly buffer POSK {int32_t data_posk[];};
 
 // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, e.g. when computing Mold-M.
 #define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
@@ -233,6 +241,20 @@ void init_indices()
         start_j = min(split_k_index * per_blocks, total_blocks);
         end_j   = min((split_k_index + 1) * per_blocks, total_blocks);
     }
+}
+
+// The relative bias of tile row r against K/V column kv: rel[d, head, query] for a distance d below RelN - 1,
+// rel[RelN - 1] for the farther, future and empty cells. The rows are queries of one head, or with grouped query
+// attention heads of one query, as in perElemOpComputeSlope.
+float relBias(const uint32_t r, const uint32_t kv) {
+    const uint32_t h = iq2 + (r % p.gqa_ratio);
+    const uint32_t q = p.gqa_ratio > 1 ? gqa_iq1 : i * Br + r;
+    if (q >= p.ne2 || kv >= KV) {
+        return 0.0;
+    }
+    const int d = data_posq[iq3 * p.ne2 + q] - data_posk[iq3 * KV + kv];
+    const uint32_t di = d >= 0 && d < int(RelN) - 1 ? uint32_t(d) : RelN - 1;
+    return data_rel[((iq3 * p.ne2 + q) * p.ne1 + h) * RelN + di];
 }
 
 // Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).
