@@ -1902,6 +1902,15 @@ llm_graph_amax_src1 llm_graph_context::build_amax_src1_f16(
     return result;
 }
 
+// the per-expert scale w_s [n_expert] of each selected expert: [1, n_expert_used, n_tokens]
+static ggml_tensor * build_expert_scale(ggml_context * ctx0, ggml_tensor * w_s, ggml_tensor * ids) {
+    const int64_t n_expert = w_s->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
+    s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+    return ggml_get_rows(ctx0, s, ids);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
@@ -1909,6 +1918,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w_s,
           ggml_tensor * slots,
                  bool   cached) const {
+    // the scale is in the graph before the product, so that its MUL follows the MUL_MAT_ID: the backends fuse the two
+    ggml_tensor * s = nullptr;
+    if (w_s) {
+        s = build_expert_scale(ctx0, w_s, ids);
+        ggml_build_forward_expand(gf, s);
+    }
+
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
@@ -1922,12 +1938,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_prec_set_acc(res, GGML_PREC_BF16);
     }
 
-    if (w_s) {
-        const int64_t n_expert = w_s->ne[0];
-        const int64_t n_tokens = cur->ne[2];
-        ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
-        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-        s = ggml_get_rows(ctx0, s, ids);
+    if (s) {
         res = ggml_mul(ctx0, res, s);
     }
     for (const auto & lora : *loras) {
@@ -2580,6 +2591,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
+    // the down projection's expert scales go into the router weights: one pass less over the [n_embd, n_expert_used,
+    // n_tokens] expert outputs, and the weights' MUL follows the projection, which the backends fuse
+    ggml_tensor * down_s = down_exps_s;
+    if (down_s && !weight_before_ffn && !down_exps_b && !post_exp_norm) {
+        weights = ggml_mul(ctx0, weights, build_expert_scale(ctx0, down_s, selected_experts));
+        cb(weights, "ffn_moe_weights_down_scaled", il);
+        ggml_build_forward_expand(gf, weights);
+        down_s = nullptr;
+    }
+
     // compute the expert input before the slot lookup, so that the scheduler prefetches it for the CPU part (the router can read a different tensor)
     ggml_build_forward_expand(gf, cur);
 
@@ -2742,7 +2763,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
-        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, down_exps_s, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
+        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, down_s, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
         cb(experts, "ffn_moe_down", il);
 
@@ -2760,7 +2781,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     return (*static_cast<decltype(build_experts) *>(user_data))(cur, ids, mm_ids, cached);
                 }, &build_experts);
 
-    if (down_exps_s) {
+    if (down_s) {
         cb(experts, "ffn_moe_down_scaled", il);
     }
 
