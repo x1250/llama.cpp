@@ -2034,6 +2034,21 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
+void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const slot_info & sinfo) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    const int64_t n_kv = dst->ne[0];
+    GGML_ASSERT(dst->ne[1] == sinfo.s1 - sinfo.s0 + 1);
+    std::vector<int32_t> data(n_kv * dst->ne[1]);
+    // the streams of the K/V view, in its order
+    for (uint32_t s = sinfo.s0; s <= sinfo.s1; ++s) {
+        const auto & cells = v_cells.at(s);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            data[(s - sinfo.s0)*n_kv + j] = cells.is_empty(j) ? INT32_MAX : cells.pos_get(j);
+        }
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -3139,6 +3154,10 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_relative_pos(dst, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_kv_pos(ggml_tensor * dst) const {
+    kv->set_input_kv_pos(dst, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

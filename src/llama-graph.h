@@ -808,6 +808,12 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // with flash attention the kernel reads the bias by distance (ggml_flash_attn_ext_rel) from the positions of the
+    // tokens and of the cells, instead of the distances above
+    ggml_tensor * self_pos_q      = nullptr; // I32 [n_batch]
+    ggml_tensor * self_kv_pos     = nullptr; // I32 [n_kv,     n_stream], INT32_MAX for an empty cell
+    ggml_tensor * self_kv_pos_swa = nullptr; // I32 [n_kv_swa, n_stream]
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
@@ -1086,6 +1092,13 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
+// the inputs of ggml_flash_attn_ext_rel: a relative bias read by distance in the kernel
+struct llm_graph_attn_rel {
+    ggml_tensor * table; // [n_rel, n_head, n_tokens/n_stream, n_stream]
+    ggml_tensor * pos_q; // [n_tokens/n_stream, n_stream]
+    ggml_tensor * pos_k; // [n_kv, n_stream]
+};
+
 struct llm_graph_context {
     const llama_model & model;
 
@@ -1343,7 +1356,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+      const llm_graph_attn_rel * rel = nullptr) const; // flash attention only
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1550,8 +1564,8 @@ struct llm_graph_context {
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
-            ggml_tensor * sinks, // [n_head_q]
+            ggml_tensor * rel_table, // [n_rel, n_head_q, n_tokens], read by the distance of each cell
+            ggml_tensor * sinks,     // [n_head_q]
                   float   kq_scale,
                     int   il) const;
 
