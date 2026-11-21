@@ -4271,6 +4271,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_residual_f32,  "ssm_conv_residual_f32",  ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -10273,7 +10274,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             switch (ctx->num_additional_fused_ops) {
                 case 0:  return ctx->device->pipeline_ssm_conv_f32;
                 case 1:  return ctx->device->pipeline_ssm_conv_silu_f32;
-                case 2:  return ctx->device->pipeline_ssm_conv_bias_silu_f32;
+                case 2:  return dst->op == GGML_OP_SCALE ? ctx->device->pipeline_ssm_conv_residual_f32 : ctx->device->pipeline_ssm_conv_bias_silu_f32;
                 default: return nullptr;
             }
         }
@@ -11593,17 +11594,21 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     const ggml_tensor * src0 = conv->src[0];
     const ggml_tensor * src1 = conv->src[1];
 
-    // Pick the destination tensor (last node in the fused chain) and the optional bias.
-    // Fusion modes: 0 = ssm_conv, 1 = ssm_conv+silu, 2 = ssm_conv+add(bias)+silu.
+    // Pick the destination tensor (last node in the fused chain) and the optional bias or residual.
+    // Fusion modes: 0 = ssm_conv, 1 = ssm_conv+silu, 2 = ssm_conv+add(bias)+silu or ssm_conv+add(residual)+scale.
     ggml_tensor * dst = conv;
     const ggml_tensor * bias = nullptr;
+    float scale = 1.0f;
 
     if (ctx->num_additional_fused_ops == 1) {
         dst = cgraph->nodes[node_idx + 1]; // silu
     } else if (ctx->num_additional_fused_ops == 2) {
         ggml_tensor * add = cgraph->nodes[node_idx + 1];
         bias = (add->src[0] == conv) ? add->src[1] : add->src[0];
-        dst = cgraph->nodes[node_idx + 2]; // silu
+        dst = cgraph->nodes[node_idx + 2]; // silu or scale
+        if (dst->op == GGML_OP_SCALE) {
+            memcpy(&scale, dst->op_params, sizeof(float));
+        }
     }
 
     // The shader always declares 4 bindings; bind src0 as a dummy when bias isn't fused.
@@ -11618,6 +11623,7 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
         (uint32_t)src0->ne[1],
         (uint32_t)dst->ne[1],
         (uint32_t)dst->ne[2],
+        scale,
     });
 }
 
@@ -15104,6 +15110,34 @@ bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct
     return true;
 }
 
+// SSM_CONV + ADD + SCALE: the ADD's other operand, a tensor of the conv output's shape, and the scale applied as the
+// conv output is written
+bool ggml_vk_can_fuse_ssm_conv_residual(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_SCALE })) {
+        return false;
+    }
+    const ggml_tensor * conv  = cgraph->nodes[node_idx];
+    const ggml_tensor * add   = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * scale = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * residual = (add->src[0] == conv) ? add->src[1] : add->src[0];
+
+    if (conv->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+        residual->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // no broadcast, and the shader indexes the residual as a contiguous tensor of the output's shape
+    if (!ggml_are_same_shape(residual, conv) || !ggml_are_same_shape(add, conv) || !ggml_is_contiguous(residual)) {
+        return false;
+    }
+    float bias;
+    memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+    if (bias != 0.0f) {
+        return false;
+    }
+    // neither binding carries a per-tensor offset
+    return get_misalign_bytes(ctx, residual) == 0 && get_misalign_bytes(ctx, scale) == 0;
+}
+
 bool ggml_vk_can_fuse_topk_moe(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, topk_moe_mode mode) {
 
@@ -15863,6 +15897,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_ssm_conv_residual(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "SSM_CONV_ADD_SCALE";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
             } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "SSM_CONV_BIAS_SILU";
@@ -16384,7 +16424,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
-                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY)) {
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY) &&
+                    // the ADD after an SSM_CONV does not wait for a view of a computed tensor (its residual): the view
+                    // costs nothing, and the ADD would land in the next set, away from the SSM_CONV
+                    !(j > 0 && graph->nodes[j-1]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD &&
+                      is_empty(graph->nodes[c]) && is_computed(graph->nodes[c]))) {
                     ok = false;
                     break;
                 }
@@ -16478,12 +16522,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                         }
                     }
                 }
-                // SSM_CONV + ADD + UNARY: pull the consuming UNARY forward
+                // SSM_CONV + ADD + UNARY or SCALE: pull the consuming UNARY or SCALE forward
                 if (j > 0 &&
                     graph->nodes[j]->op == GGML_OP_ADD &&
                     graph->nodes[j-1]->op == GGML_OP_SSM_CONV) {
                     for (int k = j + 1; k < std::min(j + 15, graph->n_nodes); ++k) {
-                        if (graph->nodes[k]->op == GGML_OP_UNARY &&
+                        if ((graph->nodes[k]->op == GGML_OP_UNARY || graph->nodes[k]->op == GGML_OP_SCALE) &&
                             graph->nodes[k]->src[0] == graph->nodes[j]) {
                             current_set.push_back(k);
                             used[k] = true;

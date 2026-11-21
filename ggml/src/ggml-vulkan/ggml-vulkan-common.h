@@ -215,6 +215,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 bool ggml_vk_is_empty(ggml_tensor * node);
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops);
 bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int num_extra);
+bool ggml_vk_can_fuse_ssm_conv_residual(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
 bool ggml_vk_can_fuse_topk_moe(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, topk_moe_mode mode);
 int ggml_vk_gdn_snapshots_fused_nodes(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
 bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);

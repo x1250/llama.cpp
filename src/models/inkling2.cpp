@@ -220,10 +220,11 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
 
-    ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
-    out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+    ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight); // [n_channels, n_seq_tokens, n_seqs]
 
     if (dynamic) {
+        out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+
         const int64_t n_heads = dynamic->ne[0]/n_conv;
 
         dynamic = ggml_reshape_3d(ctx0, dynamic, n_conv, n_heads, n_tokens);
@@ -239,9 +240,15 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
             out = ggml_add(ctx0, out, term);
         }
+
+        out = ggml_reshape_3d(ctx0, out, n_channels, n_seq_tokens, n_seqs);
     }
 
-    return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+    // the residual and the scale on the convolution's shape, right after it: a backend can apply both as it writes it
+    out = ggml_add(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs), out);
+    out = ggml_scale(ctx0, out, 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+
+    return ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
 }
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
