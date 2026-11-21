@@ -16105,6 +16105,14 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
     int first_unused = 0;
 
+    // a weight, or a node already in new_order (through the views of it)
+    auto const &is_computed = [&](const ggml_tensor * t) -> bool {
+        while (is_empty(t) && t->src[0] != nullptr) {
+            t = t->src[0];
+        }
+        return t->op == GGML_OP_NONE || used_node_set.find(const_cast<ggml_tensor *>(t)) != used_node_set.end();
+    };
+
     // scheduled or zero-compute nodes in [lo, hi)
     auto const &empty_or_scheduled_between = [&](int lo, int hi) -> bool {
         for (int v = lo; v < hi; ++v) {
@@ -16272,6 +16280,14 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
                 return false;
             };
+            // a MUL_MAT_ID whose rows the next node scales (MUL_MAT_ID_MUL) waits until the MUL's other source is
+            // computed, so that the MUL can follow it in the same set; otherwise independent nodes (the router weights)
+            // land between the two and the fusion is lost
+            if (graph->nodes[j]->op == GGML_OP_MUL_MAT_ID && j + 1 < graph->n_nodes &&
+                graph->nodes[j + 1]->op == GGML_OP_MUL && graph->nodes[j + 1]->src[0] == graph->nodes[j] &&
+                !is_computed(graph->nodes[j + 1]->src[1])) {
+                continue;
+            }
             if (match_pattern(topk_moe_early_softmax_norm, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
