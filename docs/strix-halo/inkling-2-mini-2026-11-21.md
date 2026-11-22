@@ -196,7 +196,8 @@ Producción usa 512, el único que entra en el timeout al contexto nativo (-10 %
   - La conversión exacta salvo 5062 subnormales de 28.3 M valores (`ctrl_f16.py`) dio +1.2 % de prefill con ubatch
     2048.
   - Pero la KLD contra el original fue 0.0010: el producto F16 redondea también las activaciones. Descartado.
-- **HIP:** no se evaluó. Los ops nuevos son de CPU y Vulkan; HIP exigiría portar cuatro.
+- **HIP:** no se evaluó. Los ops nuevos son de CPU y Vulkan; HIP exigiría portar cuatro. El backend HIP de Strata para
+  este modelo está leído en la sección 10.
 
 ## 7. Abierto al instalar (cerrado por la desinstalación)
 
@@ -225,8 +226,9 @@ Las velocidades son de llama-bench con KV q8_0, con la base primera y última en
   - A 131k: 522 t/s con ubatch 1024 y con 2048, y 14 TFLOPS en la atención (`fmt-depth.sh`).
 - **La convolución corta con su residual y su escala** (`f533b0cd8`, `conv-check.sh`). Es una fusión SSM_CONV + ADD +
   SCALE en el shader de SSM_CONV. El optimizador de grafo deja pasar el ADD por delante de una vista pendiente de un
-  tensor ya calculado (su residuo): así se funden 156 de las 192 convoluciones de un paso. Las otras 36 son las
-  dinámicas de las capas globales.
+  tensor ya calculado (su residuo): así se funden 156 de las 192 convoluciones de un paso. De las otras 36, 16 son las
+  dinámicas de las capas globales (K y V en las 8 visitas globales: el perfil trae 16 de sus proyecciones por token).
+  Las otras 20 coinciden en número con las visitas SWA sin mensajes; su causa no se investigó.
 - **La cola de los controladores del loop** (`22cac0e76`, `GGML_OP_TANH_BLEND`): `a*(1 - tanh(f)) + b*tanh(g)` en una
   pasada, en vez de seis.
   - Con las dos fusiones, contra el build anterior: decode de 34.8 a 36.5 t/s, y prefill pp2048 de 968 a 1008 t/s con
@@ -825,3 +827,130 @@ la tabla junta las diez corridas de las dos cadenas (`kvq8-op.out`, `kvq8-op-in-
 | 2048 | 88.7-94.3 | 43-46 |
 
 **Queda en disco:** el worktree `llama.cpp-kvq8` (0.7 GB), con su build.
+
+## 10. Las optimizaciones de Strata para este modelo (2026-11-22, estudio sin mediciones)
+
+**Origen:** Strata v0.2.19 (2026-11-22, motor `strata-inkling` 0.1.65) corre Inkling 2 Mini con un backend HIP propio
+y publica para esta máquina cifras sobre las del fork. El Director decidió no mover el modelo a Strata y pidió mirar
+qué hizo.
+- **Leído:** su código en el commit `c6f6427d9` de `Niko1221/Strata`, carpeta `engine/src/inkling2/`: `ink_serve.h`
+  y `hip/ink_hip_backend.hip.cpp`, citados abajo como `serve` y `hip` con su línea. Y su ficha de Hugging Face y las
+  notas de la versión (copias en `strata-study/`).
+- **Contra qué:** los perfiles vigentes del fork, del build de la sección 8.1 (`runs/prof-tg-fuse2.log` y
+  `runs/prof-pp-fuse2.log`). Todas sus ops están en `runs/strata-study-tg-ops.out` y `runs/strata-study-pp-ops.out`
+  (`perf_top.py`).
+- **Nada se midió:** producción siguió cargada, en las pruebas del Director, y el motor de Strata no se instaló.
+
+**Resultado:**
+- **Decode:** su cifra es con un draft que su propio server apaga cuando se muestrea, y producción muestrea. Sin
+  draft no publica cifra para esta máquina.
+- **Prefill:** su cifra no trae el largo del prompt. A igual prompt, la diferencia no está establecida.
+- **Lo que hace mejor y aplica acá:** lanza de 13 a 27 kernels por visita de capa, unos 900 por token; el fork
+  despacha 80 por visita, 3830 por token. Esa cola de despachos chicos es 11.6 de los 30.0 ms de GPU de un token
+  (sección 10.3).
+
+### 10.1 Lo publicado y su protocolo
+
+| | Strata (ficha, Strix Halo 128 GB) | El fork (sección 8.1) |
+|---|---|---|
+| Prefill | 1466 t/s, "the highest measured on that machine", sin largo de prompt; 1654 con 64 peticiones a la vez | pp2048: 1008 t/s con ubatch 512 y 1122 con 2048 |
+| Una petición | 47.3 t/s (SQ-20) y 48.0 (SQ-10), con el draft de árbol W=4 y sin razonamiento | 36.5 t/s, sin draft |
+
+- **El draft exige decodificación greedy.** El server entra al paso especulativo solo con `greedy()`, que es
+  `temperature <= 0` (`serve:66`, `serve:631-634`). Producción muestrea con temperatura 1.0 (sección 0), la misma que
+  recomienda la ficha: con ese muestreo Strata decodifica sin draft.
+- **Sin draft no hay cifra para esta máquina.** En las dos filas que traen las dos, el draft multiplica por 1.43
+  (Olares One: 80.5 y "115+"; RX 7900 XT: "54.7+" y "about 78+"). Con esa razón, 47.3 serían ~33 t/s. Es una
+  inferencia.
+- **El prefill a 2K:** en las tres filas que traen además esa cifra, queda de 10 a 27 % bajo la principal (8722 de
+  11306, 7645 de 10452, 3951 de 4367). Con esa razón, 1466 serían de 1070 a 1330 t/s. Otra inferencia.
+- La ficha lleva un comentario HTML de su autor, sin resolver: añadir la versión y los tamaños de contexto de las
+  cifras.
+
+### 10.2 Lo que hace su backend HIP
+
+| Técnica | En Strata | En el fork | ¿Sirve acá? |
+|---|---|---|---|
+| Pocos kernels por visita | Una visita SWA simple son 13: la mezcla de residuos con su norma (`hip:2498`); Q, K, V, R, G y el sumidero en un producto (`hip:2843`); el par de convoluciones de K y V (`hip:2892`); clips, norma de V, guardado de K/V y sesgo relativo (`hip:2911`); la atención en dos (`hip:2984-2990`); wo con su convolución (`hip:3033`); la mezcla del FFN con su norma (`hip:3062`); el router en dos, el producto y el top-k con sus pesos (`hip:3076-3080`); y los expertos en tres, el último con la convolución (`hip:3099-3109`). Una visita con mensajes suma 11: la mezcla de los mensajes (`hip:3600`), 3 kernels para los controladores de Q, K y V juntos (`hip:2770-2777`), 3 para el del FFN (`hip:2688-2738`), las normas aparte de las mezclas y K y V en productos propios | 80 despachos por visita (3830 en 48) | Sí: sección 10.3 |
+| Replay del paso | Graba el paso de decode como grafo HIP y lo relanza (`hip:2523-2561`); el draft igual (`hip:1095-1245`) | Graba los command buffers en cada grafo | No. Descartado en qwen4exp: se midió que la GPU no espera al host, y reusar los command buffers recuperaría solo los 0.38 ms previos al primer submit (`decode-plan-2026-09-28.md`, sección 2). Sin repetir en este modelo |
+| Tronco en BF16 | Las matrices 2-D grandes van en BF16 (`hip:2016`) y los expertos en su códec de 4 bits | Tronco Q8_0, expertos NVFP4 | No. El decode lee 3708 MB de pesos por token a 202 GB/s, el límite de la máquina; en BF16 el tronco serían 2577 MB en vez de 1369 |
+| Kernel de expertos del prefill | En esta GPU, FP16 WMMA (`hip:3201-3207`); el int8 es solo de RDNA4 (`hip:507`) | MMQ coopmat1: 15.7-17.5 TFLOPS (Q8_0 denso, 24.2) | Sin evidencia. En este fork el coopmat f16 midió más lento que los cuantizados, 15-17 frente a 20-22 TFLOPS (`qwen4exp-cost-breakdown-2026-09-09.md`, sección 11) |
+| Draft de árbol W=4 | Ramas verificadas en un batch, con un modelo de costo que decide cuántos nodos (`hip:1510-1543`). Solo greedy | DSpark lineal, sin adoptar (sección 6) | No con el muestreo de producción |
+
+El conteo es propio, sobre el camino de un token de `forward_batch_chunk` con sus ramas fusionadas: 13 kernels en una
+visita SWA simple y 24 en una con mensajes, 19 y 27 en las capas globales; 924 en las 48 visitas. No es una medición.
+Cuenta un kernel por cada producto que lanza un helper (`launch_bf16_opt`, `launch_f32_linear`, `launch_trunk_linear`,
+sin leer) y no cuenta las copias entre buffers.
+
+### 10.3 Dónde está el costo del fork
+
+**Decode** (30 grafos: 30.02 ms de GPU y 3830 despachos por token):
+- **Productos con pesos Q8_0 y NVFP4:** 449 despachos, 18.39 ms. Leen 3708 MB a 202 GB/s (la máquina da ~210).
+  Solos, serían 54 t/s.
+- **La cola:** 3381 despachos, 11.62 ms. El perfil no nombra tensores: las ops compartidas se reparten por conteo,
+  según el grafo (`src/models/inkling2.cpp` y `build_moe_ffn`).
+
+| Grupo (veces por token) | Ops | Despachos | ms | Strata | Fundido | ms que quitaría |
+|---|---|---|---|---|---|---|
+| Controladores del loop (96) | RMS_NORM ×2, CONCAT, 3 productos BF16, TANH_BLEND | 672 | 2.11 | 6 kernels por visita con mensajes (el fork, 28 despachos) | 1 op por controlador: −576 | 1.0-1.3 |
+| Router, pesos y escalas de los expertos (48) | producto f32, SIGMOID, ADD, ARGSORT, GET_ROWS ×3, SUM_ROWS, SCALE ×2, DIV, REPEAT ×2, MUL | 652 | 1.83 | 2 kernels | ~3 por visita: −500 | 0.9-1.1 |
+| Convoluciones cortas (192) | CONCAT, CPY del estado, SSM_CONV | 576 | 1.42 | Dentro de otros kernels; el par K/V en uno | 1 op por convolución: −384 | 0.7-0.85 |
+| Preparación de la atención (48) | L2_NORM_CLIP ×3, MUL ×2, norma de V, PAD, tabla del sesgo, SUB, FILL, SET_ROWS | 572 | 1.48 | 1 kernel | ~3 por visita: −430 | 0.8-0.95 |
+| Proyecciones Q, K, V, R, G y sumidero (48) | 6 productos Q8_0 (están en los 449 de arriba) | 288 | 5.01 | 1 kernel en la visita SWA simple; 3 en las demás, con K y V aparte | Lo mismo: −184 | 0.3-0.4 |
+
+- **Lo demás de la cola:** DEPTH_ATTN (120 despachos, 2.00 ms; sección 8.3), RMS_NORM_MUL (154, 0.81), la atención
+  (48, 0.56), los taps de las convoluciones dinámicas (192, 0.46), la compuerta de la atención, SiTU y los
+  residuales.
+- **Constantes que se recalculan en cada token:** el PAD de la tabla del sesgo y el FILL de los sumideros. Son 96
+  despachos y 0.25 ms del grupo de la atención. No es algo de Strata: salió al repartir el perfil.
+- **Lo que vale un despacho quitado:** 1.8 µs de reloj (L2_NORM_CLIP: ~1000 despachos menos, de 33.2 a 35.3 t/s) y
+  2.0-2.2 µs de GPU bajo el logger (`runs/strata-study-tg-totals.out`: 5633, 4394 y 3830 despachos en 33.90, 31.13 y
+  30.02 ms). La última columna es despachos por 1.8-2.2 µs.
+- **La suma:** 2074 despachos menos, de 3.7 a 4.6 ms sobre los 27.4 ms de reloj de un token: de 36.5 a 42-44 t/s. Es
+  un techo aritmético. La máquina está limitada por potencia y una palanca puede recuperar menos de lo que quita
+  (`qwen4exp-cost-breakdown-2026-09-09.md`, sección 28.4); el orden real lo da el A/B de cada una.
+
+**Prefill** (un ubatch de 2048 tokens: 1806.8 ms de GPU, 3974 despachos, 1133 t/s):
+
+| Grupo | Despachos | ms | % |
+|---|---|---|---|
+| Expertos NVFP4 (17.5 y 15.7 TFLOPS) | 88 | 682.1 | 37.7 |
+| Productos Q8_0: tronco, 4 capas de expertos y salida (24.2 TFLOPS en Q y G) | 361 | 320.5 | 17.7 |
+| FLASH_ATTN_EXT_REL | 48 | 153.1 | 8.5 |
+| Productos BF16 de los controladores (shader escalar, 2.0-3.2 TFLOPS) | 288 | 94.5 | 5.2 |
+| DEPTH_ATTN | 120 | 65.4 | 3.6 |
+| Productos f32: la tabla del sesgo y el router | 96 | 60.0 | 3.3 |
+| El resto: normas, convoluciones, copias y ops elemento a elemento | 2973 | 431.2 | 23.9 |
+
+- **Los expertos NVFP4** siguen siendo la partida mayor (sección 7). A los 24 TFLOPS del Q8_0 denso serían ~200 ms
+  menos, +13 %. El código de Strata no responde eso: su kernel en esta GPU es FP16.
+- **El resto** son pasadas enteras sobre las activaciones del ubatch. Las fusiones de la tabla del decode quitan
+  pasadas también acá; cuánto, no se estima por despacho: se mide.
+- **Los productos BF16** en F16 ya se midieron: +1.2 % con una KLD de 0.0010, descartado (sección 6).
+
+### 10.4 Candidatos que deja el estudio
+
+Por costo medido en el fork, de mayor a menor. Ninguno está implementado ni medido.
+1. **Los controladores del loop en un op.** Hoy son 7 despachos por controlador (TANH_BLEND ya fundió su cola).
+2. **El router con su top-k, sus pesos normalizados y las escalas de los expertos.**
+3. **La convolución corta con su historia y su estado**, sin el CONCAT ni la copia.
+4. **La preparación de la atención.** Dentro de ella, las dos constantes por token son la parte exacta por
+   construcción y la más barata.
+5. **Q, R, G y el sumidero en un despacho**, y K y V con ellos donde comparten la entrada (las 20 visitas SWA sin
+   mensajes). Ahorra solo despachos (los bytes leídos son los mismos) y pide un op de varias salidas: el más invasivo.
+
+Cada uno es un op nuevo con kernels de CPU y Vulkan, como los que ya rindieron en el decode: L2_NORM_CLIP, 6 %
+(sección 2), y TANH_BLEND con SSM_CONV_ADD_SCALE, 5 % entre las dos (sección 8.1). Entra con su A/B (la base primera y
+última), la KLD y las compuertas de determinismo: eso exige producción descargada. DEPTH_ATTN con workgroups de 1024
+hilos (sección 8.3) sigue abierto y vale 0.7 ms por token.
+
+### 10.5 Sin leer y sin medir
+
+- **Sin leer:** los cuerpos de los kernels fusionados de Strata (`k2_qrkv_kvstore_relpos_fused`,
+  `k_moe_reduce_sconv_add`, `k4_moe_router_topk_f16`, los de los controladores, las atenciones `k3_flash_*`, el de
+  expertos FP16 del prefill) y `forward_tree_verify`. De ellos se usaron el nombre, los argumentos y el lugar del
+  lanzamiento.
+- **Sin medir:** el decode sin draft y el prefill a 2K de Strata en esta máquina. Es lo que cerraría la comparación,
+  y pide producción descargada y su pack (19.35 GB el SQ-20).
+- **Hipótesis:** que un tronco BF16 no pueda ganarle al Q8_0 en decode supone que HIP tiene el mismo techo de ancho
+  de banda que Vulkan en esta memoria.
