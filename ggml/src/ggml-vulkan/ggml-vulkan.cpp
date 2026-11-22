@@ -4266,6 +4266,19 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // one token's states are 9 x n_embd floats at most: 256 threads with subgroup sums, 64 with a shared-memory tree
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_depth_attn_f32, "depth_attn_f32", depth_attn_subgroup_f32_len, depth_attn_subgroup_f32_data, "main", 2 + VK_DEPTH_ATTN_MAX_STATES, sizeof(vk_op_depth_attn_push_constants), {1, 1, 1}, {256, device->subgroup_size}, 1, true, true);
+
+        // a workgroup takes as long as its longest thread, which reads n_embd / threads floats of every state in a row:
+        // 768 threads read Inkling 2 Mini's 2304 in chains of 3 instead of 9, for the batches that leave each token a
+        // shader core (ggml_vk_depth_attn). Only where the device takes that workgroup and its shared memory: the
+        // shader's sums, one per subgroup, and totals
+        const uint32_t wide_threads = 768;
+        const size_t wide_shmem = sizeof(float) * VK_DEPTH_ATTN_MAX_STATES * (1 + VK_DEPTH_ATTN_MAX_QUERY) *
+                                  (wide_threads / device->subgroup_size + 1);
+        if (wide_threads <= device->properties.limits.maxComputeWorkGroupInvocations &&
+            wide_threads <= device->properties.limits.maxComputeWorkGroupSize[0] &&
+            wide_shmem <= device->properties.limits.maxComputeSharedMemorySize) {
+            ggml_vk_create_pipeline(device, device->pipeline_depth_attn_wide_f32, "depth_attn_wide_f32", depth_attn_subgroup_f32_len, depth_attn_subgroup_f32_data, "main", 2 + VK_DEPTH_ATTN_MAX_STATES, sizeof(vk_op_depth_attn_push_constants), {1, 1, 1}, {wide_threads, device->subgroup_size}, 1, true, true);
+        }
     } else {
         ggml_vk_create_pipeline(device, device->pipeline_depth_attn_f32, "depth_attn_f32", depth_attn_f32_len, depth_attn_f32_data, "main", 2 + VK_DEPTH_ATTN_MAX_STATES, sizeof(vk_op_depth_attn_push_constants), {1, 1, 1}, {64, device->subgroup_size}, 1);
     }
@@ -11554,7 +11567,12 @@ void ggml_vk_depth_attn(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_
     const uint32_t n_states = ggml_get_op_params_i32(dst, 0);
     GGML_ASSERT(n_states >= 1 && n_states <= VK_DEPTH_ATTN_MAX_STATES);
 
-    vk_pipeline pipeline = ctx->device->pipeline_depth_attn_f32;
+    // a batch with no more tokens than shader cores (a decode step, a verification batch) gives each workgroup a core
+    // and the wide one's shorter chains pay; a larger batch shares the cores, and a prompt batch is faster with the
+    // narrow. 16 cores where the device does not report them, like the flash attention
+    const uint32_t n_cores = ctx->device->shader_core_count ? ctx->device->shader_core_count : 16;
+    vk_pipeline pipeline = dst->ne[1] <= n_cores && ctx->device->pipeline_depth_attn_wide_f32 ?
+                           ctx->device->pipeline_depth_attn_wide_f32 : ctx->device->pipeline_depth_attn_f32;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     vk_op_depth_attn_push_constants pc {};

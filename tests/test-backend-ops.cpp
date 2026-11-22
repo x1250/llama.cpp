@@ -13659,6 +13659,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_depth_attn(2304, 33, 4, 3, true));
+    // rows shorter than the workgroup of a small batch
+    test_cases.emplace_back(new test_depth_attn(100, 2, 7, 2));
 
     for (int64_t n_tokens : {1, 3, 512}) {
         test_cases.emplace_back(new test_tanh_blend({2304, n_tokens, 1, 1}));
@@ -14653,6 +14655,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 32768, nb, 1, 1025, type_KV));
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 32768, nb, true, true, 0, 0, GGML_PREC_F32, type_KV, type_KV));
         }
+    }
+
+    // Inkling 2 Mini's attention residuals: a layer's input over 4 states, a global layer's Q/K/V inputs and the loop
+    // messages; decode and verification batches, and a prompt ubatch of 512 and of 2048
+    for (int64_t n_tokens : {1, 2, 8, 32, 512, 2048}) {
+        test_cases.emplace_back(new test_depth_attn(2304, n_tokens, 4, 1));
+        test_cases.emplace_back(new test_depth_attn(2304, n_tokens, 4, 3));
+        test_cases.emplace_back(new test_depth_attn(2304, n_tokens, 2, 4));
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
