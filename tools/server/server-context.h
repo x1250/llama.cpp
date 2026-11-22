@@ -152,7 +152,7 @@ private:
             const server_http_req & req,
             server_task_type type,
             const json & data,
-            const std::vector<raw_buffer> & files,
+            const server_prompt_media & media,
             task_response_type res_type,
             const common_chat_session & chat_session = {});
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);

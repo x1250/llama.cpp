@@ -22,7 +22,7 @@ json convert_transcriptions_to_chatcmpl(
     const json & body,
     const common_chat_templates * tmpls,
     const std::map<std::string, uploaded_file> & in_files,
-    std::vector<raw_buffer> & out_files);
+    server_prompt_media & media);
 
 // convert OpenAI speech API format to the /tts format
 json convert_speech_to_tts(const json & body);

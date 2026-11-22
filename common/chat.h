@@ -277,6 +277,7 @@ struct common_chat_templates_inputs {
     bool                                  add_bos = false;
     bool                                  add_eos = false;
     bool                                  force_pure_content = false;
+    std::string                           media_marker; // what stands for a media file in the message contents; empty when they carry none
 };
 
 struct common_chat_prompt_part {
@@ -383,7 +384,8 @@ std::string common_chat_format_single(const struct common_chat_templates * tmpls
                                       const std::vector<common_chat_msg> & past_msg,
                                       const common_chat_msg &              new_msg,
                                       bool                                 add_ass,
-                                      bool                                 use_jinja);
+                                      bool                                 use_jinja,
+                                      const std::string &                  media_marker = "");
 
 // Returns an example of formatted chat
 std::string common_chat_format_example(const struct common_chat_templates *       tmpls,

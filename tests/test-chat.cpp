@@ -7871,8 +7871,9 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
 static void test_inkling2_media_blocks() {
     LOG_DBG("%s\n", __func__);
 
-    // must be the marker used by the server, the split depends on its format
-    const std::string M = get_media_marker();
+    // the marker of these messages, and the published one, which a client can send back as text
+    const std::string M = gen_media_marker();
+    const std::string P = get_media_marker();
     const std::string U = "<|message_user|>";
     const std::string T = "<|content_text|>";
     const std::string E = "<|end_message|>";
@@ -7887,6 +7888,7 @@ static void test_inkling2_media_blocks() {
         common_chat_templates_inputs inputs;
         inputs.messages = { msg };
         inputs.add_generation_prompt = false;
+        inputs.media_marker = M;
         return common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
     };
 
@@ -7896,6 +7898,8 @@ static void test_inkling2_media_blocks() {
     assert_equals(U + M + E + U + M + E + U + T + "a" + E,     render({ M, M, "a" }));
     assert_equals(U + T + "a" + E + U + M + E + U + T + "b" + E, render({ "a", M, "b" }));
     assert_equals(U + T + "a" + E,                             render({ "a" }));
+    assert_equals(U + T + P + E,                               render({ P }));
+    assert_equals(U + M + E + U + T + "a" + P + "b" + E,       render({ M, "a" + P + "b" }));
 }
 
 static void test_template_generation_prompt() {
@@ -8650,9 +8654,9 @@ static void test_reasoning_budget_tokens_per_request() {
         {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
         {"reasoning_budget_tokens", 0},
     };
-    std::vector<raw_buffer> out_files;
-    common_chat_session     out_session;
-    auto llama_params = oaicompat_chat_params_parse(nullptr, body, opt, out_files, out_session);
+    server_prompt_media out_media;
+    common_chat_session out_session;
+    auto llama_params = oaicompat_chat_params_parse(nullptr, body, opt, out_media, out_session);
 
     // The per-request value must win over the server default (-1).
     if (!llama_params.contains("reasoning_budget_tokens")) {
@@ -8684,9 +8688,9 @@ static void test_reasoning_budget_message_per_request() {
         {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
         {"reasoning_budget_message", per_request_message},
     };
-    std::vector<raw_buffer> out_files;
-    common_chat_session     out_session;
-    auto llama_params = oaicompat_chat_params_parse(nullptr, body, opt, out_files, out_session);
+    server_prompt_media out_media;
+    common_chat_session out_session;
+    auto llama_params = oaicompat_chat_params_parse(nullptr, body, opt, out_media, out_session);
 
     // The per-request value must win over the server default.
     if (!llama_params.contains("reasoning_budget_message")) {

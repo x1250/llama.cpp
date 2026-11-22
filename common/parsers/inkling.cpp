@@ -7,16 +7,17 @@ bool is_inkling_template(const std::string & src) {
 
 // the template makes one message block per content part, but a media marker comes inside the text of a message
 // <header><|content_text|>{media}text<|end_message|> --> <header>{media}<|end_message|><header><|content_text|>text<|end_message|>
-static void inkling_split_media(common_chat_prompt & prompt) {
-    const std::string TEXT      = "<|content_text|>";
-    const std::string END       = "<|end_message|>";
-    const std::string MEDIA_BEG = "<__media_";
-    const std::string MEDIA_END = "__>";
+static void inkling_split_media(common_chat_prompt & prompt, const std::string & media_marker) {
+    if (media_marker.empty()) {
+        return;
+    }
+    const std::string TEXT = "<|content_text|>";
+    const std::string END  = "<|end_message|>";
 
     std::vector<common_chat_prompt_part> out;
     for (size_t i = 0; i < prompt.parts.size(); i++) {
         const auto & part = prompt.parts[i];
-        const bool in_text_block = part.is_input && part.text.find(MEDIA_BEG) != std::string::npos &&
+        const bool in_text_block = part.is_input && part.text.find(media_marker) != std::string::npos &&
             !out.empty() && !out.back().is_input && string_ends_with(out.back().text, TEXT) &&
             i + 1 < prompt.parts.size() && !prompt.parts[i + 1].is_input && string_starts_with(prompt.parts[i + 1].text, END);
         const size_t header_pos = in_text_block ? out.back().text.rfind("<|message_") : std::string::npos;
@@ -28,10 +29,9 @@ static void inkling_split_media(common_chat_prompt & prompt) {
 
         std::string rest = part.text;
         for (bool first = true; !rest.empty(); first = false) {
-            const size_t beg      = rest.find(MEDIA_BEG);
-            const size_t end      = beg == std::string::npos ? beg : rest.find(MEDIA_END, beg);
-            const bool   is_media = beg == 0 && end != std::string::npos;
-            const size_t len      = is_media ? end + MEDIA_END.size() : (end == std::string::npos ? rest.size() : beg);
+            const size_t pos      = rest.find(media_marker);
+            const bool   is_media = pos == 0;
+            const size_t len      = is_media ? media_marker.size() : std::min(pos, rest.size());
             if (!first) {
                 out.push_back({ END + header + (is_media ? "" : TEXT), false });
             } else if (is_media) {
@@ -58,7 +58,7 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
 
-    inkling_split_media(data.prompt);
+    inkling_split_media(data.prompt, inputs.media_marker);
 
     const std::string HEADER    = "<|message_model|>";
     const std::string THINK     = "<|content_thinking|>";

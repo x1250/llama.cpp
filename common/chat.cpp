@@ -743,11 +743,13 @@ std::string common_chat_format_single(const struct common_chat_templates * tmpls
                                       const std::vector<common_chat_msg> & past_msg,
                                       const common_chat_msg &              new_msg,
                                       bool                                 add_ass,
-                                      bool                                 use_jinja) {
+                                      bool                                 use_jinja,
+                                      const std::string &                  media_marker) {
     common_chat_templates_inputs inputs;
-    inputs.use_jinja = use_jinja;
-    inputs.add_bos   = tmpls->add_bos;
-    inputs.add_eos   = tmpls->add_eos;
+    inputs.use_jinja    = use_jinja;
+    inputs.add_bos      = tmpls->add_bos;
+    inputs.add_eos      = tmpls->add_eos;
+    inputs.media_marker = media_marker;
 
     std::string fmt_past_msg;
     if (!past_msg.empty()) {
@@ -1543,6 +1545,7 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     params.add_generation_prompt = inputs.add_generation_prompt;
     params.add_bos               = tmpls->add_bos;
     params.add_eos               = tmpls->add_eos;
+    params.media_marker          = inputs.media_marker;
 
     params.continue_final_message = inputs.continue_final_message;
     if (params.continue_final_message != COMMON_CHAT_CONTINUATION_NONE) {

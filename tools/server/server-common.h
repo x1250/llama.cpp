@@ -107,8 +107,10 @@ std::filesystem::path get_server_exec_path();
 std::string random_string();
 std::string gen_chatcmplid();
 std::string gen_tool_call_id();
+std::string gen_media_marker();
 
-// get a random marker; note: each time the server restarts, the marker will be different
+// get the marker of the prompts whose media files are placed by the client (published in /props)
+// note: each time the server restarts, the marker will be different
 const char * get_media_marker();
 
 //
@@ -331,14 +333,23 @@ void handle_media(
         const std::string & media_path,
         bool allow_private_urls = false);
 
+// the media files of a prompt built by the server, and the marker that stands for each of them in its text, in order
+// the marker is drawn for this prompt alone and never published, so no text sent by a client can contain it
+struct server_prompt_media {
+    std::vector<raw_buffer> files;
+    std::string marker = gen_media_marker();
+};
+
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
 // if is_placeholder is true, the media chunk will be treated as placeholder for counting tokens; the output tokens are not usable for actual inference (e.g. for submitting a task to server_queue)
+// each file takes the place of one media_marker in the prompt; any other marker-looking text is tokenized as text
 server_tokens process_mtmd_prompt(
                                         mtmd_context * mctx,
                                         const std::string & prompt,
                                         const std::vector<raw_buffer> & files,
                                          const mtmd_helper_init_opt & init_opt,
-                                          bool is_placeholder = false);
+                                          bool is_placeholder = false,
+                                          const std::string & media_marker = get_media_marker());
 
 // decode one media url (http/file/data-uri) into out_files; throws on failure
 void handle_media(std::vector<raw_buffer> & out_files, const std::string & url, const std::string & media_path, bool allow_private_urls);
@@ -403,7 +414,7 @@ json oaicompat_chat_params_parse(
     const llama_vocab * vocab,
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files,
+    server_prompt_media & media,
     common_chat_session & out_session);
 
 // used by /embeddings endpoint, content has the same format as a chat message content array

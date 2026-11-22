@@ -193,6 +193,10 @@ std::string gen_tool_call_id() {
     return random_string();
 }
 
+std::string gen_media_marker() {
+    return "<__media_" + random_string() + "__>";
+}
+
 const char * get_media_marker() {
     static const std::string marker = []() {
         // allow user to pin a reproducible marker via env var
@@ -200,7 +204,7 @@ const char * get_media_marker() {
         if (env && env[0] != '\0') {
             return std::string(env);
         }
-        return std::string("<__media_") + random_string() + "__>";
+        return gen_media_marker();
     }();
     return marker.c_str();
 }
@@ -1148,7 +1152,8 @@ server_tokens process_mtmd_prompt(
         const std::string & prompt,
         const std::vector<raw_buffer> & files,
         const mtmd_helper_init_opt & init_opt,
-        bool is_placeholder) {
+        bool is_placeholder,
+        const std::string & media_marker) {
     // these will be freed upon going out of scope
     mtmd::bitmaps bitmaps;
     std::vector<mtmd_helper::video_ptr> videos;
@@ -1164,20 +1169,40 @@ server_tokens process_mtmd_prompt(
     }
     // process prompt
     std::vector<server_tokens> inputs;
-    // multimodal
-    mtmd_input_text inp_txt = {
-        prompt.data(),
-        prompt.size(),
-        /* add_special */   true,
-        /* parse_special */ true,
-    };
-    mtmd::input_chunks chunks(mtmd_input_chunks_init());
+    // multimodal: a text part for each piece of text between two markers, a media part in the place of each marker
+    const std::vector<std::string> texts = string_split(prompt, media_marker);
     auto bitmaps_c_ptr = bitmaps.c_ptr();
-    int32_t tokenized = mtmd_tokenize(mctx,
-                                      chunks.ptr.get(),
-                                      &inp_txt,
-                                      bitmaps_c_ptr.data(),
-                                      bitmaps_c_ptr.size());
+    if (texts.size() - 1 != bitmaps_c_ptr.size()) {
+        throw std::runtime_error(string_format(
+            "Failed to tokenize prompt: number of media markers in the prompt (%zu) does not match number of media files (%zu)",
+            texts.size() - 1, bitmaps_c_ptr.size()));
+    }
+    std::vector<mtmd_input_text> inp_txts(texts.size());
+    std::vector<mtmd_input_part> parts;
+    for (size_t i = 0; i < texts.size(); i++) {
+        if (!texts[i].empty()) {
+            inp_txts[i] = {
+                texts[i].data(),
+                texts[i].size(),
+                /* add_special */   true,
+                /* parse_special */ true,
+            };
+            parts.push_back({ &inp_txts[i], nullptr });
+        }
+        if (i < bitmaps_c_ptr.size()) {
+            parts.push_back({ nullptr, bitmaps_c_ptr[i] });
+        }
+    }
+    std::vector<const mtmd_input_part *> parts_c_ptr;
+    for (const auto & part : parts) {
+        parts_c_ptr.push_back(&part);
+    }
+    mtmd::input_chunks chunks(mtmd_input_chunks_init());
+    int32_t tokenized = mtmd_tokenize_from_parts(mctx,
+                                                 chunks.ptr.get(),
+                                                 parts_c_ptr.data(),
+                                                 parts_c_ptr.size(),
+                                                 /* add_special */ true);
     if (tokenized != 0) {
         throw std::runtime_error("Failed to tokenize prompt");
     }
@@ -1411,7 +1436,7 @@ void handle_media(
     }
 }
 // load media files from an OAI content array, then replace each media part with a media marker text part
-static void oaicompat_content_load_media(json & content, const server_chat_params & opt, std::vector<raw_buffer> & out_files) {
+static void oaicompat_content_load_media(json & content, const server_chat_params & opt, server_prompt_media & media) {
     for (auto & p : content) {
         std::string type = json_value(p, "type", std::string());
         if (type == "image_url") {
@@ -1421,10 +1446,10 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
 
             json image_url = json_value(p, "image_url", json::object());
             std::string url = json_value(image_url, "url", std::string());
-            handle_media(out_files, url, opt.media_path, opt.media_allow_private_urls);
+            handle_media(media.files, url, opt.media_path, opt.media_allow_private_urls);
 
             p["type"] = "media_marker";
-            p["text"] = get_media_marker();
+            p["text"] = media.marker;
             p.erase("image_url");
 
         } else if (type == "input_audio") {
@@ -1436,10 +1461,10 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
             json input_audio = json_value(p, "input_audio", json::object());
             std::string url  = json_value(input_audio, "data",
                                     json_value(input_audio, "url", std::string()));
-            handle_media(out_files, url, opt.media_path, opt.media_allow_private_urls);
+            handle_media(media.files, url, opt.media_path, opt.media_allow_private_urls);
 
             p["type"] = "media_marker";
-            p["text"] = get_media_marker();
+            p["text"] = media.marker;
             p.erase("input_audio");
 
         } else if (type == "input_video" || type == "video_url") {
@@ -1451,10 +1476,10 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
             json input_video = json_value(p, type, json::object());
             std::string url  = json_value(input_video, "data",
                                     json_value(input_video, "url", std::string()));
-            handle_media(out_files, url, opt.media_path, opt.media_allow_private_urls);
+            handle_media(media.files, url, opt.media_path, opt.media_allow_private_urls);
 
             p["type"] = "media_marker";
-            p["text"] = get_media_marker();
+            p["text"] = media.marker;
             p.erase("input_video");
             p.erase("video_url");
 
@@ -1469,19 +1494,19 @@ server_tokens tokenize_oai_content_array(const llama_vocab * vocab, mtmd_context
         throw std::invalid_argument("\"content\" must be an array");
     }
 
-    std::vector<raw_buffer> files;
-    oaicompat_content_load_media(content, opt, files);
+    server_prompt_media media;
+    oaicompat_content_load_media(content, opt, media);
 
     std::string prompt;
     for (const auto & p : content) {
         prompt += json_value(p, "text", std::string());
     }
 
-    if (files.empty()) {
+    if (media.files.empty()) {
         return server_tokens(common_tokenize(vocab, prompt, add_special, parse_special), false);
     }
 
-    return process_mtmd_prompt(mctx, prompt, files, init_opt);
+    return process_mtmd_prompt(mctx, prompt, media.files, init_opt, false, media.marker);
 }
 
 // used by /chat/completions endpoint
@@ -1489,7 +1514,7 @@ json oaicompat_chat_params_parse(
     const llama_vocab * vocab,
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files,
+    server_prompt_media & media,
     common_chat_session & out_session)
 {
     json llama_params;
@@ -1576,7 +1601,7 @@ json oaicompat_chat_params_parse(
             throw std::invalid_argument("Expected 'content' to be a string or an array");
         }
 
-        oaicompat_content_load_media(content, opt, out_files);
+        oaicompat_content_load_media(content, opt, media);
     }
 
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
@@ -1655,6 +1680,7 @@ json oaicompat_chat_params_parse(
     }
 
     inputs.force_pure_content = opt.force_pure_content;
+    inputs.media_marker       = media.marker;
 
     // Apply chat template to the list of messages
     common_chat_session_params session_params;

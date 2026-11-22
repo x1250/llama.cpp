@@ -356,7 +356,7 @@ static std::string chat_add_and_format(mtmd_cli_context & ctx, common_chat_msg &
         new_msg.role.c_str(), new_msg.content.c_str());
     auto formatted = common_chat_format_single(ctx.tmpls.get(), ctx.chat_history,
         new_msg, new_msg.role == "user",
-        ctx.use_jinja);
+        ctx.use_jinja, mtmd_default_marker());
     ctx.chat_history.push_back(new_msg);
     return formatted;
 }

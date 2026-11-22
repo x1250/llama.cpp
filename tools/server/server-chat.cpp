@@ -721,13 +721,13 @@ json convert_transcriptions_to_chatcmpl(
         const json & inp_body,
         const common_chat_templates * tmpls,
         const std::map<std::string, uploaded_file> & in_files,
-        std::vector<raw_buffer> & out_files) {
+        server_prompt_media & media) {
     // TODO @ngxson : this function may need to be improved in the future
     // handle input files
-    out_files.clear();
+    media.files.clear();
     auto it = in_files.find("file");
     if (it != in_files.end()) {
-        out_files.push_back(it->second.data);
+        media.files.push_back(it->second.data);
     } else {
         throw std::invalid_argument("No input file found for transcription");
     }
@@ -742,7 +742,7 @@ json convert_transcriptions_to_chatcmpl(
     common_chat_prompt_preset preset = common_chat_get_asr_prompt(tmpls, language, 0.0, prompt);
     if (preset.needs_audio_length) {
         mtmd_helper_media_meta meta;
-        if (mtmd_helper_get_media_meta(out_files[0].data(), out_files[0].size(), mtmd_helper_init_opt_default(), &meta) != 0 ||
+        if (mtmd_helper_get_media_meta(media.files[0].data(), media.files[0].size(), mtmd_helper_init_opt_default(), &meta) != 0 ||
                 meta.type != MTMD_HELPER_MEDIA_TYPE_AUDIO || meta.duration < 0) {
             throw std::invalid_argument("the input file is not a supported audio file");
         }
@@ -754,7 +754,7 @@ json convert_transcriptions_to_chatcmpl(
     if (!language.empty() && !preset.has_language) {
         prompt += string_format(" (language: %s)", language.c_str());
     }
-    prompt = preset.media_first ? get_media_marker() + prompt : prompt + get_media_marker();
+    prompt = preset.media_first ? media.marker + prompt : prompt + media.marker;
 
     json messages = json::array();
     if (!preset.system.empty()) {

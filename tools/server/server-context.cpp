@@ -5343,7 +5343,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
             const json & data,
-            const std::vector<raw_buffer> & files,
+            const server_prompt_media & media,
             task_response_type res_type,
             const common_chat_session & chat_session) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
@@ -5384,7 +5384,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
+            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), media.files, ctx_server.init_opt, false, media.marker));
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
@@ -6021,55 +6021,55 @@ void server_routes::init_routes() {
             tokenized_prompts[0].get_tokens() // TODO: this could maybe be multimodal.
         );
 
-        std::vector<raw_buffer> files; // dummy
+        server_prompt_media media; // dummy
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_INFILL,
             data,
-            files,
+            media,
             TASK_RESPONSE_TYPE_NONE); // infill is not OAI compatible
     };
 
     this->post_completions = [this](const server_http_req & req) {
         auto res = create_response();
-        std::vector<raw_buffer> files; // dummy
+        server_prompt_media media; // dummy
         const json body = json::parse(req.body);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body,
-            files,
+            media,
             TASK_RESPONSE_TYPE_NONE);
     };
 
     this->post_completions_oai = [this](const server_http_req & req) {
         auto res = create_response();
-        std::vector<raw_buffer> files; // dummy
+        server_prompt_media media; // no media files: every marker in the prompt is text
         const json body = json::parse(req.body);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body,
-            files,
+            media,
             TASK_RESPONSE_TYPE_OAI_CMPL);
     };
 
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
-        std::vector<raw_buffer> files;
+        server_prompt_media media;
         json body = json::parse(req.body);
         common_chat_session session;
         json body_parsed = oaicompat_chat_params_parse(
             ctx_server.vocab,
             body,
             meta->chat_params,
-            files,
+            media,
             session);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
-            files,
+            media,
             TASK_RESPONSE_TYPE_OAI_CHAT,
             session);
     };
@@ -6117,7 +6117,7 @@ void server_routes::init_routes() {
 
     this->post_responses_oai = [this](const server_http_req & req) {
         auto res = create_response();
-        std::vector<raw_buffer> files;
+        server_prompt_media media;
         json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
@@ -6126,13 +6126,13 @@ void server_routes::init_routes() {
             ctx_server.vocab,
             body,
             meta->chat_params,
-            files,
+            media,
             session);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
-            files,
+            media,
             TASK_RESPONSE_TYPE_OAI_RESP,
             session);
     };
@@ -6149,12 +6149,12 @@ void server_routes::init_routes() {
             return res;
         }
 
-        std::vector<raw_buffer> files;
+        server_prompt_media media;
         json body = convert_transcriptions_to_chatcmpl(
             json::parse(req.body),
             meta->chat_params.tmpls.get(),
             req.files,
-            files);
+            media);
         SRV_DBG("%s\n", "Request converted: OpenAI Transcriptions -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
         common_chat_session session;
@@ -6162,13 +6162,13 @@ void server_routes::init_routes() {
             ctx_server.vocab,
             body,
             meta->chat_params,
-            files,
+            media,
             session);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
-            files,
+            media,
             TASK_RESPONSE_TYPE_OAI_ASR,
             session);
     };
@@ -6416,7 +6416,7 @@ void server_routes::init_routes() {
 
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
-        std::vector<raw_buffer> files;
+        server_prompt_media media;
         json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
@@ -6425,13 +6425,13 @@ void server_routes::init_routes() {
             ctx_server.vocab,
             body,
             meta->chat_params,
-            files,
+            media,
             session);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
-            files,
+            media,
             TASK_RESPONSE_TYPE_ANTHROPIC,
             session);
     };
@@ -6443,16 +6443,19 @@ void server_routes::init_routes() {
     // same with handle_chat_completions, but without inference part
     this->post_apply_template = [this](const server_http_req & req) {
         auto res = create_response();
-        std::vector<raw_buffer> files; // dummy, unused
+        server_prompt_media media;     // only its marker is used
         common_chat_session session;   // dummy, unused
         json body = json::parse(req.body);
         json data = oaicompat_chat_params_parse(
             ctx_server.vocab,
             body,
             meta->chat_params,
-            files,
+            media,
             session);
-        res->ok({{ "prompt", std::move(data.at("prompt")) }});
+        // the prompt goes back to the client, who places its media files with the published marker
+        std::string prompt = data.at("prompt").get<std::string>();
+        string_replace_all(prompt, media.marker, get_media_marker());
+        res->ok({{ "prompt", std::move(prompt) }});
         return res;
     };
 
@@ -7276,7 +7279,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_tts_impl(const serve
 
 std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const server_http_req & req, task_response_type res_type) {
     auto res = create_response();
-    std::vector<raw_buffer> files;
+    server_prompt_media media;
     json body = json::parse(req.body);
     bool is_oai = false;
 
@@ -7304,7 +7307,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const s
             ctx_server.vocab,
             body,
             meta->chat_params,
-            files,
+            media,
             session);
     json prompt = body_parsed.at("prompt");
     // SRV_DBG("prompt = %s\n", prompt.dump().c_str());
@@ -7315,7 +7318,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const s
         if (!prompt.is_string()) {
             throw std::runtime_error("for mtmd, input prompt must be a string.");
         }
-        n_tokens = process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt, true).size();
+        n_tokens = process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), media.files, ctx_server.init_opt, true, media.marker).size();
     } else {
         n_tokens = tokenize_mixed(ctx_server.vocab, prompt, true, true).size();
     }
