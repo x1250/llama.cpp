@@ -12,6 +12,9 @@ Se instaló como `inkling2mini` en strix-halo. Upstream lo soporta desde b12603,
 este documento registra lo que se cambió, cómo se midió y lo que queda abierto. Las cadenas, los logs y las salidas
 están en `~/ProjectHub/llama.cpp-evidence/inkling2mini/`.
 
+**Desinstalado el 2026-11-22** por decisión del Director: el modelo entra en loops de razonamiento en el uso con agente,
+y el loop es del modelo, no de esta implementación (sección 8).
+
 ## 0. Resultado
 
 **Instalado** como `inkling2mini` en `strix`. Configuración:
@@ -190,7 +193,10 @@ Producción usa 512, el único que entra en el timeout al contexto nativo (-10 %
   - Pero la KLD contra el original fue 0.0010: el producto F16 redondea también las activaciones. Descartado.
 - **HIP:** no se evaluó. Los ops nuevos son de CPU y Vulkan; HIP exigiría portar cuatro.
 
-## 7. Abierto
+## 7. Abierto al instalar (cerrado por la desinstalación)
+
+Lo que quedaba al instalar. Las secciones 8.1 a 8.3 atacaron el prefill a profundidad, los expertos NVFP4 y la cola de
+despachos; la desinstalación cerró el resto sin trabajarlo.
 
 - **El prefill a profundidad:** la atención global corre a 5.7 TFLOPS en el coopmat1 y es dos tercios del ubatch a 131k.
 - **Los expertos NVFP4:** el MMQ coopmat1 corre a 16-18 TFLOPS (Q8_0 denso, 24); es el 35 % del ubatch a contexto corto.
@@ -199,3 +205,89 @@ Producción usa 512, el único que entra en el timeout al contexto nativo (-10 %
 - **La cola de despachos chicos del decode:** unos 5600 por token. Los controladores de mensaje del loop son ~1150, y la
   convolución con su residual y su escala ~960.
 - **DSpark con draft adaptativo** (apagado cuando acepta poco).
+
+## 8. Después de la instalación y desinstalación (2026-11-21/22)
+
+Las velocidades son de llama-bench con KV q8_0, con la base primera y última en la misma cadena.
+
+### 8.1 Adoptado
+
+- **El sesgo relativo en la atención coopmat1 volteada** (`b318a4692`, `flip-check.sh`). FLASH_ATTN_EXT_REL caía en el
+  coopmat1 sin voltear. Con 24 cabezas de consulta sobre 8 de K/V, ese shader corre a un tercio del volteado.
+  - Perf de la atención global a 32k con K/V f16: de 4.6 a 10.3 TFLOPS con ubatch 512 y de 3.7 a 10.0 con 2048. Un KV
+    q8_0 llega por el dequant a f16.
+  - Prefill pp2048 a 32k de profundidad: de 585 a 750 t/s con ubatch 512 y de 651 a 846 con 2048.
+  - A 131k: 522 t/s con ubatch 1024 y con 2048, y 14 TFLOPS en la atención (`fmt-depth.sh`).
+- **La convolución corta con su residual y su escala** (`f533b0cd8`, `conv-check.sh`). Es una fusión SSM_CONV + ADD +
+  SCALE en el shader de SSM_CONV. El optimizador de grafo deja pasar el ADD por delante de una vista pendiente de un
+  tensor ya calculado (su residuo): así se funden 156 de las 192 convoluciones de un paso. Las otras 36 son las
+  dinámicas de las capas globales.
+- **La cola de los controladores del loop** (`22cac0e76`, `GGML_OP_TANH_BLEND`): `a*(1 - tanh(f)) + b*tanh(g)` en una
+  pasada, en vez de seis.
+  - Con las dos fusiones, contra el build anterior: decode de 34.8 a 36.5 t/s, y prefill pp2048 de 968 a 1008 t/s con
+    ubatch 512 y de 1070 a 1122 con 2048 (`fuse2-check.sh`).
+  - Las dos son exactas: la KLD en los modos p y d es idéntica a la del build anterior.
+  - Instaladas y verificadas en producción (`install-fusions.sh`): 33.6 t/s en el server.
+- **La escala del down fuera de los pesos del router con un LoRA** (`34b6627a9`):
+  - El pliegue de la escala por experto (punto 5 de la sección 2) también escalaba el delta de un LoRA sobre
+    `ffn_down_exps`. Ahora el pliegue se omite cuando un adaptador toca la proyección.
+  - Con el LoRA uncensored de AtomicChat sobre el GGUF propio, la KLD contra el modelo sin él es 0.0092 (0.0074 con
+    el pliegue; su ficha da 0.0078). `lora-unc.sh`.
+
+### 8.2 Medido y no adoptado
+
+- **Kernels NVFP4** (rama `inkling-nvfp4-mmvq`, `nvfp4-ab.sh`). Tres cambios:
+  - NVFP4 en el matriz-vector entero (activaciones q8_1).
+  - La escala UE4M3 calculada en el matmul int8 coopmat, en vez de la tabla compartida.
+  - La rama de dos escalas de ese matmul reestructurada.
+
+  En `test-backend-ops perf`, a la forma de un experto con un token, el producto bajó un tercio: gate_up de 67 a 45 µs y
+  down de 39 a 29 µs, cerca de MXFP4 (40 y 24 µs). En el modelo no rindió: decode de 34.8 a 35.0-35.1 t/s, prefill
+  igual, y la KLD algo más alta (0.0019 frente a 0.0018 en el modo d, 0.0033 frente a 0.0031 en el p). La causa probable
+  es que el perf repite los mismos pesos, que quedan en caché, y en el modelo cada experto se lee de la RAM; no se midió
+  el ancho de banda del decode.
+- **Otros formatos de 4 bits para los expertos** (`fmt-depth.sh`, a la forma de los expertos): con 512 y 2048 tokens,
+  IQ4_NL, MXFP4 y Q4_0 tardan 18-22 % menos que NVFP4. Convertirlos sería recuantizar los pesos NVFP4 del checkpoint, con
+  pérdida. No se probó en el modelo.
+
+### 8.3 No terminado
+
+- **DEPTH_ATTN con workgroups de 1024 hilos** cuando hay menos tokens que núcleos (el decode).
+  - En el perfil del decode, cada llamada bajó de 16.9 a 10.9 µs: 1.3 ms frente a 2.0 por token.
+  - La cadena se detuvo para devolver producción y no se completaron la KLD ni el A/B.
+  - El cambio quedó en `depth-attn-wide.patch` en la carpeta de evidencia.
+
+### 8.4 Los loops de razonamiento
+
+El Director vio loops en el uso con agente (pi): el razonamiento repite el mismo bloque hasta el tope de salida. Son del
+modelo:
+- **Ficha de Thinking Machines:** el modelo "a veces se queda atascado en loops largos de razonamiento", sobre todo
+  depurando código. Recomiendan topes de salida y de turnos.
+- **Otro motor:** con el llama.cpp de Unsloth (prebuilt b12588-mix-c0c3de8 Vulkan) y el GGUF horneado de AtomicChat
+  (AD-Q4_K), el modelo hizo los mismos loops.
+- **Reportes de terceros:**
+  - Hilos del repo oficial: en el #7, con pi y SGLang, el razonamiento se degrada a repetición después de varias
+    compactaciones; en el #7 y el #14, loops con los pesos originales en vLLM; en el #16, salidas de más de 65k tokens
+    reescribiendo comandos de bash.
+  - autotrust (`inkling-2-mini-concise`) midió el original con vLLM y un tope de 32k: no terminan el 30 % de las
+    respuestas de LiveCodeBench ni el 11 % de las de GPQA.
+- **Mitigaciones conocidas:**
+  - Topes de salida, esfuerzo bajo y presupuesto de razonamiento.
+  - El loop guard de Maya (`serve/loop_guard.py`): detecta un bloque repetido y escala de una penalización temporal a
+    cerrar el razonamiento.
+  - La edición de rango 1 de autotrust sobre `attn_output` de las capas 18-23: menos generaciones desbocadas, −4.7 en
+    IFBench.
+
+  Ninguna elimina el loop. No se aplicó ninguna.
+
+Maya y el PR de Strata que agrega Inkling (Niko1221/Strata#6506) usan el mismo motor CUDA (`ik2`). No corre en esta GPU
+ni lee los expertos Q4_K y Q5_0 del GGUF de AtomicChat.
+
+### 8.5 Desinstalación
+
+- Se borraron los GGUF (el propio, el UD-Q8_K_XL, los de AtomicChat y los drafters), la descarga parcial del
+  checkpoint original y el prebuilt de Unsloth.
+- Se borraron los worktrees de experimentos (`llama.cpp-fa`, `-relfa`, `-mix`, `-dspark`). Las ramas `inkling-*` siguen.
+- strix-halo revirtió sus entradas en `d42c259`. pi volvió a su configuración anterior y producción volvió a
+  `qwen38flash`.
+- Los parches de las secciones 2 y 8.1 siguen en master, pero ningún modelo de llama-server los usa (CLAUDE.md).
