@@ -12,8 +12,9 @@ Se instaló como `inkling2mini` en strix-halo. Upstream lo soporta desde b12603,
 este documento registra lo que se cambió, cómo se midió y lo que queda abierto. Las cadenas, los logs y las salidas
 están en `~/ProjectHub/llama.cpp-evidence/inkling2mini/`.
 
-**Desinstalado el 2026-11-22** por decisión del Director: el modelo entra en loops de razonamiento en el uso con agente,
-y el loop es del modelo, no de esta implementación (sección 8).
+**Desinstalado el 2026-11-22** por decisión del Director, después de dos fallas del razonamiento en el uso con agente
+(sección 8.4). Las dos se vieron con los pesos sin filtro; el modelo base no llegó a probarse en ese uso, y que las
+fallas sean suyas no quedó demostrado.
 
 ## 0. Resultado
 
@@ -259,26 +260,68 @@ Las velocidades son de llama-bench con KV q8_0, con la base primera y última en
 
 ### 8.4 Los loops de razonamiento
 
-El Director vio loops en el uso con agente (pi): el razonamiento repite el mismo bloque hasta el tope de salida. Son del
-modelo:
-- **Ficha de Thinking Machines:** el modelo "a veces se queda atascado en loops largos de razonamiento", sobre todo
-  depurando código. Recomiendan topes de salida y de turnos.
-- **Otro motor:** con el llama.cpp de Unsloth (prebuilt b12588-mix-c0c3de8 Vulkan) y el GGUF horneado de AtomicChat
-  (AD-Q4_K), el modelo hizo los mismos loops.
+El Director vio dos fallas distintas en el uso con agente (pi). Las dos fueron con pesos sin filtro: el LoRA uncensored
+de AtomicChat sobre el GGUF propio, o su GGUF horneado. El modelo base corrió un solo turno en pi, abortado a mano: no
+quedó probado. Las cifras son de una sesión larga de pi con texto en español (`pi_session_loops.py`,
+`runs/pi-session-loops.out`).
+
+**Loop de bloque** (tres turnos seguidos, de 42k a 60k de contexto, esfuerzo medium):
+- El razonamiento repite líneas enteras: 102 de 185, 137 de 153 y 272 de 338 líneas largas. En los dos últimos la cola
+  repite un bloque exacto, de 2749 y de 673 caracteres.
+- Los dos primeros turnos terminaron solos (9448 y 7352 tokens). El tercero llegó al tope de 16384.
+- pi tenía elegido un modelo de otra familia mientras el servidor era Inkling, así que envió el muestreo de ese modelo
+  (temp 0.7, top_p 0.95, top_k 20) y no el de Inkling (temp 1.0 sin truncar).
+- El contexto de cada turno incluye la salida completa del anterior, razonamiento incluido (42558 + 9448 → 52098). El
+  segundo y el tercero partieron con el loop anterior en el contexto y repitieron casi desde el principio: solo el
+  primero es un inicio independiente.
+- Al elegir Inkling en pi, el razonamiento de esos turnos salió del contexto (pi descarta el de otro modelo; de 76k
+  bajó a 30k). Los 19 turnos siguientes, de 30k a 123k, no repitieron ninguna línea; uno generó 20744 tokens.
+
+**Colapso** (a más de 130k de contexto, esfuerzo xhigh):
+- No es un loop. El razonamiento se deshace en la palabra "casi" traducida a unos 30 idiomas, sin período: el último
+  turno generó 65536 tokens en 63 min, el tope de salida, con 35605 palabras y 7093 distintas.
+- Empieza de a poco. Hay una palabra suelta en el turno que cruza 65536 tokens de contexto y después 11 turnos limpios,
+  de 72k a 123k. Desde el turno que cruza 131072 aparecen en todos: 1, 3, 14, 16, 12 y 85 palabras entre 130k y 159k, y
+  el colapso total a 162.6k.
+- Las palabras quedaron en el texto y en los argumentos de las herramientas, o sea en el contexto de los turnos
+  siguientes: la falla se alimenta sola.
+- 131072 es la mayor profundidad que se midió en esta instalación, y solo en velocidad; la calidad se midió hasta 16k
+  (sección 3). Dos coincidencias con una potencia de 2 no alcanzan para concluir.
+- **Otro build:** el llama.cpp de Unsloth (prebuilt b12588-mix-c0c3de8 Vulkan) con el GGUF horneado de AtomicChat
+  (AD-Q4_K) retomó esa misma conversación a 162.6k y colapsó igual: 433 palabras en 5.6k caracteres de razonamiento.
+  - Descarta los parches del fork para ese estado, y nada más. Los pesos sin filtro, el historial con las palabras, el
+    muestreo y el KV q8_0 eran los mismos.
+  - El prebuilt es otro build de llama.cpp, no otro motor: comparte la implementación de upstream.
+
+**De quién es cada falla:**
+- **Loop de bloque:** es lo que describe la ficha de Thinking Machines y lo que terceros reportan con los pesos
+  originales. En este uso tuvo un solo inicio independiente, con el muestreo de otro modelo, y no volvió en 19 turnos.
+- **Colapso:** no está en la ficha. El reporte más cercano es el del hilo #7, también a gran profundidad. Quedó sin
+  separar de:
+  - Los pesos sin filtro: el LoRA edita también `token_embd`.
+  - El muestreo: el del servidor es temp 1.0 sin truncar, y el que envió pi con Inkling elegido no quedó registrado.
+  - El KV q8_0, la implementación de llama.cpp a más de 131k y el esfuerzo xhigh.
+- El modelo se desinstaló sin separar esas causas. No se probó el base en pi, ni el loop de bloque con el muestreo de
+  Inkling, ni el colapso con los pesos originales o con otro motor.
+
+**Lo que hay publicado:**
+- **Ficha de Thinking Machines:** el modelo "a veces se queda atascado en loops largos de razonamiento, o vuelve a
+  revisar su trabajo sin avanzar", sobre todo depurando código. Recomiendan topes de salida y de turnos. No recomiendan
+  un muestreo.
 - **Reportes de terceros:**
-  - Hilos del repo oficial: en el #7, con pi y SGLang, el razonamiento se degrada a repetición después de varias
-    compactaciones; en el #7 y el #14, loops con los pesos originales en vLLM; en el #16, salidas de más de 65k tokens
-    reescribiendo comandos de bash.
+  - Hilos del repo oficial: en el #7, con pi y SGLang a 256k, el razonamiento se degrada a repetir una palabra después
+    de varias compactaciones; en el #7 y el #14, párrafos repetidos con los pesos originales en vLLM; en el #16,
+    salidas de más de 65k tokens reescribiendo comandos de bash.
   - autotrust (`inkling-2-mini-concise`) midió el original con vLLM y un tope de 32k: no terminan el 30 % de las
     respuestas de LiveCodeBench ni el 11 % de las de GPQA.
 - **Mitigaciones conocidas:**
   - Topes de salida, esfuerzo bajo y presupuesto de razonamiento.
-  - El loop guard de Maya (`serve/loop_guard.py`): detecta un bloque repetido y escala de una penalización temporal a
-    cerrar el razonamiento.
+  - El loop guard de Maya (`serve/loop_guard.py`): detecta un bloque que se repite exacto y escala de una penalización
+    temporal a cerrar el razonamiento. Cubre el loop de bloque; el colapso no tiene período.
   - La edición de rango 1 de autotrust sobre `attn_output` de las capas 18-23: menos generaciones desbocadas, −4.7 en
     IFBench.
 
-  Ninguna elimina el loop. No se aplicó ninguna.
+  Ninguna elimina el loop de bloque. No se aplicó ninguna.
 
 Maya y el PR de Strata que agrega Inkling (Niko1221/Strata#6506) usan el mismo motor CUDA (`ik2`). No corre en esta GPU
 ni lee los expertos Q4_K y Q5_0 del GGUF de AtomicChat.
