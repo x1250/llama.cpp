@@ -562,6 +562,10 @@ ningún efecto en la calidad, y producción muestrea a temperatura 1.0.
 - **El mecanismo en los kernels.** Descartado en el código: el producto de los expertos usa el mismo kernel con uno y
   con dos tokens (`ggml_vk_use_mul_mat_vec_id`, hasta 8 tokens). Candidatos sin verificar: la atención sobre la mayor
   cantidad de celdas de los dos streams, los kernels matriz-vector de dos columnas y el KV q8_0.
+- **Otro caso de la misma clase sí está identificado, a nivel de op** (sección 9.7): cuando los dos slots leen prompt
+  en un mismo ubatch (64 tokens o más de cada uno), la atención global con KV q8_0 corre en otro kernel que con un
+  slot solo y da otros bytes para el mismo stream. No es el de esta medición, donde compartían ubatch tokens sueltos.
+  La rama `vk-fa-flip-q8` lo quita; no está adoptada.
 - **Por qué dos lecturas acompañadas difieren entre sí.**
 - **Si upstream puro lo muestra:** su referencia corrió con un solo slot. El reparto del lote es código de upstream;
   `--decode-share` es del fork.
@@ -703,3 +707,121 @@ el token de control. Apareció al revisar el marcador.
   cada petición. No está diseñado ni medido. Cambia los tokens de todo prompt que cite una etiqueta, y falta medir
   que los demás prompts queden con los mismos tokens de hoy. Pide un build y su ventana de medición, con producción
   descargada: decisión del Director, pendiente.
+
+### 9.7 KV q8_0 en el kernel volteado de la atención (rama `vk-fa-flip-q8`, sin adoptar)
+
+**Origen** (2026-11-22): el Director señaló una publicación sobre el llama.cpp de Unsloth
+(`x.com/bebuu_ai/status/2124495992062177632`) y pidió detectar el parche e implementarlo, sin descargar producción.
+- **Lo que dice:** con Inkling 2 Mini, un caché KV de 8 bits ocupaba más VRAM que uno F16. El kernel de atención no
+  aceptaba K/V cuantizados y llama.cpp caía en un camino más lento, con copias F16 de K y V. Unsloth lo arregló con
+  K/V cuantizados en ese kernel y tres kernels fusionados. Sus cifras, en una B200: prefill +60 %, decode +39 % y el
+  buffer de cómputo a 1M de 9.3 a 2.1 GB, con resultados idénticos bit a bit.
+- **El parche:** el PR #399 de `unslothai/llama.cpp` (commit `7db4a7064`, K/V cuantizados en la atención en banda con
+  sesgo relativo). Es solo de CUDA y no está en upstream.
+
+**En Vulkan el defecto no existe en esa forma** (leído en el código):
+- `supports_op` acepta K/V cuantizados, y un caché q8_0 ocupa menos que uno f16.
+- **El análogo es la copia f16.** Con K/V q8_0, 64 consultas o más y un caché contiguo, cada atención de un ubatch
+  de prompt deshace la cuantización de K y V en un buffer auxiliar (`use_dequant_kv`, `pipeline_dequant_transpose`)
+  y el kernel volteado f16 lee esa copia. En las capas globales son 4096 B por celda: 128 MiB a 32k.
+- **Lo que la copia no toma** iba al kernel sin voltear, que decodifica q8_0 dentro del kernel:
+  - K/V con paso: los dos slots leyendo prompt en un mismo ubatch (dos streams de un caché sin llenar no son
+    contiguos, `is_dense_kv_cache`), y las vistas.
+  - Una copia que no cabe en un buffer: los 4 GiB de n_kv 1048576, las últimas 256 celdas del contexto nativo.
+- **El decode no pasa por aquí:** con menos de 64 consultas no aplican ni la copia ni el kernel volteado.
+
+**El parche** (`9bad70a63`, rama local `vk-fa-flip-q8`, worktree `~/ProjectHub/llama.cpp-kvq8`): el kernel volteado
+deshace la cuantización q8_0 de K y V al cargar sus teselas en LDS, con el redondeo de `dequant_q8_0.comp`. Es el
+mismo módulo, con el tipo de K/V como constante de especialización. Solo en UMA, donde se midió;
+`GGML_VK_DISABLE_FA_FLIP_QUANT=1` vuelve al kernel sin voltear.
+
+**Dos formas medidas.** La primera es el equivalente directo del parche de Unsloth: leer q8_0 en el lugar siempre que
+el kernel volteado aplica, sin copia (`kvq8-in-place-everywhere.diff`, `kvq8-op-in-place-everywhere.out`). Da los
+mismos bytes que la copia en cinco formas. En un caché contiguo de 32k celdas, con un slot:
+
+| Consultas | La copia | En el lugar |
+|---|---|---|
+| 64 | 3.9-4.0 ms | 3.7 ms |
+| 128 | 12.1-12.3 ms | 12.2-12.6 ms |
+| 256 | 20.1-21.4 ms | 20.1-20.4 ms |
+| 512 (producción) | 28.0-34.9 ms | 29.6-30.6 ms |
+| 2048 | 92.8-94.3 ms | 114.1-114.6 ms |
+| Memoria de GPU que agrega la op, con 512 y con 2048 | 138 y 156 MiB | 10 y 28 MiB |
+
+- **Con 2048 consultas es 22 % más lenta.** Con 512 o menos no se separa del ruido de esta medición.
+- **Leído en el código, sin medir el reparto:** la copia deshace la cuantización una vez por op y deja cada cabeza
+  contigua. En el lugar, cada bloque de 64 consultas lee de nuevo los bloques de 34 bytes, con las cabezas
+  intercaladas.
+- **Forma elegida:** la copia conserva todos los casos que ya tomaba, y el kernel lee en el lugar solo los que la
+  copia no toma. No ahorra la memoria de la copia, que es la cifra principal de la publicación: aquí cuesta 128 MiB
+  por cada 32k celdas, y el objetivo en esta máquina es la velocidad.
+
+**Verificación de la forma elegida** (`kvq8-op.sh`, `kvq8-op.out`, `fa_bits.cpp`): a nivel de op, con producción
+cargada y decodificando durante las corridas, y cada paso por la compuerta. "Antes" es el mismo build con
+`GGML_VK_DISABLE_FA_FLIP_QUANT=1`. Ningún reset de anillo; producción siguió arriba.
+- **Tests** (`test-backend-ops` en Vulkan0 contra la CPU, con el parche y antes): FLASH_ATTN_EXT_REL 66 de 66, con
+  casos nuevos en el layout del caché, de uno y de dos streams. FLASH_ATTN_EXT 5693 de 5693, con los mismos 82 casos
+  sin soporte.
+- **Bytes del resultado** de la atención global (24 cabezas de consulta sobre 8 de K/V, la tabla de 1025 distancias).
+  K y V son, como en el server, las primeras celdas de cada stream de un caché más grande:
+
+  | Comparación | Con el parche | Antes |
+  |---|---|---|
+  | Un stream, cinco formas (de 1024 celdas × 64 consultas a 32768 × 2048), contra el kernel f16 sobre los valores ya descuantizados | iguales | iguales (la copia) |
+  | Dos streams (2048 × 512 y 32768 × 256), contra ese kernel f16 | iguales | distintos |
+  | Dos streams: el stream 0 contra la corrida de ese stream solo | iguales | distintos |
+
+  El control: el kernel sin voltear da otros bytes en las siete formas, y con dos streams da los de "antes".
+- **Memoria:** sin cambio. Con un stream la copia sigue (de 230.2 a 368.1 MiB a 32768 × 512, con el parche y antes);
+  con dos streams no la había (de 366.3 a 376.2 MiB).
+- **Velocidad** a 32k celdas, en ms por op, con el camino de antes primero y último:
+
+  | Caso | Antes | Parche | Antes | Parche | Antes |
+  |---|---|---|---|---|---|
+  | Dos slots, 256 consultas cada uno, caché q8_0 | 79.5 | 27.2 | 79.5 | 28.6 | 84.5 |
+  | El mismo con caché f16 (control) | 25.3 | 23.4 | 25.1 | 24.9 | 25.5 |
+  | Vistas con paso, 512 consultas, q8_0 | 75.2 | 21.9 | 57.7 | 30.4 | 59.1 |
+  | Vistas con paso, 2048 consultas, q8_0 | 314.8 | 109.3 | 213.2 | 112.3 | 221.4 |
+  | Un slot, caché q8_0, 512 consultas (la copia en las cinco) | 26.8 | 21.6 | 21.5 | 29.2 | 29.3 |
+  | Un slot, caché q8_0, 2048 consultas (la copia en las cinco) | 93.9 | 87.6 | 99.8 | 91.2 | 90.1 |
+
+  - **Dos slots:** de 2.8 a 3.1 veces más rápida, a 2-5 ms del caché f16. En la cadena de la primera forma el mismo
+    caso midió 62.7-65.1 ms antes y 27.3-27.6 ms después (2.3 veces).
+  - **Un slot:** las cinco corridas toman el mismo camino, así que su dispersión (de 21.5 a 29.3 ms con 512
+    consultas) no es del parche. Su causa no se investigó: el slot 0 de producción decodificaba en todas.
+
+**Lo que cambia en producción si se adopta:**
+- **Un agente a la vez:** nada. El prefill toma el mismo camino, con los mismos bytes y la misma memoria, y el decode
+  no pasa por este kernel.
+- **Dos agentes leyendo prompt a la vez** (64 tokens o más de cada uno en un mismo ubatch): la atención global corre a
+  6.8-9.4 TFLOPS en vez de 2.4-3.9. Cuánto pesa eso en el t/s del modelo no se midió.
+- **El resultado de esa op deja de depender del otro slot.** Antes, con los dos slots en el ubatch, corría en otro
+  kernel y daba otros bytes que el mismo stream solo. Es un mecanismo identificado de la dependencia de la sección
+  9.4, pero no el que se midió allí: allí compartían ubatch tokens sueltos, que no pasan por este kernel.
+- **Margen del anillo a profundidad** (extrapolación lineal desde 32k, sin medir): una atención de 512 consultas
+  sobre 1M de celdas son 32 veces la de 32k. A 2.4-3.9 TFLOPS serían 1.7-2.7 s, alrededor del timeout de 2 s; a
+  6.8-9.4, 0.7-1.0 s (la sección 4 estima ~1.2 s desde la medición a 131k). Vale para los dos slots leyendo prompt a
+  la vez (con la tasa más baja medida, desde unas 775k celdas) y para las últimas 256 celdas del contexto, donde la
+  copia no cabe en un buffer. Ninguna de las dos situaciones se ha dado: lo más profundo medido son 163k.
+
+**Sin medir, pendiente con producción descargada** (decisión del Director):
+- El A/B en el modelo con los dos slots leyendo prompt a la vez, con la base primera y última.
+- Las compuertas de adopción (calidad, determinismo, historia, profundidad) y la memoria a 1M.
+- La copia que no cabe en un buffer (n_kv 1048576): el camino está leído en el código. Una op de ese tamaño no se
+  corrió junto a producción, por el timeout del anillo.
+
+**Observación abierta, fuera del parche:** en el layout del caché a 32k celdas, un stream de 128 o de 256 consultas
+cuesta casi el doble por consulta que uno de 2048 o que dos de 256. Pasa igual con f16 y con q8_0. Por ahí pasan el
+último ubatch de cada prompt y los turnos cortos de un agente. Sin investigar. Las filas f16 no dependen del parche:
+la tabla junta las diez corridas de las dos cadenas (`kvq8-op.out`, `kvq8-op-in-place-everywhere.out`).
+
+| Consultas, caché f16 | ms por op | µs por consulta |
+|---|---|---|
+| 64 | 2.7-4.3 | 42-67 |
+| 128 | 10.7-11.6 | 84-91 |
+| 256 | 20.1-21.8 (una corrida, 13.8) | 79-85 (54) |
+| 2 streams × 256 | 23.4-25.5 | 46-50 |
+| 512 | 28.2-30.0 (una corrida, 21.6) | 55-59 (42) |
+| 2048 | 88.7-94.3 | 43-46 |
+
+**Queda en disco:** el worktree `llama.cpp-kvq8` (0.7 GB), con su build.
