@@ -633,7 +633,7 @@ hace falta para la medición pendiente.
   con ese marcador. Ahí un texto que lo contenga sigue contando como un archivo (`latent-defects.md`).
 - **Superficie:** `tools/server` y `common`, sin tocar mtmd ni libllama. Son archivos de upstream: el parche se
   reaplica en cada merge mientras upstream no cierre el defecto. Sus issues #25285, #27249 y #29118 están cerrados
-  sin arreglo en master; los PR #28249 y #29291 seguían abiertos.
+  sin arreglo en master; el PR #29291, que quita del texto del usuario los marcadores sueltos, seguía abierto.
 
 **Verificación contra el build anterior** (`marker-check.sh`, `marker_check.py`): 2 slots de 32768, cuatro cargas, el
 build anterior (2464) primero y último. Cada server publica un marcador fijado con `LLAMA_MEDIA_MARKER`. Se compara el
@@ -672,6 +672,34 @@ estado HTTP, los tokens de prompt, 16 tokens greedy y sus 4 log-probabilidades m
 - **La sesión del Director:** no se tocó ni se volvió a correr. El marcador que quedó en su historial es ahora
   texto. El caso equivalente medido es el turno de agente de la verificación.
 
-**Registrado sin arreglar** (`latent-defects.md`): el marcador publicado en los caminos crudos, y un defecto vecino
-que apareció al revisar este: una etiqueta de control de la plantilla citada en un mensaje llega al modelo como el
-token de control (`special_in_text.py`, `runs/special-in-text.out`).
+**Registrado sin arreglar** (`latent-defects.md`): el marcador publicado en los caminos crudos, y el defecto vecino
+que sigue.
+
+**Defecto vecino, sin arreglar: las etiquetas de control en el texto del cliente.** El server tokeniza el prompt de
+chat ya renderizado con `parse_special` en todo su texto, el de la plantilla y el del cliente por igual. Una etiqueta
+de la plantilla citada en un mensaje, en un archivo leído o en el resultado de una herramienta llega al modelo como
+el token de control. Apareció al revisar el marcador.
+- **Medido en producción, sin usar slots** (`special_in_text.py`, `runs/special-in-text.out`):
+  - Citadas en un mensaje, `<|end_message|>`, `<|message_model|>` y `<|content_thinking|>` quedan cada una en un
+    token. El contador del chat da los 28 tokens de esa tokenización; como texto son 69.
+  - Un resultado de herramienta con el volcado de `/props`, que trae la plantilla entera: las 26 apariciones de sus
+    12 etiquetas quedan como 26 tokens de control (4036 tokens; como texto, 4345). Dentro del resultado el modelo
+    recibe 7 encabezados de rol (`<|message_…|>`), 8 `<|end_message|>` y 2 `<|content_model_end_sampling|>`. El
+    primero está a 2095 de sus 9753 caracteres.
+- **Ocurrió en la sesión del Director** (`session_tags.py`, `runs/session-tags.out`; solo conteos): la llamada que
+  trajo el marcador trajo también la plantilla, 26 apariciones de las 12 etiquetas en un resultado de herramienta.
+  pi no compactó el historial después. Al contarlo (10:23), las 32 respuestas posteriores se habían generado con
+  esos tokens de control en el prompt, de 72.6k a 97.8k tokens, y todas terminaron sin error. En las otras dos
+  sesiones con respuestas de `inkling2mini` no hay ninguna etiqueta citada.
+- **El efecto en las respuestas no se midió.** Lo que esa sesión muestre después de ese turno no separa al modelo de
+  este defecto.
+- **Upstream:** es su código, para todo modelo. Lo sigue el issue #28249 del mantenedor, abierto: que la plantilla
+  marque qué texto viene del cliente. Sus dos primeros pasos están en master y en este árbol: el prompt renderizado
+  sale en partes con la marca `is_input` (`common_chat_prompt`, `common/chat.h`), y el server las aplana en una
+  cadena (`oaicompat_chat_params_parse`). El tercero, usarlas al tokenizar, es el PR #32033: un borrador del
+  2026-11-10, en conflicto con master, que solo actúa con `--no-chat-input-special`. Su autor advierte que depende
+  de la plantilla. Busca en el texto el marcador publicado: no reemplaza a `9a62394d4`.
+- **Arreglo candidato:** tokenizar por partes, con `parse_special` solo en las de la plantilla, sobre el marcador de
+  cada petición. No está diseñado ni medido. Cambia los tokens de todo prompt que cite una etiqueta, y falta medir
+  que los demás prompts queden con los mismos tokens de hoy. Pide un build y su ventana de medición, con producción
+  descargada: decisión del Director, pendiente.
