@@ -614,9 +614,64 @@ hace falta para la medición pendiente.
   lanzó la herramienta.
 - **Alcance:** es código de upstream, igual en su master (`1fb8a2696`). Vale para todo modelo de llama-server con
   mmproj y para cualquier texto que contenga el marcador del proceso.
-- **Salida de la sesión:** retomarla desde antes de esa llamada. Recargar el server también la destraba según el
-  código, porque el marcador cambia en cada arranque y el del historial queda como texto corriente. No se probó.
-- **Arreglo, sin hacer:** que el texto del cliente no pueda contener el marcador. El lugar es
-  `oaicompat_chat_params_parse`: neutralizarlo en los mensajes y las herramientas de la petición antes de insertar los
-  marcadores de las imágenes. Pide build y recarga de producción, y el server está en la prueba del Director: espera su
-  orden.
+- **Salida de la sesión, sin el arreglo:** retomarla desde antes de esa llamada. Recargar el server también la
+  destraba según el código, porque el marcador cambia en cada arranque y el del historial queda como texto corriente.
+  No se probó.
+
+**Arreglo** (`9a62394d4`, por orden del Director): el marcador es de cada petición.
+- **Diseño:** cada petición de chat lleva sus archivos y un marcador aleatorio propio, que nunca se publica
+  (`server_prompt_media`). El server lo escribe donde va cada imagen, parte el prompt ya renderizado por esa cadena
+  exacta y exige un marcador por archivo (`process_mtmd_prompt`, sobre `mtmd_tokenize_from_parts`). El texto del
+  cliente no lo puede contener, porque no lo conoce. El marcador publicado, dentro de un mensaje, es texto.
+- **El divisor de la plantilla de Inkling** (`common/parsers/inkling.cpp`) tenía el mismo defecto por la forma: sacaba
+  de su bloque de texto cualquier cadena `<__media_…__>`. Ahora parte por el marcador de la petición.
+- **Rutas cubiertas:** `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, sus contadores de tokens y
+  `/v1/completions`, que no recibe archivos. También `/v1/audio/transcriptions` y el contenido con formato OAI de
+  `/embeddings`, sin probar: este modelo no tiene codificador de audio ni se sirve para embeddings.
+- **Lo que queda igual:** `/props` publica `media_marker`. En los caminos crudos (`/completion` con `prompt_string` y
+  `multimodal_data`) es el mecanismo con que el cliente ubica sus archivos, y `/apply-template` devuelve el prompt
+  con ese marcador. Ahí un texto que lo contenga sigue contando como un archivo (`latent-defects.md`).
+- **Superficie:** `tools/server` y `common`, sin tocar mtmd ni libllama. Son archivos de upstream: el parche se
+  reaplica en cada merge mientras upstream no cierre el defecto. Sus issues #25285, #27249 y #29118 están cerrados
+  sin arreglo en master; los PR #28249 y #29291 seguían abiertos.
+
+**Verificación contra el build anterior** (`marker-check.sh`, `marker_check.py`): 2 slots de 32768, cuatro cargas, el
+build anterior (2464) primero y último. Cada server publica un marcador fijado con `LLAMA_MEDIA_MARKER`. Se compara el
+estado HTTP, los tokens de prompt, 16 tokens greedy y sus 4 log-probabilidades más altas.
+
+| Comparación | Casos | Resultado |
+|---|---|---|
+| Build anterior, dos cargas, sin marcador en el texto | 13 | iguales |
+| Build nuevo contra el anterior, sin marcador en el texto | 16 | iguales |
+| Build nuevo: el marcador publicado en el texto, contra la misma cadena sin publicar | 19 | iguales |
+| Build anterior: el marcador publicado en el texto | 6 | 400 en los tres de chat y en `/v1/completions`, 500 en el contador, 200 en `/apply-template` |
+| Build nuevo: el marcador publicado en el texto | 6 | 200 |
+
+- **Sin marcador en el texto:** un chat de texto, un turno de agente con llamadas a herramientas, una imagen, una
+  imagen entre dos textos, tres imágenes, una de 2048x2048, `/v1/completions`, los tres contadores, `/v1/responses`,
+  `/v1/messages`, la transcripción (501 en los dos builds), `/apply-template`, `/completion` crudo con su imagen y un
+  marcador sin su archivo (400 en los dos).
+- **Con el marcador en el texto:** un mensaje, el turno de agente (el marcador en el resultado de una herramienta, en
+  un texto del asistente y en los argumentos de otra llamada), un mensaje con imagen, `/v1/completions`, el contador
+  y `/apply-template`.
+- **El divisor por forma, en el build anterior:** la misma cadena sin publicar daba 65, 427 y 211 tokens de prompt,
+  contra 62, 421 y 208 en el nuevo: quedaba fuera de su bloque de texto.
+
+**Producción** (`marker-install.sh`, build 2466, la forma de la sección 9.5):
+- **Memoria** (`srv_mem.py`): 54.13 GiB al cargar. MemFree no bajó de 33.2 GiB. Ningún reset de anillo.
+- **Checks** (`server_check.py`, `inkling_repeat.py`, `effort_check.py`, `vision_check.py`):
+  - Razonamiento, tool call, caché de prompt, historia y lectura de una imagen: correctos.
+  - Velocidad: 33.3-33.4 t/s una respuesta y 46.1 t/s en total con dos a la vez.
+  - Imagen de 2048x2048 en el slot 1: 8.7 s.
+  - Determinismo: 5 corridas idénticas.
+  - Los seis niveles de razonamiento de pi llegan a la plantilla.
+- **El marcador de ese server en el texto del cliente:** 200 en los seis casos. Los 16 sin marcador dan el mismo
+  estado y los mismos tokens de prompt que en la verificación.
+- **Servidor entregado:** uno sin historia, cargado después de los checks. Con su marcador en un mensaje responde
+  200, a 33.8 t/s.
+- **La sesión del Director:** no se tocó ni se volvió a correr. El marcador que quedó en su historial es ahora
+  texto. El caso equivalente medido es el turno de agente de la verificación.
+
+**Registrado sin arreglar** (`latent-defects.md`): el marcador publicado en los caminos crudos, y un defecto vecino
+que apareció al revisar este: una etiqueta de control de la plantilla citada en un mensaje llega al modelo como el
+token de control (`special_in_text.py`, `runs/special-in-text.out`).
