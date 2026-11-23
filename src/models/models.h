@@ -2490,10 +2490,20 @@ struct llama_model_inkling2 : public llama_model_base {
     llama_model_inkling2(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    bool load_tensors(llama_model_loader & ml) override;
     uint32_t graph_nodes_per_tensor() const override { return 32; }
 
     // the layers stored in the file
     virtual int n_layer_phys() const { return hparams.n_layer(); }
+
+    // constants of the attention that depend on the weights alone, built at load in the buffer type of attn_rel_bias
+    struct attn_const {
+        ggml_tensor * rel_bias = nullptr; // attn_rel_bias and a zero row, the bias of the cells out of the extent
+        ggml_tensor * sinks    = nullptr; // zeros, the relative table carries the sink logit
+    };
+
+    // indexed by physical layer
+    std::vector<attn_const> attn_consts;
 
     // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
     enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };

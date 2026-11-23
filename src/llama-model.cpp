@@ -2547,6 +2547,32 @@ void llama_model_base::load_tensors_hadamard() {
             __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
 }
 
+ggml_backend_buffer_type_t llama_model_base::derived_buft(const ggml_tensor * weight) const {
+    GGML_ASSERT(weight->buffer != nullptr);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+    if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            buft = ggml_backend_dev_buffer_type(dev);
+        }
+    }
+
+    return buft;
+}
+
+ggml_backend_buffer_t llama_model_base::alloc_derived(ggml_context_ptr ctx, ggml_backend_buffer_type_t buft) {
+    ggml_backend_buffer_ptr buf = llama_memory_bufs::alloc_buf(ctx.get(), buft, no_alloc(), "derived weights");
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    ggml_backend_buffer_t res = buf.get();
+
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(std::move(buf));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+
+    return res;
+}
+
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = nullptr;
     if (tn.bid != -1) {

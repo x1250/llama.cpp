@@ -1126,6 +1126,14 @@ struct llama_model_base : public llama_model {
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
 
+    // helper: the buffer type for tensors derived from a weight, the one of the weight
+    // the CPU extra buffer types (e.g. CPU_REPACK) only accept the tensors they repack: the default CPU type instead
+    ggml_backend_buffer_type_t derived_buft(const ggml_tensor * weight) const;
+
+    // helper: allocate the tensors of ctx on buft as weights of the model, a dummy buffer with no_alloc
+    // the caller sets their data after load_tensors() of the base, unless no_alloc
+    ggml_backend_buffer_t alloc_derived(ggml_context_ptr ctx, ggml_backend_buffer_type_t buft);
+
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
 

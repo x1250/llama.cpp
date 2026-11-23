@@ -156,6 +156,67 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
     }
 }
 
+bool llama_model_inkling2::load_tensors(llama_model_loader & ml) {
+    if (!llama_model_base::load_tensors(ml)) {
+        return false;
+    }
+
+    // the constants of a layer go in the buffer type of its attn_rel_bias, one context for each buffer type
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
+
+    attn_consts.resize(n_layer_phys());
+    for (int i = 0; i < n_layer_phys(); ++i) {
+        const ggml_tensor * bias = layers[i].attn_rel_bias;
+        GGML_ASSERT(ggml_is_contiguous(bias));
+
+        auto & ctx = ctx_map[derived_buft(bias)];
+        if (!ctx) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ 2*n_layer_phys()*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ctx.reset(ggml_init(params));
+            if (!ctx) {
+                throw std::runtime_error("inkling2: failed to create the context of the attention constants");
+            }
+        }
+
+        auto & consts = attn_consts[i];
+        consts.rel_bias = ggml_new_tensor_2d(ctx.get(), bias->type, bias->ne[0], bias->ne[1] + 1);
+        consts.sinks    = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, hparams.n_head(i));
+
+        ggml_format_name(consts.rel_bias, "blk.%d.attn_rel_bias.padded", i);
+        ggml_format_name(consts.sinks,    "blk.%d.attn_sinks.zero", i);
+    }
+
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = alloc_derived(std::move(ctx), buft);
+        LLAMA_LOG_INFO("%s: %10s attention constants buffer size = %8.2f MiB\n", __func__,
+                ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+    }
+
+    if (ml.no_alloc) {
+        return true;
+    }
+
+    std::vector<uint8_t> data;
+    for (int i = 0; i < n_layer_phys(); ++i) {
+        const ggml_tensor * bias   = layers[i].attn_rel_bias;
+        const auto        & consts = attn_consts[i];
+
+        // the rows of the bias and a zero row
+        data.assign(ggml_nbytes(consts.rel_bias), 0);
+        ggml_backend_tensor_get(bias, data.data(), 0, ggml_nbytes(bias));
+        ggml_backend_tensor_set(consts.rel_bias, data.data(), 0, data.size());
+
+        data.assign(ggml_nbytes(consts.sinks), 0);
+        ggml_backend_tensor_set(consts.sinks, data.data(), 0, data.size());
+    }
+
+    return true;
+}
+
 std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(params);
 }
@@ -338,7 +399,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * messages, const loop_layer * loop) {
     GGML_ASSERT(!messages == !loop);
 
-    const auto & layer = model.layers[il];
+    const auto & layer  = model.layers[il];
+    const auto & consts = static_cast<const llama_model_inkling2 &>(model).attn_consts[ip];
 
     const bool    is_swa       = hparams.is_swa(il);
     const int64_t n_head       = hparams.n_head(il);
@@ -410,20 +472,17 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         if (n_tokens >= 32) {
             // a prompt batch subtracts the sink in the product: one more row, -1 in the bias and t in r, instead of a pass
             // over the [extent + 1, n_head, n_tokens] table
-            ggml_tensor * bias = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
-            bias = ggml_concat(ctx0, bias, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, bias->ne[1]), -1.0f), 0);
+            ggml_tensor * bias = ggml_concat(ctx0, consts.rel_bias, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, consts.rel_bias->ne[1]), -1.0f), 0);
             table = ggml_mul_mat(ctx0, bias, ggml_concat(ctx0, Rcur, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens), 0));
         } else {
-            table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+            table = ggml_mul_mat(ctx0, consts.rel_bias, Rcur);
             table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
         }
         cb(table, "rel_table", il);
 
-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
-
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il);
+                Qcur, Kcur, Vcur, table, consts.sinks, 1.0f/sqrtf(n_embd_head), il);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
