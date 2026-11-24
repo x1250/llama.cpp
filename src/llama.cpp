@@ -47,6 +47,16 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
     GGML_ABORT("fatal error");
 }
 
+const char * llama_loop_contrast_type_name(enum llama_loop_contrast_type loop_contrast_type) {
+    switch (loop_contrast_type) {
+        case LLAMA_LOOP_CONTRAST_TYPE_LOGITS:
+            return "logits";
+        case LLAMA_LOOP_CONTRAST_TYPE_HIDDEN:
+            return "hidden";
+    }
+    GGML_ABORT("fatal error");
+}
+
 const char * llama_load_mode_name(enum llama_load_mode load_mode) {
     switch (load_mode) {
         case LLAMA_LOAD_MODE_AUTO:

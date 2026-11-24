@@ -435,8 +435,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 }
 
 void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
-    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cur = build_output_norm(cur, blocks);
     res->t_layer_inp[n_layer] = cur;
 
     if (inp_out_ids) {
@@ -446,6 +445,18 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
+    cur = build_head(cur);
+
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+}
+
+ggml_tensor * llama_model_inkling2::graph::build_output_norm(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
+    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
+    return build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+}
+
+ggml_tensor * llama_model_inkling2::graph::build_head(ggml_tensor * cur) {
     // lm_head
     cur = build_lora_mm(model.output, cur);
     ggml_prec_set_acc(cur, GGML_PREC_F32);
@@ -457,10 +468,7 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     }
 
     // drop the padded vocabulary
-    cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
-
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+    return ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
 }
 
 llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {

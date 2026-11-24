@@ -2770,6 +2770,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
     add_opt(common_arg(
+        {"--loop-contrast"}, "F",
+        string_format("looped models: contrast the last pass against the first (LoopCD, arXiv 2610.02185) with strength F, "
+                      "z + F*(z - z_first) on the logits or the hidden states (default: %.2f, 0 = off)", (double) params.loop_contrast),
+        [](common_params & params, const std::string & value) {
+            const float strength = std::stof(value);
+            if (!(strength >= 0.0f)) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.loop_contrast = strength;
+        }
+    ).set_env("LLAMA_ARG_LOOP_CONTRAST"));
+    add_opt(common_arg(
+        {"--loop-contrast-type"}, "{logits,hidden}",
+        string_format("where the loop contrast applies: 'logits' runs the first pass through its own copy of the layers "
+                      "after the loop (more compute and memory), 'hidden' contrasts the states that enter them (default: %s)",
+                      llama_loop_contrast_type_name(params.loop_contrast_type)),
+        [](common_params & params, const std::string & value) {
+            if (value == "logits") {
+                params.loop_contrast_type = LLAMA_LOOP_CONTRAST_TYPE_LOGITS;
+            } else if (value == "hidden") {
+                params.loop_contrast_type = LLAMA_LOOP_CONTRAST_TYPE_HIDDEN;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_LOOP_CONTRAST_TYPE"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

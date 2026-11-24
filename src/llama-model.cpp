@@ -3367,7 +3367,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_idx = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
                         };
-                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP || arch == LLM_ARCH_ZAYA1) {
+                    } else if (arch == LLM_ARCH_INKLING2_LOOP) {
+                        // the first pass's copy of the coda is kept only for the logits loop contrast
+                        const auto * lm = static_cast<const llama_model_inkling2_loop *>(this);
+                        filter_attn = [lm, &cparams](uint32_t il) { return lm->uses_slot(il, cparams); };
+                        filter_recr = [lm, &cparams](uint32_t il) { return lm->uses_slot(il, cparams); };
+                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_ZAYA1) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {

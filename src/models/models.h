@@ -2530,6 +2530,10 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        // the final depth mix of the blocks and cur, normalized, all rows
+        ggml_tensor * build_output_norm(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        // the head over normalized states: the logits of the unpadded vocabulary
+        ggml_tensor * build_head(ggml_tensor * cur);
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_attn_kv_iswa        * attn = nullptr;
@@ -2542,7 +2546,8 @@ struct llama_model_inkling2 : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
-// the cache slots after the physical layers repeat the core [core_start, core_end) for each later pass
+// the cache slots after the physical layers repeat the core [core_start, core_end) for each later pass, then the coda
+// [core_end, n_phys) once more for the first pass, which the logits loop contrast runs through it
 struct llama_model_inkling2_loop : public llama_model_inkling2 {
     llama_model_inkling2_loop(const struct llama_model_params & params) : llama_model_inkling2(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -2550,6 +2555,12 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
 
     int n_layer_phys() const override { return n_phys; }
     int layer_phys(int il) const;
+    // the cache slot of coda layer ip in the first pass's copy
+    int first_coda_slot(int ip) const;
+    // whether a context with these parameters contrasts the last pass against the first where type says
+    bool contrasts(const llama_cparams & cparams, llama_loop_contrast_type type) const;
+    // whether a context with these parameters keeps the memory of cache slot il
+    bool uses_slot(int il, const llama_cparams & cparams) const;
 
     int      n_phys     = 0;
     uint32_t core_start = 0;
@@ -2563,6 +2574,8 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
 
     struct graph : public llama_model_inkling2::graph {
         graph(const llm_graph_params & params);
+        // the last pass's value moved away from the first pass's by the loop contrast's strength
+        ggml_tensor * contrast(ggml_tensor * last, ggml_tensor * first);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

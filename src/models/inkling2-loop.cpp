@@ -1,7 +1,26 @@
 #include "models.h"
 
 int llama_model_inkling2_loop::layer_phys(int il) const {
-    return il < n_phys ? il : core_start + (il - n_phys) % (core_end - core_start);
+    const int core_slots_end = first_coda_slot(core_end);
+    if (il < n_phys) {
+        return il;
+    }
+    if (il < core_slots_end) {
+        return core_start + (il - n_phys) % (core_end - core_start);
+    }
+    return core_end + (il - core_slots_end);
+}
+
+int llama_model_inkling2_loop::first_coda_slot(int ip) const {
+    return n_phys + (n_passes - 1)*(core_end - core_start) + (ip - core_end);
+}
+
+bool llama_model_inkling2_loop::contrasts(const llama_cparams & cparams, llama_loop_contrast_type type) const {
+    return cparams.loop_contrast > 0.0f && cparams.loop_contrast_type == type && n_passes > 1;
+}
+
+bool llama_model_inkling2_loop::uses_slot(int il, const llama_cparams & cparams) const {
+    return il < first_coda_slot(core_end) || contrasts(cparams, LLAMA_LOOP_CONTRAST_TYPE_LOGITS);
 }
 
 void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
@@ -21,7 +40,7 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error(format("inkling2_loop: invalid loop core [%u, %u) with block size %u, %u passes or gate rank %u for %d layers",
                 core_start, core_end, block, n_passes, gate_rank, n_phys));
     }
-    const size_t n_slot = n_phys + (size_t) (n_passes - 1)*(core_end - core_start);
+    const size_t n_slot = n_phys + (size_t) (n_passes - 1)*(core_end - core_start) + (n_phys - core_end);
     if (n_slot > LLAMA_MAX_LAYERS) {
         throw std::runtime_error(format("inkling2_loop: %zu cache slots exceed the maximum of %d", n_slot, LLAMA_MAX_LAYERS));
     }
@@ -85,6 +104,9 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     // every pass starts from the prelude output
     auto * prelude = cur;
     const auto prelude_blocks = blocks;
+    // the first pass's output and blocks: the weak prediction of the loop contrast
+    ggml_tensor * first = nullptr;
+    std::vector<ggml_tensor *> first_blocks;
     for (uint32_t pass = 0; pass < m.n_passes; ++pass) {
         // the bank of the previous pass: its blocks after the first core block, and its output
         std::vector<ggml_tensor *> bank;
@@ -92,6 +114,10 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
         if (pass > 0) {
             bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
             bank_out = cur;
+            if (pass == 1) {
+                first = cur;
+                first_blocks = blocks;
+            }
             cur = prelude;
             blocks = prelude_blocks;
         }
@@ -106,8 +132,33 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
         }
     }
 
+    if (m.contrasts(cparams, LLAMA_LOOP_CONTRAST_TYPE_HIDDEN)) {
+        // the states that enter the coda: the output and the blocks after the first core block, which every pass shares
+        for (size_t i = prelude_blocks.size() + 1; i < blocks.size(); ++i) {
+            blocks[i] = contrast(blocks[i], first_blocks[i]);
+        }
+        cur = contrast(cur, first);
+    }
+
     for (int il = end; il < m.n_phys; ++il) {
         cur = build_layer(il, il, cur, blocks);
     }
     build_output(cur, blocks);
+
+    if (m.contrasts(cparams, LLAMA_LOOP_CONTRAST_TYPE_LOGITS)) {
+        // the first pass through its own copy of the coda, which keeps that stream's KV and convolution state
+        for (int ip = end; ip < m.n_phys; ++ip) {
+            first = build_layer(m.first_coda_slot(ip), ip, first, first_blocks);
+        }
+        first = build_output_norm(first, first_blocks);
+        if (inp_out_ids) {
+            first = ggml_get_rows(ctx0, first, inp_out_ids);
+        }
+        res->t_logits = contrast(res->t_logits, build_head(first));
+        cb(res->t_logits, "result_output_contrast", -1);
+    }
+}
+
+ggml_tensor * llama_model_inkling2_loop::graph::contrast(ggml_tensor * last, ggml_tensor * first) {
+    return ggml_add(ctx0, last, ggml_scale(ctx0, ggml_sub(ctx0, last, first), cparams.loop_contrast));
 }

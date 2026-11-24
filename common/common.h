@@ -619,6 +619,9 @@ struct common_params {
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
 
+    float                         loop_contrast      = 0.0f; // strength of the loop contrast of a looped model, 0 = off
+    enum llama_loop_contrast_type loop_contrast_type = LLAMA_LOOP_CONTRAST_TYPE_LOGITS;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

@@ -177,7 +177,8 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
-    LOG("  -h, --help               Show this help message\n\n");
+    LOG("  --loop-contrast          Check the loop contrast of inkling2_loop against the model with one pass (CPU only)\n");
+    LOG("  -h, --help              Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
     LOG("  %s -a qwen35moe\n", argv[0]);
@@ -1904,6 +1905,134 @@ static int test_kv_shift(const std::string & arch_filter, const size_t seed, con
     return n_failed == 0 ? 0 : 1;
 }
 
+// the logits of every position on the CPU: the first half of the tokens in one batch, then one token per batch, so that
+// the later positions read the KV and convolution state the earlier batches left; state_size receives the context's
+// state size after the last batch
+static std::vector<float> get_logits_loop_contrast(
+        llama_model * model, const std::vector<llama_token> & tokens, float strength, llama_loop_contrast_type type, size_t & state_size) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_tokens = tokens.size();
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx              = 0;
+    ctx_params.n_threads          = 4;
+    ctx_params.n_threads_batch    = 4;
+    ctx_params.n_ubatch           = 64;
+    ctx_params.loop_contrast      = strength;
+    ctx_params.loop_contrast_type = type;
+
+    llama_context_ptr lctx(llama_init_from_model(model, ctx_params));
+    if (!lctx) {
+        throw std::runtime_error("failed to create llama context");
+    }
+
+    std::vector<float> ret;
+    ret.reserve((size_t) n_tokens*n_vocab);
+    common_batch batch(lctx.get());
+    for (uint32_t pos = 0; pos < n_tokens; ) {
+        const uint32_t n_batch = pos == 0 ? n_tokens/2 : 1;
+        batch.clear();
+        for (uint32_t i = 0; i < n_batch; i++) {
+            batch.add(tokens[pos + i], pos + i, 0, true);
+        }
+        if (llama_process(lctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode batch");
+        }
+        for (uint32_t i = 0; i < n_batch; i++) {
+            const float * logits_ith = llama_get_logits_ith(lctx.get(), i);
+            ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+        }
+        pos += n_batch;
+    }
+    state_size = llama_state_get_size(lctx.get());
+    return ret;
+}
+
+// the loop contrast of inkling2_loop on the CPU. The logits contrast must give last + strength*(last - first), with
+// first the logits of the same weights with one pass, whose coda keeps its own KV and convolution state, and only it
+// keeps the memory of the first pass's coda. The hidden contrast must move the logits and keep the memory as it is.
+static int test_loop_contrast(const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const llm_arch arch     = LLM_ARCH_INKLING2_LOOP;
+    const float    strength = 0.5f;
+
+    gguf_context_ptr gguf_loop = get_gguf_ctx(arch, true);
+    gguf_context_ptr gguf_one  = get_gguf_ctx(arch, true);
+    gguf_set_val_u32 (gguf_one.get(), llama_arch_kv_name(arch, LLM_KV_LOOP_COUNT).c_str(),   1);
+    gguf_set_val_bool(gguf_one.get(), llama_arch_kv_name(arch, LLM_KV_LOOP_VARYING).c_str(), true);
+
+    int n_failed = 0;
+    auto check = [&](const char * what, bool ok, const std::string & detail) {
+        LOG("%-48s %-40s %s\n", what, detail.c_str(), ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m");
+        n_failed += !ok;
+    };
+    try {
+        llama_model_ptr model_loop = get_model(gguf_loop.get(), nullptr, seed, stdev, {});
+        llama_model_ptr model_one  = get_model(gguf_one.get(),  nullptr, seed, stdev, {});
+
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_loop.get()));
+        const std::vector<llama_token> tokens = get_tokens(48, n_vocab, seed);
+
+        size_t size_off;
+        size_t size_one;
+        size_t size_logits;
+        size_t size_hidden;
+        const std::vector<float> last   = get_logits_loop_contrast(model_loop.get(), tokens, 0.0f,     LLAMA_LOOP_CONTRAST_TYPE_LOGITS, size_off);
+        const std::vector<float> first  = get_logits_loop_contrast(model_one.get(),  tokens, 0.0f,     LLAMA_LOOP_CONTRAST_TYPE_LOGITS, size_one);
+        const std::vector<float> logits = get_logits_loop_contrast(model_loop.get(), tokens, strength, LLAMA_LOOP_CONTRAST_TYPE_LOGITS, size_logits);
+        const std::vector<float> hidden = get_logits_loop_contrast(model_loop.get(), tokens, strength, LLAMA_LOOP_CONTRAST_TYPE_HIDDEN, size_hidden);
+
+        // in the graph's order of operations: sub, scale, add
+        std::vector<float> expected(last.size());
+        for (size_t i = 0; i < last.size(); i++) {
+            expected[i] = last[i] + (last[i] - first[i])*strength;
+        }
+
+        const double nmse_logits = nmse(expected, logits);
+        const double nmse_moved  = nmse(last, logits);
+        const double nmse_hidden = nmse(last, hidden);
+
+        check("logits contrast = last + s*(last - one pass)", nmse_logits == 0.0, string_format("nmse %.2e", nmse_logits));
+        check("logits contrast moves the logits",             nmse_moved  > 1e-6, string_format("nmse %.2e", nmse_moved));
+        check("hidden contrast moves the logits",             nmse_hidden > 1e-6, string_format("nmse %.2e", nmse_hidden));
+        check("only the logits contrast adds state",          size_logits > size_off && size_hidden == size_off,
+              string_format("off %zu, logits %zu, hidden %zu", size_off, size_logits, size_hidden));
+    } catch (const std::exception & err) {
+        LOG("\033[1;31mERROR\033[0m (%s)\n", err.what());
+        n_failed++;
+    }
+
+    if (n_failed == 0) {
+        LOG("Summary: all checks passed\n");
+    } else {
+        LOG("Summary: %d check(s) failed\n", n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1918,6 +2047,7 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool kv_shift = false;
+    bool loop_contrast = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1987,6 +2117,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[i], "--kv-shift") == 0) {
             kv_shift = true;
+        } else if (strcmp(argv[i], "--loop-contrast") == 0) {
+            loop_contrast = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -2007,6 +2139,9 @@ int main(int argc, char ** argv) {
         }
         if (kv_shift) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
+        }
+        if (loop_contrast) {
+            return test_loop_contrast(seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {

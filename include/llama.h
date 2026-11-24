@@ -198,6 +198,14 @@ extern "C" {
 
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
 
+    // the contrast of a looped model's last pass against its first (LoopCD, arXiv 2610.02185)
+    enum llama_loop_contrast_type {
+        LLAMA_LOOP_CONTRAST_TYPE_LOGITS = 0, // the logits, the first pass through its own copy of the layers after the loop
+        LLAMA_LOOP_CONTRAST_TYPE_HIDDEN = 1, // the hidden states that enter the layers after the loop
+    };
+
+    LLAMA_API const char * llama_loop_contrast_type_name(enum llama_loop_contrast_type loop_contrast_type);
+
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE   = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
@@ -408,6 +416,9 @@ extern "C" {
 
         size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
+
+        float                         loop_contrast;      // strength of the loop contrast of a looped model, 0 = off [EXPERIMENTAL]
+        enum llama_loop_contrast_type loop_contrast_type; // where the loop contrast applies
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

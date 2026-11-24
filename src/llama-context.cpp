@@ -379,6 +379,16 @@ llama_context::llama_context(
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
 
+    cparams.loop_contrast      = params.loop_contrast;
+    cparams.loop_contrast_type = params.loop_contrast_type;
+    if (!(cparams.loop_contrast >= 0.0f)) {
+        throw std::runtime_error("loop_contrast must be >= 0");
+    }
+    if (cparams.loop_contrast > 0.0f && model.arch != LLM_ARCH_INKLING2_LOOP) {
+        LLAMA_LOG_WARN("%s: loop_contrast is ignored, the model has no loop\n", __func__);
+        cparams.loop_contrast = 0.0f;
+    }
+
     // resolved after flash attention, see resolve_fused_ops()
     {
         cparams.fused_kv_rows = false;
@@ -441,6 +451,9 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    if (cparams.loop_contrast > 0.0f) {
+        LLAMA_LOG_INFO("%s: loop_contrast         = %g (%s)\n", __func__, cparams.loop_contrast, llama_loop_contrast_type_name(cparams.loop_contrast_type));
+    }
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
@@ -4426,6 +4439,8 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_cpu_share         =*/ 0.0f,
+        /*.loop_contrast               =*/ 0.0f,
+        /*.loop_contrast_type          =*/ LLAMA_LOOP_CONTRAST_TYPE_LOGITS,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
