@@ -2338,7 +2338,7 @@ extern "C" {
             struct ggml_tensor  * g);
 
     // for each group c: mul_mat(w[c], concat(rms_norm(a_c), rms_norm(b_c), 0)), with a_c the group c of a, or its only
-    // group; the products in F32 (the activations are not rounded to BF16)
+    // group; the products as mul_mat's, which may round the activations to BF16 (the CPU does, Vulkan does not)
     // used in inkling 2 (the gates of the loop controllers: a the layer inputs, b the cross-pass messages)
     // a:      [n_embd, n_tokens, 1 or n] F32, contiguous rows
     // b:      [n_embd, n_tokens, n] F32, contiguous rows
@@ -2353,7 +2353,7 @@ extern "C" {
             float                 eps);
 
     // for each group c: tanh_blend(a_c, b_c, mul_mat(wf[c], x_c), mul_mat(wg[c], x_c)), with a_c the group c of a, or
-    // its only group; the products in F32
+    // its only group; the products as mul_mat's, which may round the activations to BF16
     // used in inkling 2 (the loop controllers, x their gates)
     // a:      [n_embd, n_tokens, 1 or n] F32, contiguous rows
     // b:      [n_embd, n_tokens, n] F32, contiguous rows

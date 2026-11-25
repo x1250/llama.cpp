@@ -9633,6 +9633,11 @@ struct test_rms_norm_concat_mul_mat : public test_case {
         return out;
     }
 
+    // the products round the activations to BF16 on some backends, as mul_mat's
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
         loop_control_initialize(ctx);
     }
@@ -9676,6 +9681,11 @@ struct test_tanh_blend_mul_mat : public test_case {
         ggml_set_name(out, "out");
 
         return out;
+    }
+
+    // the products round the activations to BF16 on some backends, as mul_mat's
+    double max_nmse_err() override {
+        return 5e-4;
     }
 
     void initialize_tensors(ggml_context * ctx) override {

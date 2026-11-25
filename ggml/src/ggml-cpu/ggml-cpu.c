@@ -2974,8 +2974,14 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_RMS_NORM_CONCAT_MUL_MAT:
                     {
-                        // the concatenation of the two normalized rows
-                        cur = ggml_type_size(GGML_TYPE_F32) * 2 * node->src[0]->ne[0] * n_tasks;
+                        // the normalized rows of every (token, group) in BF16, then the two rows of each thread in F32
+                        cur = ggml_type_size(GGML_TYPE_BF16) * 2 * node->src[0]->ne[0] * node->ne[1] * node->ne[2] +
+                              ggml_type_size(GGML_TYPE_F32) * (2 * node->src[0]->ne[0] + CACHE_LINE_SIZE_F32) * n_tasks;
+                    } break;
+                case GGML_OP_TANH_BLEND_MUL_MAT:
+                    {
+                        // the gates of every (token, group) in BF16
+                        cur = ggml_type_size(GGML_TYPE_BF16) * node->src[2]->ne[0] * node->ne[1] * node->ne[2];
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_1D:
                     {

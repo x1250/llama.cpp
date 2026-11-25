@@ -9854,15 +9854,9 @@ static const float * loop_control_row(const ggml_tensor * t, int64_t token, int6
     return (const float *) ((const char *) t->data + token*t->nb[1] + (t->ne[2] == 1 ? 0 : c)*t->nb[2]);
 }
 
-// the product of row i of the BF16 matrix w with x, summed in ggml_float
-static float loop_control_dot(const ggml_tensor * w, int64_t i, const float * x) {
-    const ggml_bf16_t * rw = (const ggml_bf16_t *) ((const char *) w->data + i*w->nb[1]);
-
-    ggml_float sum = 0.0;
-    for (int64_t k = 0; k < w->ne[0]; ++k) {
-        sum += (ggml_float)(GGML_BF16_TO_FP32(rw[k])*x[k]);
-    }
-    return sum;
+// row i of the BF16 matrix w
+static ggml_bf16_t * loop_control_weight_row(const ggml_tensor * w, int64_t i) {
+    return (ggml_bf16_t *) ((char *) w->data + i*w->nb[1]);
 }
 
 // ggml_compute_forward_rms_norm_concat_mul_mat
@@ -9882,11 +9876,13 @@ void ggml_compute_forward_rms_norm_concat_mul_mat(
     const int64_t n_tokens = dst->ne[1];
     const int64_t n        = dst->ne[2];
 
-    // this thread's concatenation of the two normalized rows
-    float * u = (float *) params->wdata + (2*n_embd + CACHE_LINE_SIZE_F32)*params->ith;
+    // the concatenation of the two normalized rows of every (token, group) in BF16, shared by the threads, as the
+    // unfused graph's mul_mat converts its src1; then this thread's rows in F32 while it normalizes them
+    ggml_bf16_t * u = (ggml_bf16_t *) params->wdata;
+    float       * y = (float *) (u + 2*n_embd*n_tokens*n) + (2*n_embd + CACHE_LINE_SIZE_F32)*params->ith;
 
-    // the rms_norm of row x into y
-    auto normalize = [n_embd, eps](const float * x, float * y) {
+    // the rms_norm of row x into z
+    auto normalize = [n_embd, eps](const float * x, float * z) {
         ggml_float sum = 0.0;
         for (int64_t i = 0; i < n_embd; ++i) {
             sum += (ggml_float)(x[i]*x[i]);
@@ -9894,31 +9890,37 @@ void ggml_compute_forward_rms_norm_concat_mul_mat(
         const float mean  = sum/n_embd;
         const float scale = 1.0f/sqrtf(mean + eps);
         for (int64_t i = 0; i < n_embd; ++i) {
-            y[i] = x[i]*scale;
+            z[i] = x[i]*scale;
         }
     };
 
-    // the outputs (row, token, group) in one block per thread; the normalized rows are built once per token and group
-    const int64_t nr  = n_out*n_tokens*n;
+    for (int64_t tc = params->ith; tc < n_tokens*n; tc += params->nth) {
+        const int64_t t = tc % n_tokens;
+        const int64_t c = tc / n_tokens;
+
+        normalize(loop_control_row(a, t, c), y);
+        normalize(loop_control_row(b, t, c), y + n_embd);
+        ggml_cpu_fp32_to_bf16(y, u + tc*2*n_embd, 2*n_embd);
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // the (group, row) pairs in one block per thread, each weight row read once for every token
+    const int64_t nr  = n_out*n;
     const int64_t dr  = (nr + params->nth - 1)/params->nth;
     const int64_t ir0 = dr*params->ith;
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
-    int64_t built = -1;
     for (int64_t ir = ir0; ir < ir1; ++ir) {
-        const int64_t r  = ir % n_out;
-        const int64_t tc = ir / n_out;
-        const int64_t t  = tc % n_tokens;
-        const int64_t c  = tc / n_tokens;
+        const int64_t r = ir % n_out;
+        const int64_t c = ir / n_out;
 
-        if (tc != built) {
-            normalize(loop_control_row(a, t, c), u);
-            normalize(loop_control_row(b, t, c), u + n_embd);
-            built = tc;
+        ggml_bf16_t * wr = loop_control_weight_row(dst->src[2 + c], r);
+
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            float * rd = (float *) ((char *) dst->data + t*dst->nb[1] + c*dst->nb[2]);
+            ggml_vec_dot_bf16(2*n_embd, rd + r, 0, wr, 0, u + (c*n_tokens + t)*2*n_embd, 0, 1);
         }
-
-        float * rd = (float *) ((char *) dst->data + t*dst->nb[1] + c*dst->nb[2]);
-        rd[r] = loop_control_dot(dst->src[2 + c], r, u);
     }
 }
 
@@ -9934,30 +9936,48 @@ void ggml_compute_forward_tanh_blend_mul_mat(
     GGML_ASSERT(dst->nb[0] == sizeof(float));
 
     const int64_t n_embd   = dst->ne[0];
+    const int64_t n_in     = x->ne[0];
     const int64_t n_tokens = dst->ne[1];
     const int64_t n        = dst->ne[2];
 
-    // the outputs (element, token, group) in one block per thread
-    const int64_t nr  = n_embd*n_tokens*n;
+    // the gates of every (token, group) in BF16, shared by the threads, as the unfused graph's mul_mat converts its src1
+    ggml_bf16_t * xb = (ggml_bf16_t *) params->wdata;
+
+    for (int64_t tc = params->ith; tc < n_tokens*n; tc += params->nth) {
+        ggml_cpu_fp32_to_bf16(loop_control_row(x, tc % n_tokens, tc / n_tokens), xb + tc*n_in, n_in);
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // the (group, element) pairs in one block per thread, each with its two weight rows read once for every token
+    const int64_t nr  = n_embd*n;
     const int64_t dr  = (nr + params->nth - 1)/params->nth;
     const int64_t ir0 = dr*params->ith;
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
-        const int64_t i  = ir % n_embd;
-        const int64_t tc = ir / n_embd;
-        const int64_t t  = tc % n_tokens;
-        const int64_t c  = tc / n_tokens;
+        const int64_t i = ir % n_embd;
+        const int64_t c = ir / n_embd;
 
-        const float * rx = loop_control_row(x, t, c);
-        const float   ra = loop_control_row(a, t, c)[i];
-        const float   rb = loop_control_row(b, t, c)[i];
+        ggml_bf16_t * wf = loop_control_weight_row(dst->src[3 + c],     i);
+        ggml_bf16_t * wg = loop_control_weight_row(dst->src[3 + n + c], i);
 
-        const float forget_a = tanhf(loop_control_dot(dst->src[3 + c],     i, rx))*ra;
-        const float gain_b   = tanhf(loop_control_dot(dst->src[3 + n + c], i, rx))*rb;
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            ggml_bf16_t * rx = xb + (c*n_tokens + t)*n_in;
+            const float   ra = loop_control_row(a, t, c)[i];
+            const float   rb = loop_control_row(b, t, c)[i];
 
-        float * rd = (float *) ((char *) dst->data + t*dst->nb[1] + c*dst->nb[2]);
-        rd[i] = (ra - forget_a) + gain_b;
+            float f;
+            float g;
+            ggml_vec_dot_bf16(n_in, &f, 0, wf, 0, rx, 0, 1);
+            ggml_vec_dot_bf16(n_in, &g, 0, wg, 0, rx, 0, 1);
+
+            const float forget_a = tanhf(f)*ra;
+            const float gain_b   = tanhf(g)*rb;
+
+            float * rd = (float *) ((char *) dst->data + t*dst->nb[1] + c*dst->nb[2]);
+            rd[i] = (ra - forget_a) + gain_b;
+        }
     }
 }
 
