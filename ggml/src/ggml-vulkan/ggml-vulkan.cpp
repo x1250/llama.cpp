@@ -3691,7 +3691,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1, true);
-    ggml_vk_create_pipeline(device, device->pipeline_l2_norm_clip_f32, "l2_norm_clip_f32", l2_norm_clip_f32_len, l2_norm_clip_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_l2_norm_clip_f32, "l2_norm_clip_f32", l2_norm_clip_f32_len, l2_norm_clip_f32_data, "main", 4, sizeof(vk_op_l2_norm_clip_push_constants), {1, 1, 1}, {}, 1, true);
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_32, "cpy_32", cpy_32_len, cpy_32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f16, "cpy_f32_f16", cpy_f32_f16_len, cpy_f32_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -10059,11 +10059,6 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_l2_norm_f32;
         }
         return nullptr;
-    case GGML_OP_L2_NORM_CLIP:
-        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_l2_norm_clip_f32;
-        }
-        return nullptr;
     case GGML_OP_UNARY:
         return ggml_vk_float_pipeline(ctx->device->pipeline_unary[ggml_get_unary_op(dst)], src0, dst);
     case GGML_OP_GLU:
@@ -10531,7 +10526,6 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_NORM:
     case GGML_OP_RMS_NORM_BACK:
     case GGML_OP_L2_NORM:
-    case GGML_OP_L2_NORM_CLIP:
     case GGML_OP_SOFT_MAX:
     case GGML_OP_SOFT_MAX_BACK:
     case GGML_OP_SUM_ROWS:
@@ -12423,11 +12417,68 @@ void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const gg
     ggml_vk_op_f32<vk_op_unary_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_L2_NORM, std::move(p));
 }
 
-void ggml_vk_l2_norm_clip(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    vk_op_unary_push_constants p = vk_op_unary_push_constants_init(src0, dst);
-    p.param1 = ggml_get_op_params_f32(dst, 0);
-    p.param2 = ggml_get_op_params_f32(dst, 1);
-    ggml_vk_op_f32<vk_op_unary_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_L2_NORM_CLIP, std::move(p));
+void ggml_vk_l2_norm_clip(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * a     = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * post  = dst->src[2];
+
+    vk_pipeline pipeline = ctx->device->pipeline_l2_norm_clip_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    auto nb     = [](const ggml_tensor * t, int i) { return (uint32_t) (t->nb[i] / sizeof(float)); };
+    auto offset = [&](const ggml_tensor * t) { return (uint32_t) (get_misalign_bytes(ctx, t) / sizeof(float)); };
+
+    vk_op_l2_norm_clip_push_constants pc {};
+    pc.ne00   = (uint32_t) a->ne[0];
+    pc.ne01   = (uint32_t) a->ne[1];
+    pc.ne02   = (uint32_t) a->ne[2];
+    pc.n_rows = (uint32_t) ggml_nrows(a);
+    pc.a_nb1  = nb(a, 1);
+    pc.a_nb2  = nb(a, 2);
+    pc.a_nb3  = nb(a, 3);
+    pc.a_offset = offset(a);
+    pc.d_offset = offset(dst);
+    if (scale) {
+        pc.flags |= VK_L2_NORM_CLIP_SCALE;
+        pc.s_ne0 = (uint32_t) scale->ne[0];
+        pc.s_ne1 = (uint32_t) scale->ne[1];
+        pc.s_ne2 = (uint32_t) scale->ne[2];
+        pc.s_ne3 = (uint32_t) scale->ne[3];
+        pc.s_nb1 = nb(scale, 1);
+        pc.s_nb2 = nb(scale, 2);
+        pc.s_nb3 = nb(scale, 3);
+        pc.s_offset = offset(scale);
+    } else {
+        pc.s_ne0 = pc.s_ne1 = pc.s_ne2 = pc.s_ne3 = 1;
+    }
+    if (post) {
+        pc.flags |= VK_L2_NORM_CLIP_POST;
+        pc.p_ne1 = (uint32_t) post->ne[1];
+        pc.p_ne2 = (uint32_t) post->ne[2];
+        pc.p_ne3 = (uint32_t) post->ne[3];
+        pc.p_nb1 = nb(post, 1);
+        pc.p_nb2 = nb(post, 2);
+        pc.p_nb3 = nb(post, 3);
+        pc.p_offset = offset(post);
+    } else {
+        pc.p_ne1 = pc.p_ne2 = pc.p_ne3 = 1;
+    }
+    pc.max_norm = ggml_get_op_params_f32(dst, 0);
+    pc.eps      = ggml_get_op_params_f32(dst, 1);
+
+    // one workgroup per row, the rows past 512 in y and past 262144 in z
+    const uint32_t nr = pc.n_rows;
+    const std::array<uint32_t, 3> elements = nr > 262144 ? std::array<uint32_t, 3>{ 512, 512, CEIL_DIV(nr, 262144) } :
+                                             nr > 512    ? std::array<uint32_t, 3>{ 512, CEIL_DIV(nr, 512), 1 } :
+                                                           std::array<uint32_t, 3>{ nr, 1, 1 };
+
+    const vk_subbuffer a_buf = ggml_vk_tensor_subbuffer(ctx, a, true);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { a_buf,
+          scale ? ggml_vk_tensor_subbuffer(ctx, scale, true) : a_buf,
+          post  ? ggml_vk_tensor_subbuffer(ctx, post,  true) : a_buf,
+          ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, elements);
 }
 
 void ggml_vk_unary(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -14005,7 +14056,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_L2_NORM_CLIP:
-        ggml_vk_l2_norm_clip(ctx, compute_ctx, src0, node);
+        ggml_vk_l2_norm_clip(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_UNARY:
@@ -17759,8 +17810,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_NORM:
         case GGML_OP_L2_NORM:
-        case GGML_OP_L2_NORM_CLIP:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_L2_NORM_CLIP:
+            // l2_norm_clip.comp: the input and the scale with contiguous rows
+            return op->src[0]->nb[0] == sizeof(float) && (!op->src[1] || op->src[1]->nb[0] == sizeof(float)) &&
+                   ggml_nrows(op) <= (int64_t) 512 * 512 * device->properties.limits.maxComputeWorkGroupCount[2];
         case GGML_OP_RMS_NORM:
             return ggml_vk_is_float_elementwise(op) && op->type != GGML_TYPE_F16;
         case GGML_OP_ADD:

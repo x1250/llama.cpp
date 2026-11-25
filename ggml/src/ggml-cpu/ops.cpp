@@ -4691,9 +4691,13 @@ void ggml_compute_forward_l2_norm_clip(
     ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1]; // the scale before the clip, or NULL
+    const ggml_tensor * src2 = dst->src[2]; // the factor of each row after it, or NULL
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(!src1 || (src1->type == GGML_TYPE_F32 && ggml_can_repeat(src1, src0)));
+    GGML_ASSERT(!src2 || (src2->type == GGML_TYPE_F32 && src2->ne[0] == 1 && ggml_can_repeat(src2, src0)));
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -4707,18 +4711,32 @@ void ggml_compute_forward_l2_norm_clip(
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const char * x = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
+                const char * s = src1 ? (const char *) src1->data + (i01 % src1->ne[1])*src1->nb[1] + (i02 % src1->ne[2])*src1->nb[2] + (i03 % src1->ne[3])*src1->nb[3] : nullptr;
+
+                // the input, scaled as a separate multiplication would round it
+                auto input = [&](int64_t i00) {
+                    const float xi = *(const float *) (x + i00*nb00);
+                    return s ? xi * *(const float *) (s + (i00 % src1->ne[0])*src1->nb[0]) : xi;
+                };
 
                 ggml_float sum = 0.0;
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    const float xi = *(const float *) (x + i00*nb00);
+                    const float xi = input(i00);
                     sum += (ggml_float)(xi * xi);
                 }
 
                 const float scale = fminf(1.0f, max_norm/(sqrtf(sum) + eps));
 
                 char * y = (char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3;
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    *(float *) (y + i00*nb0) = *(const float *) (x + i00*nb00) * scale;
+                if (src2) {
+                    const float f = *(const float *) ((const char *) src2->data + (i01 % src2->ne[1])*src2->nb[1] + (i02 % src2->ne[2])*src2->nb[2] + (i03 % src2->ne[3])*src2->nb[3]);
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        *(float *) (y + i00*nb0) = input(i00) * scale * f;
+                    }
+                } else {
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        *(float *) (y + i00*nb0) = input(i00) * scale;
+                    }
                 }
             }
         }

@@ -9149,13 +9149,16 @@ struct test_l2_norm_clip : public test_case {
     const std::array<int64_t, 4> ne;
     const float max_norm;
     const bool v; // a view with a row stride
+    const std::array<int64_t, 4> ne_scale; // the scale before the clip, none if ne_scale[0] == 0
+    const bool post;                       // a factor per [ne1] rows after the clip
 
     std::string vars() override {
-        return VARS_TO_STR3(ne, max_norm, v);
+        return VARS_TO_STR5(ne, max_norm, v, ne_scale, post);
     }
 
-    test_l2_norm_clip(std::array<int64_t, 4> ne = {128, 24, 7, 1}, float max_norm = 5.0f, bool v = false)
-        : ne(ne), max_norm(max_norm), v(v) {}
+    test_l2_norm_clip(std::array<int64_t, 4> ne = {128, 24, 7, 1}, float max_norm = 5.0f, bool v = false,
+            std::array<int64_t, 4> ne_scale = {0, 0, 0, 0}, bool post = false)
+        : ne(ne), max_norm(max_norm), v(v), ne_scale(ne_scale), post(post) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -9165,16 +9168,32 @@ struct test_l2_norm_clip : public test_case {
             ggml_set_name(a, "view of a");
         }
 
-        ggml_tensor * out = ggml_l2_norm_clip(ctx, a, max_norm, 1e-6f);
+        ggml_tensor * s = nullptr;
+        if (ne_scale[0] != 0) {
+            s = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_scale.data());
+            ggml_set_name(s, "scale");
+        }
+
+        ggml_tensor * f = nullptr;
+        if (post) {
+            f = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, a->ne[2], a->ne[3]);
+            ggml_set_name(f, "post");
+        }
+
+        ggml_tensor * out = ggml_l2_norm_clip_ext(ctx, a, s, f, max_norm, 1e-6f);
         ggml_set_name(out, "out");
 
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        // rows of growing scale, so that some are clipped and some are not
+        // rows of growing scale, so that some are clipped and some are not; the scale and the factors around 1
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "scale") == 0 || strcmp(t->name, "post") == 0) {
+                init_tensor_uniform(t, 0.5f, 1.5f);
                 continue;
             }
             const int64_t n_rows = ggml_nrows(t);
@@ -12460,13 +12479,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Inkling 2's clips: q and k [128, n_head, n_tokens], the relative-position projection [16, n_head, n_tokens]
+    // Inkling 2's clips: q and k [128, n_head, n_tokens], the relative-position projection [16, n_head, n_tokens]; q and r
+    // with their scale per head and channel, and tau per token in the full-attention layers
     for (int64_t n_tokens : {1, 3, 512}) {
         test_cases.emplace_back(new test_l2_norm_clip({128, 24, n_tokens, 1}, 5.0f));
         test_cases.emplace_back(new test_l2_norm_clip({128, 8,  n_tokens, 1}, 5.0f));
         test_cases.emplace_back(new test_l2_norm_clip({16,  24, n_tokens, 1}, 2.0f));
+        for (bool post : {false, true}) {
+            test_cases.emplace_back(new test_l2_norm_clip({128, 24, n_tokens, 1}, 5.0f, false, {128, 24, 1, 1}, post));
+            test_cases.emplace_back(new test_l2_norm_clip({16,  24, n_tokens, 1}, 2.0f, false, {16,  24, 1, 1}, post));
+        }
     }
     test_cases.emplace_back(new test_l2_norm_clip({128, 24, 33, 2}, 5.0f, true));
+    test_cases.emplace_back(new test_l2_norm_clip({128, 24, 33, 2}, 5.0f, true, {64, 24, 1, 1}, true));
+    test_cases.emplace_back(new test_l2_norm_clip({128, 24, 3,  2}, 5.0f, false, {128, 1, 3, 1}, false));
+    test_cases.emplace_back(new test_l2_norm_clip({128, 24, 3,  2}, 5.0f, false, {0, 0, 0, 0}, true));
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));

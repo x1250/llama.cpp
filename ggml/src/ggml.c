@@ -3307,7 +3307,20 @@ struct ggml_tensor * ggml_l2_norm_clip(
         struct ggml_tensor  * a,
         float                 max_norm,
         float                 eps) {
+    return ggml_l2_norm_clip_ext(ctx, a, NULL, NULL, max_norm, eps);
+}
+
+struct ggml_tensor * ggml_l2_norm_clip_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * post,
+        float                 max_norm,
+        float                 eps) {
     GGML_ASSERT(max_norm > 0.0f && eps >= 0.0f);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(!scale || (scale->type == GGML_TYPE_F32 && ggml_can_repeat(scale, a)));
+    GGML_ASSERT(!post  || (post->type  == GGML_TYPE_F32 && post->ne[0] == 1 && ggml_can_repeat(post, a)));
 
     struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
 
@@ -3316,6 +3329,8 @@ struct ggml_tensor * ggml_l2_norm_clip(
 
     result->op     = GGML_OP_L2_NORM_CLIP;
     result->src[0] = a;
+    result->src[1] = scale;
+    result->src[2] = post;
 
     return result;
 }

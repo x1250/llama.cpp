@@ -1274,6 +1274,16 @@ extern "C" {
             float                 max_norm,
             float                 eps);
 
+    // ggml_l2_norm_clip of a*scale, each row of the result multiplied by its factor in post
+    // scale (optional) broadcasts to a, post (optional, ne[0] == 1) broadcasts to the rows of a
+    GGML_API struct ggml_tensor * ggml_l2_norm_clip_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * post,
+            float                 max_norm,
+            float                 eps);
+
     // a - x
     // b - dy
     GGML_API struct ggml_tensor * ggml_rms_norm_back(

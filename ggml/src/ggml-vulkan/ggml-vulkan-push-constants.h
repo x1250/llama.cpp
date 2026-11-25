@@ -867,6 +867,23 @@ struct vk_op_tanh_blend_mul_mat_push_constants {
     uint32_t wg_offset[VK_LOOP_CONTROL_MAX_GROUPS];
 };
 
+// ggml_l2_norm_clip: strides and offsets in floats, a and scale with contiguous rows, post one factor per row
+// (l2_norm_clip.comp)
+#define VK_L2_NORM_CLIP_SCALE 1
+#define VK_L2_NORM_CLIP_POST  2
+struct vk_op_l2_norm_clip_push_constants {
+    uint32_t ne00, ne01, ne02, n_rows;
+    uint32_t a_nb1, a_nb2, a_nb3;
+    uint32_t s_ne0, s_ne1, s_ne2, s_ne3;
+    uint32_t s_nb1, s_nb2, s_nb3;
+    uint32_t p_ne1, p_ne2, p_ne3;
+    uint32_t p_nb1, p_nb2, p_nb3;
+    uint32_t a_offset, s_offset, p_offset, d_offset;
+    uint32_t flags;
+    float max_norm, eps;
+};
+static_assert(sizeof(vk_op_l2_norm_clip_push_constants) <= 128, "sizeof(vk_op_l2_norm_clip_push_constants) must be <= 128");
+
 // ggml_depth_attn: strides and offsets in floats, states beyond n_states unused (depth_attn.comp)
 #define VK_DEPTH_ATTN_MAX_STATES 9
 #define VK_DEPTH_ATTN_MAX_QUERY  4

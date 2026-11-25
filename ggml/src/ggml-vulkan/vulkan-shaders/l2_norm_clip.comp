@@ -1,0 +1,86 @@
+#version 450
+
+// ggml_l2_norm_clip: each row of x = a*scale scaled down to an L2 norm of at most max_norm, then multiplied by its factor
+// in post. One workgroup per row; the sum of squares is the tree of l2_norm.comp. Rows of contiguous floats, strides and
+// offsets in floats.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#define BLOCK_SIZE 512
+
+#define FLAG_SCALE 1
+#define FLAG_POST  2
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) readonly buffer S {float data_s[];};
+layout (binding = 2) readonly buffer P {float data_p[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint ne00; uint ne01; uint ne02; uint n_rows;
+    uint a_nb1; uint a_nb2; uint a_nb3;
+    uint s_ne0; uint s_ne1; uint s_ne2; uint s_ne3;
+    uint s_nb1; uint s_nb2; uint s_nb3;
+    uint p_ne1; uint p_ne2; uint p_ne3;
+    uint p_nb1; uint p_nb2; uint p_nb3;
+    uint a_offset; uint s_offset; uint p_offset; uint d_offset;
+    uint flags;
+    float max_norm; float eps;
+} p;
+
+shared float sum[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (row >= p.n_rows) {
+        return;
+    }
+
+    const uint i01 = row % p.ne01;
+    const uint i02 = (row / p.ne01) % p.ne02;
+    const uint i03 = row / (p.ne01 * p.ne02);
+
+    const bool has_scale = (p.flags & FLAG_SCALE) != 0;
+    const bool has_post  = (p.flags & FLAG_POST) != 0;
+
+    const uint a_base = p.a_offset + i01*p.a_nb1 + i02*p.a_nb2 + i03*p.a_nb3;
+    const uint s_base = p.s_offset + (i01 % p.s_ne1)*p.s_nb1 + (i02 % p.s_ne2)*p.s_nb2 + (i03 % p.s_ne3)*p.s_nb3;
+    const uint d_base = p.d_offset + row*p.ne00;
+
+    sum[tid] = 0.0f;
+
+    [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
+        float xi = data_a[a_base + i0];
+        if (has_scale) {
+            xi *= data_s[s_base + i0 % p.s_ne0];
+        }
+        sum[tid] += xi * xi;
+    }
+
+    barrier();
+    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum[tid] += sum[tid + s];
+        }
+        barrier();
+    }
+
+    const float scale = min(1.0f, p.max_norm / (sqrt(sum[0]) + p.eps));
+    const float post  = has_post ? data_p[p.p_offset + (i01 % p.p_ne1)*p.p_nb1 + (i02 % p.p_ne2)*p.p_nb2 + (i03 % p.p_ne3)*p.p_nb3] : 1.0f;
+
+    [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
+        float xi = data_a[a_base + i0];
+        if (has_scale) {
+            xi *= data_s[s_base + i0 % p.s_ne0];
+        }
+        float y = scale * xi;
+        if (has_post) {
+            y *= post;
+        }
+        data_d[d_base + i0] = y;
+    }
+}
