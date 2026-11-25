@@ -5024,6 +5024,93 @@ struct test_ssm_conv_residual : public test_case {
     }
 };
 
+// GGML_OP_CONCAT + VIEW + VIEW + GGML_OP_CPY + GGML_OP_SSM_CONV + GGML_OP_ADD + GGML_OP_SCALE: Inkling 2's short
+// convolution over its history and its input, whose last d_conv - 1 columns go to a block of channels in the rows of the
+// recurrent state
+struct test_ssm_conv_state : public test_case {
+    const int64_t d_conv;
+    const int64_t channels;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t channel_offset;   // of the convolution's block in a row of the history and of the state
+    const bool    state_view_first; // the view of the state ahead of the pattern, where a graph optimizer may leave it
+    const bool    fused_order;      // the convolution right after its state copy, the residual on the same reshape of
+                                    // the input; otherwise a second reshape comes between them (the unfused path)
+
+    ggml_tensor * state_after = nullptr;
+    ggml_tensor * cpy         = nullptr;
+    ggml_tensor * conv        = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_STATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { state_after, cpy, conv }; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(d_conv, channels, n_seq_tokens, n_seqs, channel_offset, state_view_first, fused_order);
+    }
+
+    test_ssm_conv_state(int64_t d_conv, int64_t channels, int64_t n_seq_tokens, int64_t n_seqs, int64_t channel_offset,
+            bool state_view_first, bool fused_order = true)
+        : d_conv(d_conv), channels(channels), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          channel_offset(channel_offset), state_view_first(state_view_first), fused_order(fused_order) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_cols       = d_conv - 1;
+        const int64_t row_channels = channel_offset + channels + 1;
+
+        ggml_tensor * history = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_cols, row_channels, n_seqs);
+        ggml_tensor * cur     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, n_seq_tokens * n_seqs);
+        ggml_tensor * weight  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, channels);
+        // a row before the sequences' rows and a row after them
+        ggml_tensor * state   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols * row_channels, n_seqs + 2);
+        ggml_set_name(history, "history");
+        ggml_set_name(cur, "cur");
+        ggml_set_name(weight, "weight");
+        ggml_set_name(state, "state");
+
+        // the whole state as the graph leaves it: nothing but the block is written
+        state_after = ggml_view_2d(ctx, state, state->ne[0], state->ne[1], state->nb[1], 0);
+        ggml_set_name(state_after, "state_after");
+        ggml_build_forward_expand(gf, state_after);
+
+        ggml_tensor * past = ggml_view_3d(ctx, history, n_cols, channels, n_seqs, history->nb[1], history->nb[2],
+                channel_offset * history->nb[1]);
+        ggml_tensor * rows = ggml_reshape_3d(ctx, cur, channels, n_seq_tokens, n_seqs);
+        ggml_tensor * x    = ggml_concat(ctx, past, ggml_transpose(ctx, rows), 0);
+
+        ggml_tensor * last = ggml_view_3d(ctx, x, n_cols, channels, n_seqs, x->nb[1], x->nb[2],
+                ggml_row_size(x->type, n_seq_tokens));
+        ggml_tensor * cell = ggml_view_2d(ctx, state, n_cols * channels, n_seqs, state->nb[1],
+                state->nb[1] + channel_offset * n_cols * ggml_element_size(state));
+        if (state_view_first) {
+            ggml_build_forward_expand(gf, cell);
+        }
+        cpy = ggml_cpy(ctx, last, cell);
+        ggml_set_name(cpy, "cpy");
+
+        // the copy right after the CONCAT, as the model builds it; the convolution follows
+        ggml_build_forward_expand(gf, cpy);
+
+        ggml_tensor * residual = fused_order ? rows : ggml_reshape_3d(ctx, cur, channels, n_seq_tokens, n_seqs);
+
+        conv = ggml_scale(ctx, ggml_add(ctx, residual, ggml_ssm_conv(ctx, x, weight)), 1.0f / sqrtf(d_conv + 1.0f));
+        ggml_set_name(conv, "conv");
+        return conv;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            init_tensor_uniform(t);
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -12531,6 +12618,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_ssm_conv_residual(
                     GGML_TYPE_F32, {3 + n_t, d_inner, n_s, 1}, {4, d_inner, 1, 1}, 1.0f/sqrtf(5.0f)));
             }
+        }
+    }
+
+    // the convolution with its state: one token, fewer tokens than history columns, as many and more, one and two
+    // sequences, the state view inside the pattern and ahead of it, and other kernel sizes
+    for (int64_t d_inner : {1024, 2304}) {
+        for (int64_t n_t : {1, 2, 3, 5, 64}) {
+            for (int64_t n_s : {1, 2}) {
+                for (bool state_view_first : {false, true}) {
+                    test_cases.emplace_back(new test_ssm_conv_state(
+                        4, d_inner, n_t, n_s, d_inner == 1024 ? 0 : 2048, state_view_first));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_ssm_conv_state(2, 96,  1, 2, 7, false));
+    test_cases.emplace_back(new test_ssm_conv_state(7, 96,  3, 2, 7, true));
+    test_cases.emplace_back(new test_ssm_conv_state(7, 96, 40, 1, 0, false));
+    // the order that keeps the convolution away from its copy (the unfused path) at a decode step and at a prompt ubatch,
+    // and the fused order at the prompt ubatch
+    for (int64_t d_inner : {1024, 2304}) {
+        for (int64_t n_s : {1, 2}) {
+            for (int64_t n_t : {1, 5, 2048}) {
+                test_cases.emplace_back(new test_ssm_conv_state(4, d_inner, n_t, n_s, d_inner == 1024 ? 0 : 2048, false, false));
+            }
+            test_cases.emplace_back(new test_ssm_conv_state(4, d_inner, 2048, n_s, d_inner == 1024 ? 0 : 2048, false));
         }
     }
 

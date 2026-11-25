@@ -141,6 +141,7 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
 void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx);
 void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
 void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
+void ggml_vk_ssm_conv_state(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
 void ggml_vk_depth_attn(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
 void ggml_vk_tanh_blend(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
 void ggml_vk_rms_norm_concat_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst);
@@ -219,6 +220,7 @@ bool ggml_vk_is_empty(ggml_tensor * node);
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops);
 bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int num_extra);
 bool ggml_vk_can_fuse_ssm_conv_residual(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
+int ggml_vk_ssm_conv_state_fused_nodes(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
 bool ggml_vk_can_fuse_topk_moe(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, topk_moe_mode mode);
 int ggml_vk_gdn_snapshots_fused_nodes(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
 bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);

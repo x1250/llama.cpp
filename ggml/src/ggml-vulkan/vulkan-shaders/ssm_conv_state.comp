@@ -1,0 +1,76 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// SSM_CONV over the columns of a history followed by an input, both read where they are, with the residual and the
+// scale of ssm_conv.comp (same sum, same rounding); the last n_h columns go to the recurrent state. Strides and offsets
+// in floats; the weight, the residual and the output are contiguous
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Hist { float hist[]; };
+layout(binding = 1) readonly buffer X { float x[]; };
+layout(binding = 2) readonly buffer Weight { float weight[]; };
+layout(binding = 3) readonly buffer Residual { float residual[]; };
+layout(binding = 4) writeonly buffer Dst { float dst[]; };
+layout(binding = 5) writeonly buffer State { float state[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint nc; uint n_h; uint nr; uint n_t; uint n_s;
+    uint hist_offset; uint hist_nb0; uint hist_nb1; uint hist_nb2;
+    uint x_offset; uint x_nb0; uint x_nb1; uint x_nb2;
+    uint weight_offset; uint residual_offset; uint dst_offset;
+    uint state_offset; uint state_nb1;
+    float scale;
+};
+
+// column col of channel i1 in sequence i3: the n_h columns of the history, then the n_t of the input
+float column(uint col, uint i1, uint i3) {
+    if (col < n_h) {
+        return hist[hist_offset + i3 * hist_nb2 + i1 * hist_nb1 + col * hist_nb0];
+    }
+    return x[x_offset + i3 * x_nb2 + i1 * x_nb1 + (col - n_h) * x_nb0];
+}
+
+void main() {
+    const uint i1 = gl_GlobalInvocationID.x;
+    const uint i2 = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
+    const uint i3 = gl_WorkGroupID.z;
+
+    if (i1 >= nr || i2 >= n_t || i3 >= n_s) {
+        return;
+    }
+
+    const uint weight_base = weight_offset + i1 * nc;
+
+    float sum = 0.0;
+
+    if (nc == 4) {
+        sum = dot(
+            vec4(column(i2, i1, i3), column(i2 + 1, i1, i3), column(i2 + 2, i1, i3), column(i2 + 3, i1, i3)),
+            vec4(weight[weight_base], weight[weight_base + 1], weight[weight_base + 2], weight[weight_base + 3])
+        );
+    } else {
+        [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
+            sum += column(i2 + i0, i1, i3) * weight[weight_base + i0];
+        }
+    }
+
+    const uint dst_idx = (i3 * n_t + i2) * nr + i1;
+    dst[dst_offset + dst_idx] = (sum + residual[residual_offset + dst_idx]) * scale;
+
+    // the state keeps columns n_t .. n_t + n_h - 1, each written by one invocation: a token writes its own input, and
+    // token 0 the history columns that stay when the batch is shorter than the history
+    if (i2 + n_h >= n_t) {
+        const uint state_base = state_offset + i3 * state_nb1 + i1 * n_h;
+        state[state_base + i2 + n_h - n_t] = column(i2 + n_h, i1, i3);
+        if (i2 == 0) {
+            for (uint col = n_t; col < n_h; col++) {
+                state[state_base + col - n_t] = column(col, i1, i3);
+            }
+        }
+    }
+}

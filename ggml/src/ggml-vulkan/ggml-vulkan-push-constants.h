@@ -822,6 +822,16 @@ struct vk_op_ssm_conv_push_constants {
     float scale;
 };
 
+// SSM_CONV_STATE: strides and offsets in floats (ssm_conv_state.comp)
+struct vk_op_ssm_conv_state_push_constants {
+    uint32_t nc, n_h, nr, n_t, n_s;
+    uint32_t hist_offset, hist_nb0, hist_nb1, hist_nb2;
+    uint32_t x_offset, x_nb0, x_nb1, x_nb2;
+    uint32_t weight_offset, residual_offset, dst_offset;
+    uint32_t state_offset, state_nb1;
+    float scale;
+};
+
 // ggml_tanh_blend: row strides and offsets in floats (tanh_blend.comp)
 struct vk_op_tanh_blend_push_constants {
     uint32_t ne0, n_rows;
