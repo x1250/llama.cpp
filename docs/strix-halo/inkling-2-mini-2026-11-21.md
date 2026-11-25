@@ -19,6 +19,9 @@ fallas sean suyas no quedó demostrado.
 **Reinstalado el mismo día:** el modelo base, con el GGUF propio en Q8_0, para que el Director lo pruebe en ese uso
 (sección 9).
 
+**Desde el 2026-11-24/25:** LoopCD en producción (sección 11), DFlash2 medido y no adoptado (sección 12) y las fusiones
+del decode adoptadas: 4050 a 1974 despachos por token, una petición de 28.3 a 31.5 t/s (sección 13).
+
 ## 0. Resultado
 
 **Instalado** como `inkling2mini` en `strix`. Configuración:
@@ -954,3 +957,89 @@ hilos (sección 8.3) sigue abierto y vale 0.7 ms por token.
   y pide producción descargada y su pack (19.35 GB el SQ-20).
 - **Hipótesis:** que un tronco BF16 no pueda ganarle al Q8_0 en decode supone que HIP tiene el mismo techo de ancho
   de banda que Vulkan en esta memoria.
+
+## 11. LoopCD en producción (2026-11-24, `04ea3c68a`)
+
+- **Qué es:** el contraste de la última pasada del loop contra la primera (arXiv 2610.02185): los logits finales son
+  `z3 + 0.3·(z3 − z1)`, con z1 la primera pasada llevada por su propia copia de la coda (6 slots de caché más).
+  También está la variante en los estados que entran a la coda (`--loop-contrast-type hidden`), sin costo extra.
+- **Instalado** con `loop_contrast = 0.3` en logits (`config.ini`, `run-server.sh`), la fuerza del paper para
+  generación. El Director lo prueba en uso real; no pasó por la compuerta de calidad, porque cambia la distribución a
+  propósito y su efecto se juzga en las respuestas.
+- **Verificado:** con la fuerza 0 los logits son los de master (KLD 0, 100 % de top igual); el contraste en logits es
+  exacto contra `last + s·(last − una pasada)` en el modelo sintético (`test-llama-archs --loop-contrast`).
+- **Costo:** unos 11 GiB más de memoria cargada (37.9 contra 49.2 GiB de MemAvailable; la estimación era 5, y la
+  diferencia no está explicada). Una petición decodifica a 28.3 t/s con LoopCD; sin él el server daba 32-33 t/s
+  (sección 0), sin un A/B de los dos en una misma cadena.
+
+## 12. DFlash2 de incoai, no adoptado (2026-11-25)
+
+- **El drafter:** `incoai/Inkling-2-Mini-DFlash2` (5 capas, bloques de 8), en el GGUF de `ufrik`, reescrito por
+  `dflash2/fix_gguf.py`: el vocabulario del objetivo (200058, el GGUF traía el relleno de 201024), los índices de capa
+  de la referencia de SGLang ([5, 23, 41, 48], los de DSpark; ufrik escribió [6, 24, 42, 48]) y el softcap del selector
+  después de su corrección (`dflash.selector_softcap_after_correction`).
+- **La rama** `inkling-dflash2` (worktree `llama.cpp-loopcd`): el soporte de drafters de upstream para Inkling
+  (`33aeb17f8`, PR #32218), las features indexadas por visita y no por slot (con LoopCD hay 6 slots más que visitas) y
+  los dos cambios del grafo de DFlash2. Sin merge.
+- **Medido** (`dflash2-check.sh`, NP=1, 32k, LoopCD 0.3, verificación por muestreo; cortado por el Director antes de
+  los controles):
+
+| | Greedy | Muestreo de producción | ms por paso (muestreo) |
+|---|---|---|---|
+| Sin draft | 29.7 t/s | 28.3 t/s | 35 |
+| n-max 7 | 29.3 t/s | 19.3 t/s | 150 |
+| n-max 3 | 33.8 t/s | 21.1 t/s | 100 |
+
+- **Por qué pierde:** verificar 8 tokens cuesta 100-117 ms de GPU contra 34 ms de un token (en el MoE cada token del
+  lote lee sus propios expertos), y hay ~50 ms por paso fuera de la GPU, sin identificar. Acepta 1.9 tokens por paso
+  con muestreo, la mitad de lo que reporta incoai en una H200; los controles que separaban LoopCD y la conversión no
+  llegaron a correr.
+
+## 13. Las fusiones del decode (2026-11-25, `571dd49fa`..`0392fef19`)
+
+Los candidatos de la sección 10.4, más la atención en profundidad con workgroups anchos (sección 8.3), implementados
+en ramas propias y en una de integración (`inkling-fuse`), cada uno con su arnés y su informe en
+`llama.cpp-evidence/inkling2mini/fusions/<grupo>/REPORT.md`.
+
+| Grupo | Commits | Mecanismo | Exactitud |
+|---|---|---|---|
+| Atención en profundidad | `571dd49fa` | Un pipeline de 768 hilos para lotes de hasta 40 tokens | Reagrupa sumas (nmse 1e-14) |
+| Controladores del loop | `4a4a0b4fc`, `b8e02a7a3`, `879657923` | Ops `RMS_NORM_CONCAT_MUL_MAT` y `TANH_BLEND_MUL_MAT`, lotes de hasta 32 tokens; en CPU por productos BF16 como mul_mat | Vulkan: activaciones en F32 (nmse 1e-14 hasta 8 tokens, 5e-7 de 9 a 32) |
+| Router | `ef24daaa6`, `f1b2cbb23`, `590bade97` | `topk_moe` de upstream con la suma de Inkling y las escalas de los expertos | Bit a bit, empates incluidos |
+| Convoluciones cortas | `0377d8d99`, `2bd209726` | Fusión `SSM_CONV_STATE`: lee historia y entrada en su lugar y escribe el estado | Bit a bit, estado incluido |
+| Preparación de la atención | `2a8017c88`..`0392fef19` (6) | Tabla y sumideros al cargar; `L2_NORM_CLIP` con escala y factor; normas con la rotación y el guardado de K/V; la tabla del sesgo dentro del clip de r en decode | Bit a bit salvo la tabla (suma en F32: más cerca de la CPU) |
+
+**Medido** (`fuse3-all.sh`: la base primera y última; `fuse3-faoff.sh`; `fuse3-install.sh`):
+
+| Etapa | Despachos por token | GPU por token | tg128 (ub 512) | pp2048 ub 512 / 2048 |
+|---|---|---|---|---|
+| Base (master `04ea3c68a`) | 4050 | 30.7-31.8 ms | 34.8-35.9 t/s | 979-985 / 1086-1105 |
+| + atención en profundidad | 4050 | 30.4 | 37.0 | 993 / 1102 |
+| + controladores | 3474 | 29.4 | 37.9 | 991 / 1099 |
+| + router | 2918 | 27.7 | 38.6 | 995 / 1104 |
+| + convoluciones | 2526 | 26.6 | 39.3 | 962 / 1128 |
+| + preparación sin la tabla | 2070 | 26.8 | 40.3 | 978 / 1130 |
+| + la tabla | 1974 | 25.9 | 40.8 | 989 / 1134 |
+
+- **En producción** (1M × 2 slots, KV q8_0, LoopCD): una petición de 28.3 a 31.5 t/s (+11 %); dos a la vez de 38.1 a
+  44.2 t/s. Instalado: 31.1-31.5 t/s, 41.5 t/s con dos.
+- **Compuertas:** `test-backend-ops` 2494/2494 y `test-llama-archs` 158/158 en Vulkan; determinismo (`repeat_probe`,
+  cinco lecturas idénticas, y `depth_equiv` de 2k a 163k contra la base: KLD media de 0.002 a 0.004, la de dos
+  corridas de un build); la forma de producción, base y rama: razonamiento, tool call, caché del prompt, imagen de
+  2048 × 2048, historia, peticiones repetidas idénticas y los dos slots a la vez.
+- **Calidad:** con ubatch de 2048 (modos p, P y pL) la rama da la KLD de la base sin fusiones. Con ubatch de 3 (d, M y
+  dL) la referencia de `GGML_VK_DISABLE_FUSION=1` mueve casi nada en este modelo (0.0005 en d) y la rama quedaba a
+  3.5 veces; ya la primera etapa (una reagrupación de sumas de 1e-14) da 0.0018, y las siguientes quedan en esa meseta:
+  con lotes chicos el modelo amplifica cualquier redondeo hasta ahí. Contra la referencia sustituta de la sección 3,
+  la base con `-fa off`, pasa en los tres:
+
+| Modo | KLD rama | KLD `-fa off` | Top igual rama / `-fa off` |
+|---|---|---|---|
+| d (ubatch 3, 4096) | 0.0019 | 0.0020 | 98.1 / 97.8 % |
+| M (ubatch 3, 16k) | 0.0028 | 0.0033 | 98.0 / 97.9 % |
+| dL (d con LoopCD) | 0.0032 | 0.0034 | 97.4 / 97.4 % |
+
+- **Queda:** 4 despachos por visita en la preparación de la atención (3 pide juntar cadenas independientes); las 18
+  convoluciones dinámicas por token con sus taps (un op nuevo, ~−288 despachos); en CPU, los controladores fundidos con
+  lotes de 9 a 32 tokens quedan hasta un 30 % bajo el camino sin fundir (el mul_mat por lotes usa el GEMM de
+  llamafile). Las notas sobre upstream que encontraron las ramas están en `latent-defects.md`.
