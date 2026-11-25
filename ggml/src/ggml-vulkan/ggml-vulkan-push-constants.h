@@ -868,7 +868,8 @@ struct vk_op_tanh_blend_mul_mat_push_constants {
 };
 
 // ggml_l2_norm_clip: strides and offsets in floats, a and scale with contiguous rows, post one factor per row; fused with
-// the rotation (n_rot, rot_scale) and the K store (d_nb1, the row stride of the cache in its elements) (l2_norm_clip.comp)
+// the rotation (n_rot, rot_scale) and the K store (d_nb1, the row stride of the cache in its elements), or with the product
+// by a weight less one value per row (d_nb1 the rows of the weight, w_offset and t_offset) (l2_norm_clip.comp)
 #define VK_L2_NORM_CLIP_SCALE 1
 #define VK_L2_NORM_CLIP_POST  2
 struct vk_op_l2_norm_clip_push_constants {
@@ -883,6 +884,7 @@ struct vk_op_l2_norm_clip_push_constants {
     float max_norm, eps;
     uint32_t d_nb1, n_rot;
     float rot_scale;
+    uint32_t w_offset, t_offset;
 };
 static_assert(sizeof(vk_op_l2_norm_clip_push_constants) <= 128, "sizeof(vk_op_l2_norm_clip_push_constants) must be <= 128");
 

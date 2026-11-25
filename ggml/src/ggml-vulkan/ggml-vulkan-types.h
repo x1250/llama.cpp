@@ -609,6 +609,8 @@ static constexpr std::initializer_list<ggml_op> l2_norm_clip_hadamard_view_set_r
 static constexpr std::initializer_list<ggml_op> l2_norm_clip_view_set_rows_pattern { GGML_OP_L2_NORM_CLIP, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 // the rotated q
 static constexpr std::initializer_list<ggml_op> l2_norm_clip_hadamard_pattern { GGML_OP_L2_NORM_CLIP, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE };
+// the relative bias table of Inkling 2 in a decode step, its sink subtracted
+static constexpr std::initializer_list<ggml_op> l2_norm_clip_mul_mat_sub_pattern { GGML_OP_L2_NORM_CLIP, GGML_OP_MUL_MAT, GGML_OP_SUB };
 
 static constexpr std::initializer_list<ggml_op> gdn_view_cpy_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
 static constexpr std::initializer_list<ggml_op> gdn_view_cpy_short_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_CPY };
@@ -730,6 +732,11 @@ static constexpr std::initializer_list<std::array<int, 3>> norm_hadamard_edges {
     { 1, 0, 0 }, // reshape->src[0]  == norm
     { 2, 1, 1 }, // mul_mat->src[1]  == reshape
     { 3, 0, 2 }, // reshape->src[0]  == mul_mat
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> l2_norm_clip_mul_mat_sub_edges {
+    { 1, 1, 0 }, // mul_mat->src[1]  == l2_norm_clip
+    { 2, 0, 1 }, // sub->src[0]      == mul_mat
 };
 
 static constexpr std::initializer_list<std::array<int, 3>> norm_hadamard_view_set_rows_edges {
@@ -1014,6 +1021,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_l2_norm_clip_f32;
     // the K store: [dst 0=f32,1=f16,2=q8_0]
     std::array<vk_pipeline, 3> pipeline_l2_norm_clip_set_rows;
+    vk_pipeline pipeline_l2_norm_clip_mul_mat_sub_f32;
 
     // [src/dst 0=fp32,1=fp16,2=bf16]
     vk_pipeline pipeline_unary[GGML_UNARY_OP_COUNT][3];

@@ -5,7 +5,8 @@
 // offsets in floats.
 // Fused with what follows it, for rows of at most BLOCK_SIZE elements: the rotation of a quantized cache (n_rot > 0, the
 // Hadamard product of fwht.comp) and, with SET_ROWS, the K store into the row data_i[i02] of the cache (D_TYPE or, with
-// NORM_STORE_Q8_0, q8_0 blocks; d_nb1 the row stride in its elements).
+// NORM_STORE_Q8_0, q8_0 blocks; d_nb1 the row stride in its elements). With MUL_MAT_SUB, the product of the d_nb1 rows
+// of data_w by the row, less the value of the row in data_t (the relative bias table of Inkling 2 and its sink).
 
 #extension GL_EXT_control_flow_attributes : enable
 
@@ -25,7 +26,12 @@ layout (binding = 3) writeonly buffer D {block_q8_0 data_q[];};
 #else
 layout (binding = 3) writeonly buffer D {D_TYPE data_d[];};
 #endif
+#if defined(MUL_MAT_SUB)
+layout (binding = 4) readonly buffer W {float data_w[];};
+layout (binding = 5) readonly buffer T {float data_t[];};
+#else
 layout (binding = 4) readonly buffer I {uvec2 data_i[];};
+#endif
 
 layout (push_constant) uniform parameter {
     uint ne00; uint ne01; uint ne02; uint n_rows;
@@ -38,6 +44,7 @@ layout (push_constant) uniform parameter {
     uint flags;
     float max_norm; float eps;
     uint d_nb1; uint n_rot; float rot_scale;
+    uint w_offset; uint t_offset;
 } p;
 
 shared float sum[BLOCK_SIZE];
@@ -84,7 +91,7 @@ void main() {
     const float scale = min(1.0f, p.max_norm / (sqrt(sum[0]) + p.eps));
     const float post  = has_post ? data_p[p.p_offset + (i01 % p.p_ne1)*p.p_nb1 + (i02 % p.p_ne2)*p.p_nb2 + (i03 % p.p_ne3)*p.p_nb3] : 1.0f;
 
-#if !defined(SET_ROWS)
+#if !defined(SET_ROWS) && !defined(MUL_MAT_SUB)
     if (p.n_rot == 0) {
         const uint d_base = p.d_offset + row*p.ne00;
         [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
@@ -127,6 +134,16 @@ void main() {
 #elif defined(SET_ROWS)
     if (col < p.ne00) {
         data_d[p.d_offset + data_i[i02].x*p.d_nb1 + i01*p.ne00 + col] = D_TYPE(row_vals[col]);
+    }
+#elif defined(MUL_MAT_SUB)
+    // each element of the product in f32, its terms in order, less the value of the row
+    const float t = data_t[p.t_offset + row];
+    for (uint o = tid; o < p.d_nb1; o += BLOCK_SIZE) {
+        float acc = 0.0f;
+        for (uint k = 0; k < p.ne00; ++k) {
+            acc = fma(data_w[p.w_offset + o*p.ne00 + k], row_vals[k], acc);
+        }
+        data_d[p.d_offset + row*p.d_nb1 + o] = acc - t;
     }
 #else
     if (col < p.ne00) {

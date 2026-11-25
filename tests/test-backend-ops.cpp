@@ -3280,6 +3280,67 @@ struct test_norm_store : public test_case {
     }
 };
 
+// GGML_OP_L2_NORM_CLIP, GGML_OP_MUL_MAT of an f32 weight by the clipped rows and GGML_OP_SUB of one value per row from its
+// product, as Inkling 2 builds the table of its relative bias in a short batch (the weight its bias, the value its sink)
+struct test_clip_mul_mat_sub : public test_case {
+    const std::array<int64_t, 3> ne; // [relative length, heads, tokens]
+    const int64_t n_out;             // the rows of the weight, the distances of the table
+    const bool post;                 // a factor per token after the clip (tau, in the full-attention layers)
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CLIP_MUL_MAT_SUB";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, n_out, post);
+    }
+
+    test_clip_mul_mat_sub(std::array<int64_t, 3> ne = {16, 24, 1}, int64_t n_out = 1025, bool post = false)
+        : ne(ne), n_out(n_out), post(post) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+        ggml_set_name(a, "a");
+        ggml_tensor * scale = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_set_name(scale, "scale");
+        ggml_tensor * f = nullptr;
+        if (post) {
+            f = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, ne[2]);
+            ggml_set_name(f, "post");
+        }
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], n_out);
+        ggml_set_name(w, "w");
+        // the model reshapes its sinks [heads, tokens]: a view node between the product and the SUB, which the Vulkan graph
+        // optimizer moves out of the pattern; the test has no optimizer, so t is shaped as the SUB reads it
+        ggml_tensor * t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, ne[1], ne[2]);
+        ggml_set_name(t, "t");
+
+        ggml_tensor * out = ggml_l2_norm_clip_ext(ctx, a, scale, f, 2.0f, 1e-6f);
+        out = ggml_mul_mat(ctx, w, out);
+        out = ggml_sub(ctx, out, t);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "scale") == 0 || strcmp(t->name, "post") == 0) {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else {
+                // the rows of a scaled have a norm of about 2.4 with 16 elements: some are clipped and some are not
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 5e-4; // same as test_mul_mat
+    }
+};
+
 // GGML_OP_ARGMAX
 struct test_argmax : public test_case {
     const ggml_type type;
@@ -12651,6 +12712,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_norm_store(false, {256,  2, 3}, 64,   GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_norm_store(true,  {64,   4, 3}, 128,  GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_norm_store(true,  {64,   4, 3}, 128,  GGML_TYPE_COUNT));
+
+    // Inkling 2's relative bias table, SWA and full-attention layers, in decode steps of one and two slots (1 and 2 tokens,
+    // fused on Vulkan) and in short batches (3 and 31 tokens, the longest without the sink in the product); then rows past
+    // one element per invocation
+    for (int64_t n_tokens : {1, 2, 3, 31}) {
+        for (bool post : {false, true}) {
+            test_cases.emplace_back(new test_clip_mul_mat_sub({16, 24, n_tokens}, 1025, post));
+        }
+    }
+    test_cases.emplace_back(new test_clip_mul_mat_sub({1024, 2, 3}, 8, true));
 
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));

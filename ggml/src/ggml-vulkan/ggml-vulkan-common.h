@@ -231,6 +231,8 @@ bool ggml_vk_can_fuse_norm_hadamard(const ggml_backend_vk_context * ctx, const s
 // a norm stored by the SET_ROWS that ends its fusion, rotated first if rotate
 bool ggml_vk_can_fuse_norm_set_rows(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, bool rotate, uint32_t max_cols);
 bool ggml_vk_can_fuse_rms_norm_set_rows(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, bool rotate);
+// a clip multiplied by an f32 weight, one value per row subtracted from the product
+bool ggml_vk_can_fuse_l2_norm_clip_mul_mat_sub(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
 bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
 bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise);
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx);
