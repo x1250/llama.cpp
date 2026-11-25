@@ -545,6 +545,13 @@ static constexpr std::initializer_list<ggml_op> topk_moe_sigmoid_norm_bias{ GGML
                                                                             GGML_OP_RESHAPE,  GGML_OP_SUM_ROWS, GGML_OP_CLAMP,
                                                                             GGML_OP_DIV,      GGML_OP_RESHAPE };
 
+// the sum adjusted with a scale and bias (an epsilon) instead of a lower clamp (Inkling 2), with the edges of
+// topk_moe_sigmoid_norm_bias
+static constexpr std::initializer_list<ggml_op> topk_moe_sigmoid_norm_eps_bias{ GGML_OP_UNARY,    GGML_OP_RESHAPE,  GGML_OP_ADD,
+                                                                                GGML_OP_ARGSORT,  GGML_OP_VIEW,     GGML_OP_GET_ROWS,
+                                                                                GGML_OP_RESHAPE,  GGML_OP_SUM_ROWS, GGML_OP_SCALE,
+                                                                                GGML_OP_DIV,      GGML_OP_RESHAPE };
+
 static constexpr std::initializer_list<ggml_op> topk_moe_sqrt_softplus_norm_bias{ GGML_OP_UNARY,    GGML_OP_SQRT,
                                                                                   GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                                   GGML_OP_ARGSORT,  GGML_OP_VIEW,
@@ -622,9 +629,9 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_moe_sigmoid_norm
     { 5, 1, 4 }, // get_rows->src[1] == view
     { 6, 0, 5 }, // reshape->src[0]  == get_rows
     { 7, 0, 6 }, // sum_rows->src[0] == reshape
-    { 8, 0, 7 }, // clamp->src[0]    == sum_rows
+    { 8, 0, 7 }, // clamp->src[0]    == sum_rows (or scale)
     { 9, 0, 6 }, // div->src[0]      == reshape
-    { 9, 1, 8 }, // div->src[1]      == clamp
+    { 9, 1, 8 }, // div->src[1]      == clamp (or scale)
     {10, 0, 9 }, // reshape->src[0]  == div
 };
 
@@ -665,6 +672,7 @@ enum topk_moe_mode {
     TOPK_MOE_EARLY_SOFTMAX_NORM,
     TOPK_MOE_LATE_SOFTMAX,
     TOPK_MOE_SIGMOID_NORM_BIAS,
+    TOPK_MOE_SIGMOID_NORM_EPS_BIAS,
     TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS,
     TOPK_MOE_COUNT,
 };

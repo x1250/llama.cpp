@@ -8052,6 +8052,14 @@ struct test_topk_moe : public test_case {
 
     bool run_whole_graph() override { return true; }
 
+    // Vulkan's fused router of sigmoid scores with an epsilon in the sum gives the bytes of its unfused ops in every
+    // run (the graph copy of the check runs them: its nodes carry no use counts, so it does not fuse); the routers of
+    // the other modes differ from their unfused ops in the last bits
+    bool deterministic(ggml_backend_t backend) override {
+        const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
+        return strcmp(name, "Vulkan") == 0 && gating_func == GATING_FUNC_SIGMOID && norm_bias;
+    }
+
     // the selection scores (probs plus bias) of a row are a random permutation of a grid, and the experts of
     // the n_group_used best groups move up by half a step, so every expert and group decision is one step
     // apart; the logits are the inverse of the gating function at these scores
@@ -14265,6 +14273,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (float scale_w : {0.0f, 2.0f}) {
         test_cases.emplace_back(new test_topk_moe({8, 22, 1, 1}, 4, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
         test_cases.emplace_back(new test_topk_moe({384,  1, 1, 1}, 6, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
+        // every expert used: the selected experts take more than one per thread
+        test_cases.emplace_back(new test_topk_moe({128,  3, 1, 1}, 128, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
+        test_cases.emplace_back(new test_topk_moe({160,  4, 1, 1}, 160, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
+    }
+    // Inkling 2: 8 of 128 experts, the weights scaled by 8; one and two tokens, and prompt ubatches
+    for (int64_t n_tokens : {1, 2, 512, 2048}) {
+        test_cases.emplace_back(new test_topk_moe({128, n_tokens, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
     }
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.

@@ -537,6 +537,9 @@ struct vk_op_topk_moe_push_constants {
     uint32_t with_norm;
     float output_scale;
     float output_bias;
+    float norm_scale;
+    float norm_bias;
+    uint32_t argsort_select;
 };
 
 struct vk_op_add_id_push_constants {
