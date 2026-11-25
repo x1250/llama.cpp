@@ -9417,6 +9417,119 @@ struct test_tanh_blend : public test_case {
     }
 };
 
+// the layer inputs a [n_embd, n_tokens, n_a] and the messages b [n_embd, n_tokens, n] of the loop controllers, as views
+// of one more group (Inkling 2's mixed inputs and messages) or as tensors of their own
+static void loop_control_inputs(ggml_context * ctx, int64_t n_embd, int64_t n_tokens, int64_t n_a, int n, bool views,
+        ggml_tensor ** a, ggml_tensor ** b) {
+    if (views) {
+        ggml_tensor * mixed    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, n_a + 1);
+        ggml_tensor * messages = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, n + 1);
+        ggml_set_name(mixed,    "mixed");
+        ggml_set_name(messages, "messages");
+        *a = ggml_view_3d(ctx, mixed,    n_embd, n_tokens, n_a, mixed->nb[1],    mixed->nb[2],    mixed->nb[2]);
+        *b = ggml_view_3d(ctx, messages, n_embd, n_tokens, n,   messages->nb[1], messages->nb[2], messages->nb[2]);
+    } else {
+        *a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, n_a);
+        *b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, n);
+    }
+    ggml_set_name(*a, "a");
+    ggml_set_name(*b, "b");
+}
+
+// the loop controller tensors: weights of the magnitude 1/sqrt(row length) of a trained matrix, so that the gates stay
+// mostly out of the saturation of tanh, and inputs of different scales, so that the normalization matters
+static void loop_control_initialize(ggml_context * ctx) {
+    int i = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t), ++i) {
+        const float s = t->type == GGML_TYPE_BF16 ? 1.0f/sqrtf((float) t->ne[0]) : 0.5f + 1.5f*(i % 4);
+        init_tensor_uniform(t, -s, s);
+    }
+}
+
+// GGML_OP_RMS_NORM_CONCAT_MUL_MAT
+struct test_rms_norm_concat_mul_mat : public test_case {
+    const int64_t n_embd;
+    const int64_t n_out;
+    const int64_t n_tokens;
+    const int n;       // groups
+    const int64_t n_a; // groups of a: 1 or n
+    const bool views;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_embd, n_out, n_tokens, n, n_a, views);
+    }
+
+    test_rms_norm_concat_mul_mat(int64_t n_embd = 2304, int64_t n_out = 64, int64_t n_tokens = 1, int n = 3,
+            int64_t n_a = 1, bool views = false)
+        : n_embd(n_embd), n_out(n_out), n_tokens(n_tokens), n(n), n_a(n_a), views(views) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        ggml_tensor * b;
+        loop_control_inputs(ctx, n_embd, n_tokens, n_a, n, views, &a, &b);
+
+        ggml_tensor * w[GGML_MAX_SRC];
+        for (int c = 0; c < n; ++c) {
+            w[c] = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 2*n_embd, n_out);
+            ggml_set_name(w[c], "w");
+        }
+
+        ggml_tensor * out = ggml_rms_norm_concat_mul_mat(ctx, a, b, w, n, 1e-6f);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        loop_control_initialize(ctx);
+    }
+};
+
+// GGML_OP_TANH_BLEND_MUL_MAT
+struct test_tanh_blend_mul_mat : public test_case {
+    const int64_t n_embd;
+    const int64_t n_in;
+    const int64_t n_tokens;
+    const int n;       // groups
+    const int64_t n_a; // groups of a: 1 or n
+    const bool views;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_embd, n_in, n_tokens, n, n_a, views);
+    }
+
+    test_tanh_blend_mul_mat(int64_t n_embd = 2304, int64_t n_in = 64, int64_t n_tokens = 1, int n = 3,
+            int64_t n_a = 1, bool views = false)
+        : n_embd(n_embd), n_in(n_in), n_tokens(n_tokens), n(n), n_a(n_a), views(views) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        ggml_tensor * b;
+        loop_control_inputs(ctx, n_embd, n_tokens, n_a, n, views, &a, &b);
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, n_tokens, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * wf[GGML_MAX_SRC];
+        ggml_tensor * wg[GGML_MAX_SRC];
+        for (int c = 0; c < n; ++c) {
+            wf[c] = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, n_in, n_embd);
+            wg[c] = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, n_in, n_embd);
+            ggml_set_name(wf[c], "wf");
+            ggml_set_name(wg[c], "wg");
+        }
+
+        ggml_tensor * out = ggml_tanh_blend_mul_mat(ctx, a, b, x, wf, wg, n);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        loop_control_initialize(ctx);
+    }
+};
+
 struct test_flash_attn_ext_rel : public test_case {
     const int64_t hs;    // K and V head size
     const int64_t nh;    // num K/V heads
@@ -13667,6 +13780,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_tanh_blend({2304, 7, 1, 1}, true));
     test_cases.emplace_back(new test_tanh_blend({100, 5, 3, 2}));
+
+    // Inkling-2-Mini's loop controllers: Q, K and V of a SWA layer (one input) and of a global layer (three), and the FFN
+    for (int64_t n_tokens : {1, 2, 3, 8, 9, 512}) {
+        for (auto [n, n_a] : std::vector<std::pair<int, int64_t>>{{3, 1}, {3, 3}, {1, 1}}) {
+            test_cases.emplace_back(new test_rms_norm_concat_mul_mat(2304, 64, n_tokens, n, n_a, true));
+            test_cases.emplace_back(new test_tanh_blend_mul_mat(2304, 64, n_tokens, n, n_a, true));
+        }
+    }
+    test_cases.emplace_back(new test_rms_norm_concat_mul_mat(2304, 64, 2, 3, 3, false));
+    test_cases.emplace_back(new test_tanh_blend_mul_mat(2304, 64, 2, 3, 3, false));
+    // rows of a and b shorter than a subgroup's 256 columns and not a multiple of them, rows past the last full
+    // workgroup, rows of x of more than 256
+    test_cases.emplace_back(new test_rms_norm_concat_mul_mat(100, 5, 3, 2, 2, false));
+    test_cases.emplace_back(new test_rms_norm_concat_mul_mat(200, 7, 2, 3, 1, true));
+    test_cases.emplace_back(new test_rms_norm_concat_mul_mat(516, 9, 4, 2, 1, false));
+    test_cases.emplace_back(new test_tanh_blend_mul_mat(37, 12, 3, 2, 2, false));
+    test_cases.emplace_back(new test_tanh_blend_mul_mat(100, 260, 2, 3, 1, true));
+    test_cases.emplace_back(new test_tanh_blend_mul_mat(16, 4, 1, 1, 1, false));
+
     test_cases.emplace_back(new test_depth_attn(100,  65, 7, 2, true));
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
@@ -14872,6 +15004,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
     test_cases.emplace_back(new test_ssm_conv_residual(GGML_TYPE_F32, {2051, 2304, 1, 1}, {4, 2304, 1, 1}, 1.0f/sqrtf(5.0f))); // Inkling 2 prefill
     test_cases.emplace_back(new test_ssm_conv_residual(GGML_TYPE_F32, {4,    2304, 1, 1}, {4, 2304, 1, 1}, 1.0f/sqrtf(5.0f))); // Inkling 2 generate
+    // Inkling 2's loop controllers (Q, K and V of a SWA layer, the FFN), and the ops of one controller without them
+    for (int64_t n_tokens : {1, 2, 8, 2048}) {
+        test_cases.emplace_back(new test_rms_norm_concat_mul_mat(2304, 64, n_tokens, 3, 1, true));
+        test_cases.emplace_back(new test_rms_norm_concat_mul_mat(2304, 64, n_tokens, 1, 1, true));
+        test_cases.emplace_back(new test_tanh_blend_mul_mat(2304, 64, n_tokens, 3, 1, true));
+        test_cases.emplace_back(new test_tanh_blend_mul_mat(2304, 64, n_tokens, 1, 1, true));
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {2304, n_tokens, 1, 1}));
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {2304, n_tokens, 1, 1}, 2304, 0));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 64,   n_tokens, 4608, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 2304, n_tokens, 64,   {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_tanh_blend({2304, n_tokens, 1, 1}));
+    }
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill

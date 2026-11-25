@@ -824,6 +824,34 @@ struct vk_op_tanh_blend_push_constants {
     uint32_t a_offset, b_offset, f_offset, g_offset, d_offset;
 };
 
+// ggml_rms_norm_concat_mul_mat and ggml_tanh_blend_mul_mat (rms_norm_concat_mul_mat.comp, tanh_blend_mul_mat.comp):
+// up to three groups; per tensor the row stride, the group stride (0 for a tensor of one group) and the offset in
+// floats, the matrix offsets in words
+#define VK_LOOP_CONTROL_MAX_GROUPS 3
+// workgroups of 256 threads: 2 rows of the down matrix per workgroup, 4 threads per row of the gain and forget matrices
+#define VK_LOOP_CONTROL_BLOCK_SIZE      256
+#define VK_RMS_NORM_CONCAT_MUL_MAT_ROWS 2
+#define VK_TANH_BLEND_MUL_MAT_CLUSTER   4
+static_assert(VK_TANH_BLEND_MUL_MAT_CLUSTER == 4 || VK_TANH_BLEND_MUL_MAT_CLUSTER == 8, "tanh_blend_mul_mat.comp takes clusters of 4 or 8");
+struct vk_op_rms_norm_concat_mul_mat_push_constants {
+    uint32_t ne0, n_rows, n_tokens;
+    float eps;
+    uint32_t a_stride, a_group, a_offset;
+    uint32_t b_stride, b_group, b_offset;
+    uint32_t d_stride, d_group, d_offset;
+    uint32_t w_offset[VK_LOOP_CONTROL_MAX_GROUPS];
+};
+
+struct vk_op_tanh_blend_mul_mat_push_constants {
+    uint32_t ncols, n_rows, n_tokens;
+    uint32_t x_stride, x_group, x_offset;
+    uint32_t a_stride, a_group, a_offset;
+    uint32_t b_stride, b_group, b_offset;
+    uint32_t d_stride, d_group, d_offset;
+    uint32_t wf_offset[VK_LOOP_CONTROL_MAX_GROUPS];
+    uint32_t wg_offset[VK_LOOP_CONTROL_MAX_GROUPS];
+};
+
 // ggml_depth_attn: strides and offsets in floats, states beyond n_states unused (depth_attn.comp)
 #define VK_DEPTH_ATTN_MAX_STATES 9
 #define VK_DEPTH_ATTN_MAX_QUERY  4

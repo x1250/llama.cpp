@@ -4283,6 +4283,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_depth_attn_f32, "depth_attn_f32", depth_attn_f32_len, depth_attn_f32_data, "main", 2 + VK_DEPTH_ATTN_MAX_STATES, sizeof(vk_op_depth_attn_push_constants), {1, 1, 1}, {64, device->subgroup_size}, 1);
     }
     ggml_vk_create_pipeline(device, device->pipeline_tanh_blend_f32, "tanh_blend_f32", tanh_blend_f32_len, tanh_blend_f32_data, "main", 5, sizeof(vk_op_tanh_blend_push_constants), {512, 1, 1}, {}, 1);
+    // the loop controllers: full subgroups of a fixed size, whose sums the workgroup adds in order; clusters of threads
+    // within a subgroup
+    if (device->subgroup_arithmetic && device->subgroup_clustered && device->subgroup_require_full_support &&
+        VK_LOOP_CONTROL_BLOCK_SIZE % device->subgroup_size == 0 && device->subgroup_size >= VK_TANH_BLEND_MUL_MAT_CLUSTER) {
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_concat_mul_mat_bf16, "rms_norm_concat_mul_mat_bf16", rms_norm_concat_mul_mat_bf16_len, rms_norm_concat_mul_mat_bf16_data, "main", 2*VK_LOOP_CONTROL_MAX_GROUPS, sizeof(vk_op_rms_norm_concat_mul_mat_push_constants), {1, 1, 1}, {VK_LOOP_CONTROL_BLOCK_SIZE, VK_RMS_NORM_CONCAT_MUL_MAT_ROWS}, 1, true, true, device->subgroup_size);
+        ggml_vk_create_pipeline(device, device->pipeline_tanh_blend_mul_mat_bf16, "tanh_blend_mul_mat_bf16", tanh_blend_mul_mat_bf16_len, tanh_blend_mul_mat_bf16_data, "main", 2*VK_LOOP_CONTROL_MAX_GROUPS + 4, sizeof(vk_op_tanh_blend_mul_mat_push_constants), {1, 1, 1}, {VK_LOOP_CONTROL_BLOCK_SIZE, VK_TANH_BLEND_MUL_MAT_CLUSTER}, 1, true, true, device->subgroup_size);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_residual_f32,  "ssm_conv_residual_f32",  ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1}, 1);
@@ -11643,6 +11650,85 @@ void ggml_vk_tanh_blend(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_
         pc, { pc.ne0, rows_y, CEIL_DIV(pc.n_rows, rows_y) });
 }
 
+// the row stride, the group stride (0 for a tensor of one group) and the offset in floats of a loop controller tensor
+static void ggml_vk_loop_control_layout(const ggml_backend_vk_context * ctx, const ggml_tensor * t, uint32_t & stride, uint32_t & group, uint32_t & offset) {
+    stride = (uint32_t) (t->nb[1] / sizeof(float));
+    group  = t->ne[2] == 1 ? 0 : (uint32_t) (t->nb[2] / sizeof(float));
+    offset = get_misalign_bytes(ctx, t) / sizeof(float);
+}
+
+// the bf16 matrix of group c, the last one for the groups past n, and its offset in words
+static vk_subbuffer ggml_vk_loop_control_matrix(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, int first, uint32_t c, uint32_t & offset) {
+    const ggml_tensor * w = dst->src[first + std::min<int64_t>(c, dst->ne[2] - 1)];
+    const uint32_t misalign = get_misalign_bytes(ctx, w);
+    GGML_ASSERT(misalign % sizeof(uint32_t) == 0);
+    offset = misalign / sizeof(uint32_t);
+    return ggml_vk_tensor_subbuffer(ctx, w, true);
+}
+
+void ggml_vk_rms_norm_concat_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+
+    vk_pipeline pipeline = ctx->device->pipeline_rms_norm_concat_mul_mat_bf16;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_op_rms_norm_concat_mul_mat_push_constants pc {};
+    pc.ne0      = (uint32_t) a->ne[0];
+    pc.n_rows   = (uint32_t) dst->ne[0];
+    pc.n_tokens = (uint32_t) dst->ne[1];
+    pc.eps      = ggml_get_op_params_f32(dst, 0);
+    ggml_vk_loop_control_layout(ctx, a,   pc.a_stride, pc.a_group, pc.a_offset);
+    ggml_vk_loop_control_layout(ctx, b,   pc.b_stride, pc.b_group, pc.b_offset);
+    ggml_vk_loop_control_layout(ctx, dst, pc.d_stride, pc.d_group, pc.d_offset);
+
+    std::array<vk_subbuffer, VK_LOOP_CONTROL_MAX_GROUPS> w_buf;
+    for (uint32_t c = 0; c < VK_LOOP_CONTROL_MAX_GROUPS; ++c) {
+        w_buf[c] = ggml_vk_loop_control_matrix(ctx, dst, 2, c, pc.w_offset[c]);
+    }
+
+    // the tokens past the dispatch limit of y in a loop
+    const uint32_t wg_y = std::min(pc.n_tokens, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { w_buf[0], w_buf[1], w_buf[2], ggml_vk_tensor_subbuffer(ctx, a, true), ggml_vk_tensor_subbuffer(ctx, b, true),
+          ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { CEIL_DIV(pc.n_rows, VK_RMS_NORM_CONCAT_MUL_MAT_ROWS), wg_y, (uint32_t) dst->ne[2] });
+}
+
+void ggml_vk_tanh_blend_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * x = dst->src[2];
+    const int n = (int) dst->ne[2];
+
+    vk_pipeline pipeline = ctx->device->pipeline_tanh_blend_mul_mat_bf16;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_op_tanh_blend_mul_mat_push_constants pc {};
+    pc.ncols    = (uint32_t) x->ne[0];
+    pc.n_rows   = (uint32_t) dst->ne[0];
+    pc.n_tokens = (uint32_t) dst->ne[1];
+    ggml_vk_loop_control_layout(ctx, x,   pc.x_stride, pc.x_group, pc.x_offset);
+    ggml_vk_loop_control_layout(ctx, a,   pc.a_stride, pc.a_group, pc.a_offset);
+    ggml_vk_loop_control_layout(ctx, b,   pc.b_stride, pc.b_group, pc.b_offset);
+    ggml_vk_loop_control_layout(ctx, dst, pc.d_stride, pc.d_group, pc.d_offset);
+
+    std::array<vk_subbuffer, VK_LOOP_CONTROL_MAX_GROUPS> wf_buf;
+    std::array<vk_subbuffer, VK_LOOP_CONTROL_MAX_GROUPS> wg_buf;
+    for (uint32_t c = 0; c < VK_LOOP_CONTROL_MAX_GROUPS; ++c) {
+        wf_buf[c] = ggml_vk_loop_control_matrix(ctx, dst, 3,     c, pc.wf_offset[c]);
+        wg_buf[c] = ggml_vk_loop_control_matrix(ctx, dst, 3 + n, c, pc.wg_offset[c]);
+    }
+
+    // the tokens past the dispatch limit of y in a loop
+    const uint32_t wg_y = std::min(pc.n_tokens, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { wf_buf[0], wf_buf[1], wf_buf[2], wg_buf[0], wg_buf[1], wg_buf[2], ggml_vk_tensor_subbuffer(ctx, x, true),
+          ggml_vk_tensor_subbuffer(ctx, a, true), ggml_vk_tensor_subbuffer(ctx, b, true),
+          ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { CEIL_DIV(pc.n_rows, VK_LOOP_CONTROL_BLOCK_SIZE / VK_TANH_BLEND_MUL_MAT_CLUSTER), wg_y, (uint32_t) n });
+}
+
 void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * conv = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = conv->src[0];
@@ -14078,6 +14164,14 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
     case GGML_OP_TANH_BLEND:
         ggml_vk_tanh_blend(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_RMS_NORM_CONCAT_MUL_MAT:
+        ggml_vk_rms_norm_concat_mul_mat(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_TANH_BLEND_MUL_MAT:
+        ggml_vk_tanh_blend_mul_mat(ctx, compute_ctx, node);
 
         break;
 
@@ -17592,6 +17686,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 return ggml_nrows(op) <= (int64_t) device->properties.limits.maxComputeWorkGroupCount[1] *
                                          (int64_t) device->properties.limits.maxComputeWorkGroupCount[2];
             }
+        case GGML_OP_RMS_NORM_CONCAT_MUL_MAT:
+            // rms_norm_concat_mul_mat.comp: up to three groups, rows of a multiple of 4, the matrix rows in x
+            return device->pipeline_rms_norm_concat_mul_mat_bf16 != nullptr && op->ne[2] <= VK_LOOP_CONTROL_MAX_GROUPS &&
+                   op->src[0]->ne[0] % 4 == 0 &&
+                   CEIL_DIV(op->ne[0], VK_RMS_NORM_CONCAT_MUL_MAT_ROWS) <= device->properties.limits.maxComputeWorkGroupCount[0];
+        case GGML_OP_TANH_BLEND_MUL_MAT:
+            // tanh_blend_mul_mat.comp: up to three groups, rows of x of a multiple of 4, the matrix rows in x
+            return device->pipeline_tanh_blend_mul_mat_bf16 != nullptr && op->ne[2] <= VK_LOOP_CONTROL_MAX_GROUPS &&
+                   op->src[2]->ne[0] % 4 == 0 &&
+                   CEIL_DIV(op->ne[0], VK_LOOP_CONTROL_BLOCK_SIZE / VK_TANH_BLEND_MUL_MAT_CLUSTER) <= device->properties.limits.maxComputeWorkGroupCount[0];
         case GGML_OP_DEPTH_ATTN:
             // depth_attn.comp: up to 9 states and 4 queries, one workgroup per token
             return ggml_get_op_params_i32(op, 0) <= VK_DEPTH_ATTN_MAX_STATES && op->src[0]->ne[1] <= VK_DEPTH_ATTN_MAX_QUERY &&

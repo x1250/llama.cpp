@@ -9849,6 +9849,118 @@ void ggml_compute_forward_tanh_blend(
     }
 }
 
+// the row of group c and token t of a loop controller input; a single group is shared by all
+static const float * loop_control_row(const ggml_tensor * t, int64_t token, int64_t c) {
+    return (const float *) ((const char *) t->data + token*t->nb[1] + (t->ne[2] == 1 ? 0 : c)*t->nb[2]);
+}
+
+// the product of row i of the BF16 matrix w with x, summed in ggml_float
+static float loop_control_dot(const ggml_tensor * w, int64_t i, const float * x) {
+    const ggml_bf16_t * rw = (const ggml_bf16_t *) ((const char *) w->data + i*w->nb[1]);
+
+    ggml_float sum = 0.0;
+    for (int64_t k = 0; k < w->ne[0]; ++k) {
+        sum += (ggml_float)(GGML_BF16_TO_FP32(rw[k])*x[k]);
+    }
+    return sum;
+}
+
+// ggml_compute_forward_rms_norm_concat_mul_mat
+
+void ggml_compute_forward_rms_norm_concat_mul_mat(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const float eps = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t n_embd   = a->ne[0];
+    const int64_t n_out    = dst->ne[0];
+    const int64_t n_tokens = dst->ne[1];
+    const int64_t n        = dst->ne[2];
+
+    // this thread's concatenation of the two normalized rows
+    float * u = (float *) params->wdata + (2*n_embd + CACHE_LINE_SIZE_F32)*params->ith;
+
+    // the rms_norm of row x into y
+    auto normalize = [n_embd, eps](const float * x, float * y) {
+        ggml_float sum = 0.0;
+        for (int64_t i = 0; i < n_embd; ++i) {
+            sum += (ggml_float)(x[i]*x[i]);
+        }
+        const float mean  = sum/n_embd;
+        const float scale = 1.0f/sqrtf(mean + eps);
+        for (int64_t i = 0; i < n_embd; ++i) {
+            y[i] = x[i]*scale;
+        }
+    };
+
+    // the outputs (row, token, group) in one block per thread; the normalized rows are built once per token and group
+    const int64_t nr  = n_out*n_tokens*n;
+    const int64_t dr  = (nr + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    int64_t built = -1;
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t r  = ir % n_out;
+        const int64_t tc = ir / n_out;
+        const int64_t t  = tc % n_tokens;
+        const int64_t c  = tc / n_tokens;
+
+        if (tc != built) {
+            normalize(loop_control_row(a, t, c), u);
+            normalize(loop_control_row(b, t, c), u + n_embd);
+            built = tc;
+        }
+
+        float * rd = (float *) ((char *) dst->data + t*dst->nb[1] + c*dst->nb[2]);
+        rd[r] = loop_control_dot(dst->src[2 + c], r, u);
+    }
+}
+
+// ggml_compute_forward_tanh_blend_mul_mat
+
+void ggml_compute_forward_tanh_blend_mul_mat(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * x = dst->src[2];
+
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_tokens = dst->ne[1];
+    const int64_t n        = dst->ne[2];
+
+    // the outputs (element, token, group) in one block per thread
+    const int64_t nr  = n_embd*n_tokens*n;
+    const int64_t dr  = (nr + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i  = ir % n_embd;
+        const int64_t tc = ir / n_embd;
+        const int64_t t  = tc % n_tokens;
+        const int64_t c  = tc / n_tokens;
+
+        const float * rx = loop_control_row(x, t, c);
+        const float   ra = loop_control_row(a, t, c)[i];
+        const float   rb = loop_control_row(b, t, c)[i];
+
+        const float forget_a = tanhf(loop_control_dot(dst->src[3 + c],     i, rx))*ra;
+        const float gain_b   = tanhf(loop_control_dot(dst->src[3 + n + c], i, rx))*rb;
+
+        float * rd = (float *) ((char *) dst->data + t*dst->nb[1] + c*dst->nb[2]);
+        rd[i] = (ra - forget_a) + gain_b;
+    }
+}
+
 // ggml_compute_forward_flash_attn_back
 
 static void ggml_compute_forward_flash_attn_back_f32(

@@ -1,0 +1,140 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// ggml_rms_norm_concat_mul_mat with bf16 matrices, up to three groups. A workgroup takes NUM_ROWS rows of the matrix of
+// one group, for one token at a time, in one pass over the two input rows: each thread sums the squares of its columns
+// of a and b and their products with the two halves of each matrix row; the workgroup adds the partial sums of its
+// subgroups in order, and row r is scale_a*dot_a[r] + scale_b*dot_b[r], with the scales 1/rms of a and of b
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint NUM_ROWS = 2;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer W0 {uint data_w0[];}; // two bf16 per word
+layout (binding = 1) readonly buffer W1 {uint data_w1[];};
+layout (binding = 2) readonly buffer W2 {uint data_w2[];};
+layout (binding = 3) readonly buffer A {float data_a[];};
+layout (binding = 4) readonly buffer B {float data_b[];};
+layout (binding = 5) writeonly buffer D {float data_d[];};
+
+// per tensor the row stride, the group stride (0 for one group) and the offset in floats; the matrix offsets in words
+layout (push_constant) uniform parameter
+{
+    uint ne0;      // row length of a and b, a multiple of 4
+    uint n_rows;   // rows of each matrix
+    uint n_tokens;
+    float eps;
+    uint a_stride; uint a_group; uint a_offset;
+    uint b_stride; uint b_group; uint b_offset;
+    uint d_stride; uint d_group; uint d_offset;
+    uint w_offset[3];
+} p;
+
+// the sums of each subgroup: the squares of a and b, the products of each row with a and with b
+shared float squares_sh[2][BLOCK_SIZE];
+shared float dot_a_sh[NUM_ROWS][BLOCK_SIZE];
+shared float dot_b_sh[NUM_ROWS][BLOCK_SIZE];
+
+// the word idx of the matrix of group c
+uint weight_word(const uint c, const uint idx) {
+    if (c == 0) {
+        return data_w0[p.w_offset[0] + idx];
+    } else if (c == 1) {
+        return data_w1[p.w_offset[1] + idx];
+    }
+    return data_w2[p.w_offset[2] + idx];
+}
+
+// the four weights from element idx on, idx even
+vec4 weights4(const uint c, const uint idx) {
+    const uint lo = weight_word(c, idx / 2);
+    const uint hi = weight_word(c, idx / 2 + 1);
+    return vec4(uintBitsToFloat((lo & 0x0000ffff) << 16),
+                uintBitsToFloat( lo & 0xffff0000),
+                uintBitsToFloat((hi & 0x0000ffff) << 16),
+                uintBitsToFloat( hi & 0xffff0000));
+}
+
+void compute_outputs(const uint c, const uint token, const uint first_row, const uint num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint a_offset = p.a_offset + token * p.a_stride + c * p.a_group;
+    const uint b_offset = p.b_offset + token * p.b_stride + c * p.b_group;
+
+    float squares_a = 0.0f;
+    float squares_b = 0.0f;
+    float dot_a[NUM_ROWS];
+    float dot_b[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        dot_a[n] = 0.0f;
+        dot_b[n] = 0.0f;
+    }
+
+    for (uint col = 4 * tid; col < p.ne0; col += 4 * BLOCK_SIZE) {
+        const vec4 xa = vec4(data_a[a_offset + col], data_a[a_offset + col + 1], data_a[a_offset + col + 2], data_a[a_offset + col + 3]);
+        const vec4 xb = vec4(data_b[b_offset + col], data_b[b_offset + col + 1], data_b[b_offset + col + 2], data_b[b_offset + col + 3]);
+        squares_a += dot(xa, xa);
+        squares_b += dot(xb, xb);
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            if (n < num_rows) {
+                const uint iw = (first_row + n) * 2 * p.ne0 + col;
+                dot_a[n] += dot(weights4(c, iw), xa);
+                dot_b[n] += dot(weights4(c, iw + p.ne0), xb);
+            }
+        }
+    }
+
+    squares_a = subgroupAdd(squares_a);
+    squares_b = subgroupAdd(squares_b);
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        dot_a[n] = subgroupAdd(dot_a[n]);
+        dot_b[n] = subgroupAdd(dot_b[n]);
+    }
+    if (gl_SubgroupInvocationID == 0) {
+        squares_sh[0][gl_SubgroupID] = squares_a;
+        squares_sh[1][gl_SubgroupID] = squares_b;
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            dot_a_sh[n][gl_SubgroupID] = dot_a[n];
+            dot_b_sh[n][gl_SubgroupID] = dot_b[n];
+        }
+    }
+    barrier();
+
+    if (tid == 0) {
+        for (uint s = 1; s < gl_NumSubgroups; ++s) {
+            squares_a += squares_sh[0][s];
+            squares_b += squares_sh[1][s];
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                dot_a[n] += dot_a_sh[n][s];
+                dot_b[n] += dot_b_sh[n][s];
+            }
+        }
+
+        const float scale_a = inversesqrt(squares_a / float(p.ne0) + p.eps);
+        const float scale_b = inversesqrt(squares_b / float(p.ne0) + p.eps);
+
+        const uint d_offset = p.d_offset + token * p.d_stride + c * p.d_group;
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            if (n < num_rows) {
+                data_d[d_offset + first_row + n] = scale_a * dot_a[n] + scale_b * dot_b[n];
+            }
+        }
+    }
+    // the next token writes the shared sums again
+    barrier();
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    const uint num_rows  = min(NUM_ROWS, p.n_rows - first_row);
+    const uint c         = gl_WorkGroupID.z;
+
+    // the tokens past the dispatch limit of y in a loop
+    for (uint token = gl_WorkGroupID.y; token < p.n_tokens; token += gl_NumWorkGroups.y) {
+        compute_outputs(c, token, first_row, num_rows);
+    }
+}

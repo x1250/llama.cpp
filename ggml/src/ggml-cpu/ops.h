@@ -89,6 +89,8 @@ void ggml_compute_forward_sleep(const struct ggml_compute_params * params, struc
 void ggml_compute_forward_flash_attn_ext(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_depth_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_tanh_blend(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_rms_norm_concat_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_tanh_blend_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_flash_attn_back(
         const struct ggml_compute_params * params,
         const bool masked,

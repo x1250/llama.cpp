@@ -2055,6 +2055,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_tanh_blend(params, tensor);
             } break;
+        case GGML_OP_RMS_NORM_CONCAT_MUL_MAT:
+            {
+                ggml_compute_forward_rms_norm_concat_mul_mat(params, tensor);
+            } break;
+        case GGML_OP_TANH_BLEND_MUL_MAT:
+            {
+                ggml_compute_forward_tanh_blend_mul_mat(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
                 int32_t t = ggml_get_op_params_i32(tensor, 0);
@@ -2457,6 +2465,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_EXT_REL:
         case GGML_OP_DEPTH_ATTN:
         case GGML_OP_TANH_BLEND:
+        case GGML_OP_RMS_NORM_CONCAT_MUL_MAT:
+        case GGML_OP_TANH_BLEND_MUL_MAT:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
@@ -2961,6 +2971,11 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_ROPE_BACK:
                     {
                         cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
+                    } break;
+                case GGML_OP_RMS_NORM_CONCAT_MUL_MAT:
+                    {
+                        // the concatenation of the two normalized rows
+                        cur = ggml_type_size(GGML_TYPE_F32) * 2 * node->src[0]->ne[0] * n_tasks;
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_1D:
                     {

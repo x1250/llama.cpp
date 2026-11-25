@@ -1040,6 +1040,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_depth_attn_f32;
     vk_pipeline pipeline_depth_attn_wide_f32;
     vk_pipeline pipeline_tanh_blend_f32;
+    vk_pipeline pipeline_rms_norm_concat_mul_mat_bf16;
+    vk_pipeline pipeline_tanh_blend_mul_mat_bf16;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     vk_pipeline pipeline_ssm_conv_residual_f32;

@@ -1,0 +1,128 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+// ggml_tanh_blend_mul_mat with bf16 matrices, up to three groups. A cluster of CLUSTER_SIZE threads takes one row of
+// the two matrices of one group, for one token at a time: each thread sums the products of its columns with x in order,
+// a clustered sum adds the threads, and the first thread of the cluster blends the row with the expressions of
+// tanh_blend.comp
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint CLUSTER_SIZE = 4;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer WF0 {uint data_wf0[];}; // two bf16 per word
+layout (binding = 1) readonly buffer WF1 {uint data_wf1[];};
+layout (binding = 2) readonly buffer WF2 {uint data_wf2[];};
+layout (binding = 3) readonly buffer WG0 {uint data_wg0[];};
+layout (binding = 4) readonly buffer WG1 {uint data_wg1[];};
+layout (binding = 5) readonly buffer WG2 {uint data_wg2[];};
+layout (binding = 6) readonly buffer X {float data_x[];};
+layout (binding = 7) readonly buffer A {float data_a[];};
+layout (binding = 8) readonly buffer B {float data_b[];};
+layout (binding = 9) writeonly buffer D {float data_d[];};
+
+// per tensor the row stride, the group stride (0 for one group) and the offset in floats; the matrix offsets in words
+layout (push_constant) uniform parameter
+{
+    uint ncols;  // row length of x and of the matrices, a multiple of 4
+    uint n_rows; // rows of each matrix, the row length of a, b and the result
+    uint n_tokens;
+    uint x_stride; uint x_group; uint x_offset;
+    uint a_stride; uint a_group; uint a_offset;
+    uint b_stride; uint b_group; uint b_offset;
+    uint d_stride; uint d_group; uint d_offset;
+    uint wf_offset[3];
+    uint wg_offset[3];
+} p;
+
+const uint ROWS_PER_WORKGROUP = BLOCK_SIZE / CLUSTER_SIZE;
+
+// the words idx and idx + 1 of the forget (or gain) matrix of group c
+uvec2 weight_words(const bool is_gain, const uint c, const uint idx) {
+    if (is_gain) {
+        if (c == 0) {
+            return uvec2(data_wg0[p.wg_offset[0] + idx], data_wg0[p.wg_offset[0] + idx + 1]);
+        } else if (c == 1) {
+            return uvec2(data_wg1[p.wg_offset[1] + idx], data_wg1[p.wg_offset[1] + idx + 1]);
+        }
+        return uvec2(data_wg2[p.wg_offset[2] + idx], data_wg2[p.wg_offset[2] + idx + 1]);
+    }
+    if (c == 0) {
+        return uvec2(data_wf0[p.wf_offset[0] + idx], data_wf0[p.wf_offset[0] + idx + 1]);
+    } else if (c == 1) {
+        return uvec2(data_wf1[p.wf_offset[1] + idx], data_wf1[p.wf_offset[1] + idx + 1]);
+    }
+    return uvec2(data_wf2[p.wf_offset[2] + idx], data_wf2[p.wf_offset[2] + idx + 1]);
+}
+
+// the four weights from element idx on, idx even
+vec4 weights4(const bool is_gain, const uint c, const uint idx) {
+    const uvec2 w = weight_words(is_gain, c, idx / 2);
+    return vec4(uintBitsToFloat((w.x & 0x0000ffff) << 16),
+                uintBitsToFloat( w.x & 0xffff0000),
+                uintBitsToFloat((w.y & 0x0000ffff) << 16),
+                uintBitsToFloat( w.y & 0xffff0000));
+}
+
+// the sum over a cluster: subgroupClusteredAdd takes a compile-time cluster size, CLUSTER_SIZE is 4 or 8
+float cluster_sum(const float x) {
+    if (CLUSTER_SIZE == 8) {
+        return subgroupClusteredAdd(x, 8);
+    }
+    return subgroupClusteredAdd(x, 4);
+}
+
+// the tanh of unary.comp
+float op_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+// the blend of tanh_blend.comp: each product and the difference rounded on their own. A function, so that precise
+// stays out of the sums of the products
+float tanh_blend(const float a, const float b, const float f, const float g) {
+    precise const float forget_a = op_tanh(f) * a;
+    precise const float gain_b   = op_tanh(g) * b;
+    precise const float kept     = a - forget_a;
+
+    return kept + gain_b;
+}
+
+void compute_output(const uint c, const uint token, const uint row, const uint lane) {
+    const uint x_offset = p.x_offset + token * p.x_stride + c * p.x_group;
+
+    // a row past the end adds nothing, its cluster still takes part in the clustered sums
+    float f = 0.0f;
+    float g = 0.0f;
+    if (row < p.n_rows) {
+        for (uint col = 4 * lane; col < p.ncols; col += 4 * CLUSTER_SIZE) {
+            const vec4 x  = vec4(data_x[x_offset + col], data_x[x_offset + col + 1], data_x[x_offset + col + 2], data_x[x_offset + col + 3]);
+            const uint iw = row * p.ncols + col;
+            f += dot(weights4(false, c, iw), x);
+            g += dot(weights4(true,  c, iw), x);
+        }
+    }
+    f = cluster_sum(f);
+    g = cluster_sum(g);
+
+    if (lane == 0 && row < p.n_rows) {
+        const float a = data_a[p.a_offset + token * p.a_stride + c * p.a_group + row];
+        const float b = data_b[p.b_offset + token * p.b_stride + c * p.b_group + row];
+
+        data_d[p.d_offset + token * p.d_stride + c * p.d_group + row] = tanh_blend(a, b, f, g);
+    }
+}
+
+void main() {
+    const uint row  = ROWS_PER_WORKGROUP * gl_WorkGroupID.x + gl_LocalInvocationID.x / CLUSTER_SIZE;
+    const uint lane = gl_LocalInvocationID.x % CLUSTER_SIZE;
+    const uint c    = gl_WorkGroupID.z;
+
+    // the tokens past the dispatch limit of y in a loop
+    for (uint token = gl_WorkGroupID.y; token < p.n_tokens; token += gl_NumWorkGroups.y) {
+        compute_output(c, token, row, lane);
+    }
+}

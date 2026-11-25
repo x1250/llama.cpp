@@ -402,6 +402,8 @@ extern "C" {
         GGML_OP_FLASH_ATTN_EXT_REL,
         GGML_OP_DEPTH_ATTN,
         GGML_OP_TANH_BLEND,
+        GGML_OP_RMS_NORM_CONCAT_MUL_MAT,
+        GGML_OP_TANH_BLEND_MUL_MAT,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2334,6 +2336,38 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * f,
             struct ggml_tensor  * g);
+
+    // for each group c: mul_mat(w[c], concat(rms_norm(a_c), rms_norm(b_c), 0)), with a_c the group c of a, or its only
+    // group; the products in F32 (the activations are not rounded to BF16)
+    // used in inkling 2 (the gates of the loop controllers: a the layer inputs, b the cross-pass messages)
+    // a:      [n_embd, n_tokens, 1 or n] F32, contiguous rows
+    // b:      [n_embd, n_tokens, n] F32, contiguous rows
+    // w:      n (at most GGML_MAX_SRC - 2) tensors [2*n_embd, n_out] BF16, contiguous
+    // result: [n_out, n_tokens, n] F32
+    GGML_API struct ggml_tensor * ggml_rms_norm_concat_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor ** w,
+            int                   n,
+            float                 eps);
+
+    // for each group c: tanh_blend(a_c, b_c, mul_mat(wf[c], x_c), mul_mat(wg[c], x_c)), with a_c the group c of a, or
+    // its only group; the products in F32
+    // used in inkling 2 (the loop controllers, x their gates)
+    // a:      [n_embd, n_tokens, 1 or n] F32, contiguous rows
+    // b:      [n_embd, n_tokens, n] F32, contiguous rows
+    // x:      [n_in, n_tokens, n] F32, contiguous rows
+    // wf, wg: n (at most (GGML_MAX_SRC - 3)/2) tensors [n_in, n_embd] BF16, contiguous
+    // result: [n_embd, n_tokens, n] F32
+    GGML_API struct ggml_tensor * ggml_tanh_blend_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * x,
+            struct ggml_tensor ** wf,
+            struct ggml_tensor ** wg,
+            int                   n);
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);

@@ -1086,6 +1086,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_EXT_REL",
     "DEPTH_ATTN",
     "TANH_BLEND",
+    "RMS_NORM_CONCAT_MUL_MAT",
+    "TANH_BLEND_MUL_MAT",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
@@ -1122,7 +1124,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1205,6 +1207,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_ext_rel(x)",
     "depth_attn(x)",
     "tanh_blend(a,b,f,g)",
+    "rms_norm_concat_mul_mat(a,b,w)",
+    "tanh_blend_mul_mat(a,b,x,wf,wg)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
@@ -1241,7 +1245,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5623,6 +5627,85 @@ struct ggml_tensor * ggml_tanh_blend(
     result->op = GGML_OP_TANH_BLEND;
     for (int j = 0; j < 4; ++j) {
         result->src[j] = srcs[j];
+    }
+
+    return result;
+}
+
+// the layer inputs a and the messages b of the loop controllers: n groups, a with n or one, contiguous F32 rows
+static void ggml_loop_control_check_inputs(
+        const struct ggml_tensor * a,
+        const struct ggml_tensor * b,
+        int                        n) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && a->nb[0] == sizeof(float));
+    GGML_ASSERT(b->type == GGML_TYPE_F32 && b->nb[0] == sizeof(float));
+    GGML_ASSERT(a->ne[2] == 1 || a->ne[2] == n);
+    GGML_ASSERT(b->ne[0] == a->ne[0] && b->ne[1] == a->ne[1] && b->ne[2] == n);
+    GGML_ASSERT(a->ne[3] == 1 && b->ne[3] == 1);
+}
+
+// ggml_rms_norm_concat_mul_mat
+
+struct ggml_tensor * ggml_rms_norm_concat_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor ** w,
+        int                   n,
+        float                 eps) {
+    GGML_ASSERT(n > 0 && n <= GGML_MAX_SRC - 2);
+    ggml_loop_control_check_inputs(a, b, n);
+
+    const int64_t n_out = w[0]->ne[1];
+    for (int c = 0; c < n; ++c) {
+        GGML_ASSERT(w[c]->type == GGML_TYPE_BF16 && ggml_is_contiguous(w[c]));
+        GGML_ASSERT(w[c]->ne[0] == 2*a->ne[0] && w[c]->ne[1] == n_out && w[c]->ne[2] == 1 && w[c]->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_out, a->ne[1], n);
+
+    ggml_set_op_params_f32(result, 0, eps);
+
+    result->op     = GGML_OP_RMS_NORM_CONCAT_MUL_MAT;
+    result->src[0] = a;
+    result->src[1] = b;
+    for (int c = 0; c < n; ++c) {
+        result->src[2 + c] = w[c];
+    }
+
+    return result;
+}
+
+// ggml_tanh_blend_mul_mat
+
+struct ggml_tensor * ggml_tanh_blend_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * x,
+        struct ggml_tensor ** wf,
+        struct ggml_tensor ** wg,
+        int                   n) {
+    GGML_ASSERT(n > 0 && 3 + 2*n <= GGML_MAX_SRC);
+    ggml_loop_control_check_inputs(a, b, n);
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float));
+    GGML_ASSERT(x->ne[1] == a->ne[1] && x->ne[2] == n && x->ne[3] == 1);
+    for (int c = 0; c < 2*n; ++c) {
+        const struct ggml_tensor * m = c < n ? wf[c] : wg[c - n];
+        GGML_ASSERT(m->type == GGML_TYPE_BF16 && ggml_is_contiguous(m));
+        GGML_ASSERT(m->ne[0] == x->ne[0] && m->ne[1] == a->ne[0] && m->ne[2] == 1 && m->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1], n);
+
+    result->op     = GGML_OP_TANH_BLEND_MUL_MAT;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = x;
+    for (int c = 0; c < n; ++c) {
+        result->src[3 + c]     = wf[c];
+        result->src[3 + n + c] = wg[c];
     }
 
     return result;

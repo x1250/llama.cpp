@@ -1226,6 +1226,8 @@ void process_shaders() {
     string_to_spv("depth_attn_subgroup_f32", "depth_attn.comp", {{"USE_SUBGROUP_ADD", "1"}});
 
     string_to_spv("tanh_blend_f32", "tanh_blend.comp", {});
+    string_to_spv("rms_norm_concat_mul_mat_bf16", "rms_norm_concat_mul_mat.comp", {});
+    string_to_spv("tanh_blend_mul_mat_bf16", "tanh_blend_mul_mat.comp", {});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
