@@ -8021,6 +8021,8 @@ struct test_topk_moe : public test_case {
     // the expert scales of build_moe_ffn (NVFP4 experts), in the weight context: one multiplied into the router weights,
     // one gathered
     const bool expert_scales;
+    // experts 0 and 1 tie at the second best selection score of every other row
+    const bool tied_top;
     ggml_tensor * weights {};
     ggml_tensor * selected_experts {};
     ggml_tensor * gathered {};
@@ -8033,7 +8035,8 @@ struct test_topk_moe : public test_case {
                   float                  scale_w         = 0.0f,
                   int                    n_expert_groups = 1,
                   bool                   norm_bias       = false,
-                  bool                   expert_scales   = false) :
+                  bool                   expert_scales   = false,
+                  bool                   tied_top        = false) :
         ne(ne),
         n_expert_used(n_expert_used),
         with_norm(with_norm),
@@ -8042,10 +8045,13 @@ struct test_topk_moe : public test_case {
         scale_w(scale_w),
         n_expert_groups(n_expert_groups),
         norm_bias(norm_bias),
-        expert_scales(expert_scales) {
+        expert_scales(expert_scales),
+        tied_top(tied_top) {
         GGML_ASSERT(n_expert_used <= ne[0]);
         GGML_ASSERT(ne[0] % n_expert_groups == 0);
         GGML_ASSERT(n_expert_used <= ne[0] / n_expert_groups);
+        // the tie stays inside the selected experts, and so in the set the CPU selects
+        GGML_ASSERT(!tied_top || (n_expert_used >= 3 && n_expert_groups == 1));
         GGML_ASSERT(!norm_bias || with_norm);
     }
 
@@ -8053,6 +8059,9 @@ struct test_topk_moe : public test_case {
         std::string v = VARS_TO_STR8(ne, n_expert_used, with_norm, norm_bias, bias_probs, gating_func, scale_w, n_expert_groups);
         if (expert_scales) {
             v += "," + VAR_TO_STR(expert_scales);
+        }
+        if (tied_top) {
+            v += "," + VAR_TO_STR(tied_top);
         }
         return v;
     }
@@ -8095,6 +8104,9 @@ struct test_topk_moe : public test_case {
             for (float & v : bias) {
                 v = dist(rng);
             }
+            if (tied_top) {
+                bias[1] = bias[0];
+            }
             ggml_backend_tensor_set(exp_probs_b, bias.data(), 0, ggml_nbytes(exp_probs_b));
         }
 
@@ -8111,6 +8123,14 @@ struct test_topk_moe : public test_case {
             std::shuffle(perm.begin(), perm.end(), rng);
             for (int i = 0; i < n_expert; ++i) {
                 rank[i] = perm[i];
+            }
+
+            if (tied_top && r % 2 == 0) {
+                // experts 0 and 1 at the second best rank, with the same logit and bias
+                const auto with_rank = [&](int value) { return std::find(rank.begin(), rank.end(), value) - rank.begin(); };
+                std::swap(rank[0], rank[with_rank(n_expert - 2)]);
+                std::swap(rank[1], rank[with_rank(n_expert - 3)]);
+                rank[1] = rank[0];
             }
 
             if (n_expert_groups > 1) {
@@ -14321,6 +14341,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n_tokens : {1, 2, 512, 2048}) {
             test_cases.emplace_back(new test_topk_moe({128, n_tokens, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true, expert_scales));
         }
+    }
+    // and a tie inside the selected experts of every other row, which ARGSORT's network orders
+    for (int64_t n_tokens : {1, 512}) {
+        test_cases.emplace_back(new test_topk_moe({128, n_tokens, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true, true, true));
     }
     // the expert scales after the weights of the other routers: a reshape of the division, a SCALE, a reshape of the
     // softmax of the selected weights, and the GET_ROWS of the weights
