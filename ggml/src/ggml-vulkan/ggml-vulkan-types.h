@@ -535,6 +535,11 @@ static constexpr uint32_t fwht_max_subgroup_n    = 512;
 static constexpr uint32_t fwht_max_subgroup_el_w = 64;
 static constexpr uint32_t fwht_rows              = 4;
 
+// the workgroups of the norms fused with a store, one row each: their rotation and q8_0 store take rows of at most one
+// element per invocation
+static constexpr uint32_t rms_set_rows_block_size = 128;
+static constexpr uint32_t l2_norm_clip_block_size = 512;
+
 static constexpr std::initializer_list<ggml_op> topk_moe_early_softmax_norm{ GGML_OP_SOFT_MAX, GGML_OP_RESHAPE,  GGML_OP_ARGSORT,
                                                                              GGML_OP_VIEW,     GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
                                                                              GGML_OP_SUM_ROWS, GGML_OP_CLAMP,    GGML_OP_DIV,
@@ -597,6 +602,13 @@ static constexpr std::initializer_list<ggml_op> rms_norm_mul_rope_view_set_rows_
 static constexpr std::initializer_list<ggml_op> rms_norm_view_set_rows_pattern { GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
 static constexpr std::initializer_list<ggml_op> rope_view_set_rows_pattern { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+
+// a norm, the rotation of a quantized cache (llama_mul_mat_hadamard) and the K/V store (cpy_k, cpy_v)
+static constexpr std::initializer_list<ggml_op> rms_norm_hadamard_view_set_rows_pattern { GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+static constexpr std::initializer_list<ggml_op> l2_norm_clip_hadamard_view_set_rows_pattern { GGML_OP_L2_NORM_CLIP, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+static constexpr std::initializer_list<ggml_op> l2_norm_clip_view_set_rows_pattern { GGML_OP_L2_NORM_CLIP, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+// the rotated q
+static constexpr std::initializer_list<ggml_op> l2_norm_clip_hadamard_pattern { GGML_OP_L2_NORM_CLIP, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE };
 
 static constexpr std::initializer_list<ggml_op> gdn_view_cpy_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
 static constexpr std::initializer_list<ggml_op> gdn_view_cpy_short_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_CPY };
@@ -693,6 +705,7 @@ enum rms_norm_mode {
     RMS_NORM_MUL_ROPE,
     RMS_NORM_MUL_ROPE_VIEW_SET_ROWS,
     RMS_NORM_VIEW_SET_ROWS,
+    RMS_NORM_HADAMARD_VIEW_SET_ROWS,
     RMS_NORM_COUNT,
 };
 
@@ -711,6 +724,20 @@ static constexpr std::initializer_list<std::array<int, 3>> rms_norm_mul_rope_vie
 static constexpr std::initializer_list<std::array<int, 3>> rms_norm_view_set_rows_edges {
     { 1, 0, 0 }, // view->src[0]     == rms_norm
     { 2, 0, 1 }, // set_rows->src[0] == view
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> norm_hadamard_edges {
+    { 1, 0, 0 }, // reshape->src[0]  == norm
+    { 2, 1, 1 }, // mul_mat->src[1]  == reshape
+    { 3, 0, 2 }, // reshape->src[0]  == mul_mat
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> norm_hadamard_view_set_rows_edges {
+    { 1, 0, 0 }, // reshape->src[0]  == norm
+    { 2, 1, 1 }, // mul_mat->src[1]  == reshape
+    { 3, 0, 2 }, // reshape->src[0]  == mul_mat
+    { 4, 0, 3 }, // view->src[0]     == reshape
+    { 5, 0, 4 }, // set_rows->src[0] == view
 };
 
 static constexpr std::initializer_list<std::array<int, 3>> gdn_view_cpy_edges {
@@ -977,6 +1004,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_add_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f16;
+    vk_pipeline pipeline_rms_norm_set_rows_f32_q8_0;
     vk_pipeline pipeline_rms_norm_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_rope_f32_f32;
@@ -984,6 +1012,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
     vk_pipeline pipeline_l2_norm_clip_f32;
+    // the K store: [dst 0=f32,1=f16,2=q8_0]
+    std::array<vk_pipeline, 3> pipeline_l2_norm_clip_set_rows;
 
     // [src/dst 0=fp32,1=fp16,2=bf16]
     vk_pipeline pipeline_unary[GGML_UNARY_OP_COUNT][3];

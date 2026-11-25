@@ -3,20 +3,29 @@
 // ggml_l2_norm_clip: each row of x = a*scale scaled down to an L2 norm of at most max_norm, then multiplied by its factor
 // in post. One workgroup per row; the sum of squares is the tree of l2_norm.comp. Rows of contiguous floats, strides and
 // offsets in floats.
+// Fused with what follows it, for rows of at most BLOCK_SIZE elements: the rotation of a quantized cache (n_rot > 0, the
+// Hadamard product of fwht.comp) and, with SET_ROWS, the K store into the row data_i[i02] of the cache (D_TYPE or, with
+// NORM_STORE_Q8_0, q8_0 blocks; d_nb1 the row stride in its elements).
 
 #extension GL_EXT_control_flow_attributes : enable
 
-#define BLOCK_SIZE 512
+#include "types.glsl"
 
 #define FLAG_SCALE 1
 #define FLAG_POST  2
 
-layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+layout (constant_id = 0) const uint BLOCK_SIZE = 512;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {float data_a[];};
 layout (binding = 1) readonly buffer S {float data_s[];};
 layout (binding = 2) readonly buffer P {float data_p[];};
-layout (binding = 3) writeonly buffer D {float data_d[];};
+#if defined(NORM_STORE_Q8_0)
+layout (binding = 3) writeonly buffer D {block_q8_0 data_q[];};
+#else
+layout (binding = 3) writeonly buffer D {D_TYPE data_d[];};
+#endif
+layout (binding = 4) readonly buffer I {uvec2 data_i[];};
 
 layout (push_constant) uniform parameter {
     uint ne00; uint ne01; uint ne02; uint n_rows;
@@ -28,9 +37,13 @@ layout (push_constant) uniform parameter {
     uint a_offset; uint s_offset; uint p_offset; uint d_offset;
     uint flags;
     float max_norm; float eps;
+    uint d_nb1; uint n_rot; float rot_scale;
 } p;
 
 shared float sum[BLOCK_SIZE];
+
+#define NORM_STORE_SIZE BLOCK_SIZE
+#include "norm_store.glsl"
 
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
@@ -49,7 +62,6 @@ void main() {
 
     const uint a_base = p.a_offset + i01*p.a_nb1 + i02*p.a_nb2 + i03*p.a_nb3;
     const uint s_base = p.s_offset + (i01 % p.s_ne1)*p.s_nb1 + (i02 % p.s_ne2)*p.s_nb2 + (i03 % p.s_ne3)*p.s_nb3;
-    const uint d_base = p.d_offset + row*p.ne00;
 
     sum[tid] = 0.0f;
 
@@ -62,7 +74,7 @@ void main() {
     }
 
     barrier();
-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
         if (tid < s) {
             sum[tid] += sum[tid + s];
         }
@@ -72,15 +84,53 @@ void main() {
     const float scale = min(1.0f, p.max_norm / (sqrt(sum[0]) + p.eps));
     const float post  = has_post ? data_p[p.p_offset + (i01 % p.p_ne1)*p.p_nb1 + (i02 % p.p_ne2)*p.p_nb2 + (i03 % p.p_ne3)*p.p_nb3] : 1.0f;
 
-    [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
-        float xi = data_a[a_base + i0];
+#if !defined(SET_ROWS)
+    if (p.n_rot == 0) {
+        const uint d_base = p.d_offset + row*p.ne00;
+        [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
+            float xi = data_a[a_base + i0];
+            if (has_scale) {
+                xi *= data_s[s_base + i0 % p.s_ne0];
+            }
+            float y = scale * xi;
+            if (has_post) {
+                y *= post;
+            }
+            data_d[d_base + i0] = y;
+        }
+        return;
+    }
+#endif
+
+    // one element per invocation: the rotation and the store work on the row in shared memory
+    const uint col = tid;
+    if (col < p.ne00) {
+        float xi = data_a[a_base + col];
         if (has_scale) {
-            xi *= data_s[s_base + i0 % p.s_ne0];
+            xi *= data_s[s_base + col % p.s_ne0];
         }
         float y = scale * xi;
         if (has_post) {
             y *= post;
         }
-        data_d[d_base + i0] = y;
+        row_vals[col] = y;
     }
+    if (p.n_rot != 0) {
+        norm_store_fwht(col, p.ne00, p.n_rot, p.rot_scale);
+    }
+    barrier();
+
+#if defined(NORM_STORE_Q8_0)
+    if (col < p.ne00 / QUANT_K_Q8_0) {
+        norm_store_q8_0(col, p.d_offset + data_i[i02].x*p.d_nb1 + i01*(p.ne00 / QUANT_K_Q8_0) + col);
+    }
+#elif defined(SET_ROWS)
+    if (col < p.ne00) {
+        data_d[p.d_offset + data_i[i02].x*p.d_nb1 + i01*p.ne00 + col] = D_TYPE(row_vals[col]);
+    }
+#else
+    if (col < p.ne00) {
+        data_d[p.d_offset + row*p.ne00 + col] = row_vals[col];
+    }
+#endif
 }

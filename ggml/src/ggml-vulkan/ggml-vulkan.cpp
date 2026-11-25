@@ -3653,7 +3653,6 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
 
     const bool rms_subgroups = (device->vendor_id == VK_VENDOR_ID_INTEL || device->vendor_id == VK_VENDOR_ID_NVIDIA || device->vendor_id == VK_VENDOR_ID_AMD) && device->subgroup_arithmetic && device->subgroup_require_full_support;
-    const uint32_t rms_set_rows_block_size = 128;
     // the unrolled fixed-count loop variants miscompile on Qualcomm's driver
     const uint32_t rms_unroll = device->driver_id != vk::DriverId::eQualcommProprietary;
 #define RMS_SHADER(name) (rms_subgroups ? name##_subgroup_len : name##_len), (rms_subgroups ? name##_subgroup_data : name##_data)
@@ -3676,6 +3675,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_mul_partials_f32, "rms_norm_mul_add_mul_partials_f32", rms_norm_mul_add_partials_f32_len, rms_norm_mul_add_partials_f32_data, "main", 6, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_set_rows_f32_f32, "rms_norm_set_rows_f32_f32", RMS_SHADER(rms_norm_set_rows_f32_f32), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, rms_set_rows_block_size, rms_unroll}, 1, true, rms_subgroups);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_set_rows_f32_f16, "rms_norm_set_rows_f32_f16", RMS_SHADER(rms_norm_set_rows_f32_f16), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, rms_set_rows_block_size, rms_unroll}, 1, true, rms_subgroups);
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_set_rows_f32_q8_0, "rms_norm_set_rows_f32_q8_0", RMS_SHADER(rms_norm_set_rows_f32_q8_0), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, rms_set_rows_block_size, rms_unroll}, 1, true, rms_subgroups);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_partials_f32, "rms_norm_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_partials_f32, "rms_norm_mul_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
 
@@ -3691,7 +3691,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1, true);
-    ggml_vk_create_pipeline(device, device->pipeline_l2_norm_clip_f32, "l2_norm_clip_f32", l2_norm_clip_f32_len, l2_norm_clip_f32_data, "main", 4, sizeof(vk_op_l2_norm_clip_push_constants), {1, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_l2_norm_clip_f32, "l2_norm_clip_f32", l2_norm_clip_f32_len, l2_norm_clip_f32_data, "main", 5, sizeof(vk_op_l2_norm_clip_push_constants), {1, 1, 1}, {l2_norm_clip_block_size}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_l2_norm_clip_set_rows[0], "l2_norm_clip_set_rows_f32", l2_norm_clip_set_rows_f32_len, l2_norm_clip_set_rows_f32_data, "main", 5, sizeof(vk_op_l2_norm_clip_push_constants), {1, 1, 1}, {l2_norm_clip_block_size}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_l2_norm_clip_set_rows[1], "l2_norm_clip_set_rows_f16", l2_norm_clip_set_rows_f16_len, l2_norm_clip_set_rows_f16_data, "main", 5, sizeof(vk_op_l2_norm_clip_push_constants), {1, 1, 1}, {l2_norm_clip_block_size}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_l2_norm_clip_set_rows[2], "l2_norm_clip_set_rows_q8_0", l2_norm_clip_set_rows_q8_0_len, l2_norm_clip_set_rows_q8_0_data, "main", 5, sizeof(vk_op_l2_norm_clip_push_constants), {1, 1, 1}, {l2_norm_clip_block_size}, 1, true);
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_32, "cpy_32", cpy_32_len, cpy_32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f16, "cpy_f32_f16", cpy_f32_f16_len, cpy_f32_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -8042,6 +8045,11 @@ bool ggml_vk_can_use_fwht(const ggml_backend_vk_context * ctx, const ggml_tensor
     return true;
 }
 
+// the scale of the transform of n elements, which also takes a norm fused with the rotation of a quantized cache
+float ggml_vk_fwht_scale(int64_t n) {
+    return 1.0f / std::sqrt((float)n);
+}
+
 void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src, ggml_tensor * dst) {
     const int idx = ggml_vk_fwht_pipeline_idx(src->ne[0]);
     vk_pipeline pipeline = src->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_f16[idx] : ctx->device->pipeline_fwht_f32[idx];
@@ -8062,7 +8070,7 @@ void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
         n_rows,
         0,
         0,
-        1.0f / std::sqrt((float)src->ne[0]),
+        ggml_vk_fwht_scale(src->ne[0]),
     };
     init_pushconst_tensor_offsets(ctx, pc, src, nullptr, nullptr, nullptr, dst);
 
@@ -12222,15 +12230,23 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     ggml_tensor * rms = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = rms->src[0];
 
-    if (ctx->fused_rms_norm_mode == RMS_NORM_VIEW_SET_ROWS) {
-        GGML_ASSERT(ctx->num_additional_fused_ops == 2);
-        ggml_tensor * set_rows = cgraph->nodes[node_idx + 2];
+    if (ctx->fused_rms_norm_mode == RMS_NORM_VIEW_SET_ROWS || ctx->fused_rms_norm_mode == RMS_NORM_HADAMARD_VIEW_SET_ROWS) {
+        const bool rotate = ctx->fused_rms_norm_mode == RMS_NORM_HADAMARD_VIEW_SET_ROWS;
+        GGML_ASSERT(ctx->num_additional_fused_ops == (rotate ? 5 : 2));
+        ggml_tensor * set_rows = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
         const ggml_tensor * indices = set_rows->src[1];
         vk_op_binary_push_constants pc = ggml_vk_rms_norm_push_constants(src0, src0, set_rows, op_params[0], 0);
         init_pushconst_tensor_offsets(ctx, pc, src0, src0, nullptr, nullptr, set_rows);
+        if (rotate) {
+            // the rotation of the q8_0 store: the size of its blocks and its scale
+            const int64_t n_rot = cgraph->nodes[node_idx + 2]->src[1]->ne[0];
+            pc.param2 = ggml_vk_fwht_scale(n_rot);
+            pc.param3 = (int32_t) n_rot;
+        }
 
-        vk_pipeline pipeline = set_rows->type == GGML_TYPE_F16 ?
-            ctx->device->pipeline_rms_norm_set_rows_f32_f16 : ctx->device->pipeline_rms_norm_set_rows_f32_f32;
+        vk_pipeline pipeline = set_rows->type == GGML_TYPE_Q8_0 ? ctx->device->pipeline_rms_norm_set_rows_f32_q8_0 :
+                               set_rows->type == GGML_TYPE_F16  ? ctx->device->pipeline_rms_norm_set_rows_f32_f16 :
+                                                                  ctx->device->pipeline_rms_norm_set_rows_f32_f32;
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
             {
@@ -12417,12 +12433,21 @@ void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const gg
     ggml_vk_op_f32<vk_op_unary_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_L2_NORM, std::move(p));
 }
 
-void ggml_vk_l2_norm_clip(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
-    const ggml_tensor * a     = dst->src[0];
-    const ggml_tensor * scale = dst->src[1];
-    const ggml_tensor * post  = dst->src[2];
+void ggml_vk_l2_norm_clip(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * clip  = cgraph->nodes[node_idx];
+    const ggml_tensor * a     = clip->src[0];
+    const ggml_tensor * scale = clip->src[1];
+    const ggml_tensor * post  = clip->src[2];
 
-    vk_pipeline pipeline = ctx->device->pipeline_l2_norm_clip_f32;
+    // fused: the rotation of a quantized cache (RESHAPE, MUL_MAT, RESHAPE) and the K store (VIEW, SET_ROWS)
+    ggml_tensor * dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+    const bool rotate = ctx->num_additional_fused_ops >= 3 && cgraph->nodes[node_idx + 2]->op == GGML_OP_MUL_MAT;
+    const bool store  = dst->op == GGML_OP_SET_ROWS;
+
+    vk_pipeline pipeline = !store                        ? ctx->device->pipeline_l2_norm_clip_f32 :
+                           dst->type == GGML_TYPE_Q8_0   ? ctx->device->pipeline_l2_norm_clip_set_rows[2] :
+                           dst->type == GGML_TYPE_F16    ? ctx->device->pipeline_l2_norm_clip_set_rows[1] :
+                                                           ctx->device->pipeline_l2_norm_clip_set_rows[0];
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     auto nb     = [](const ggml_tensor * t, int i) { return (uint32_t) (t->nb[i] / sizeof(float)); };
@@ -12437,7 +12462,17 @@ void ggml_vk_l2_norm_clip(ggml_backend_vk_context * ctx, vk_context& subctx, ggm
     pc.a_nb2  = nb(a, 2);
     pc.a_nb3  = nb(a, 3);
     pc.a_offset = offset(a);
-    pc.d_offset = offset(dst);
+    if (store) {
+        // in the elements of the cache, q8_0 blocks with a zero offset
+        pc.d_offset = (uint32_t) (get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type));
+        pc.d_nb1    = (uint32_t) (dst->nb[1] / ggml_type_size(dst->type));
+    } else {
+        pc.d_offset = offset(dst);
+    }
+    if (rotate) {
+        pc.n_rot     = (uint32_t) cgraph->nodes[node_idx + 2]->src[1]->ne[0];
+        pc.rot_scale = ggml_vk_fwht_scale(pc.n_rot);
+    }
     if (scale) {
         pc.flags |= VK_L2_NORM_CLIP_SCALE;
         pc.s_ne0 = (uint32_t) scale->ne[0];
@@ -12463,8 +12498,8 @@ void ggml_vk_l2_norm_clip(ggml_backend_vk_context * ctx, vk_context& subctx, ggm
     } else {
         pc.p_ne1 = pc.p_ne2 = pc.p_ne3 = 1;
     }
-    pc.max_norm = ggml_get_op_params_f32(dst, 0);
-    pc.eps      = ggml_get_op_params_f32(dst, 1);
+    pc.max_norm = ggml_get_op_params_f32(clip, 0);
+    pc.eps      = ggml_get_op_params_f32(clip, 1);
 
     // one workgroup per row, the rows past 512 in y and past 262144 in z
     const uint32_t nr = pc.n_rows;
@@ -12477,7 +12512,8 @@ void ggml_vk_l2_norm_clip(ggml_backend_vk_context * ctx, vk_context& subctx, ggm
         { a_buf,
           scale ? ggml_vk_tensor_subbuffer(ctx, scale, true) : a_buf,
           post  ? ggml_vk_tensor_subbuffer(ctx, post,  true) : a_buf,
-          ggml_vk_tensor_subbuffer(ctx, dst, true) },
+          ggml_vk_tensor_subbuffer(ctx, dst, true),
+          store ? ggml_vk_tensor_subbuffer(ctx, dst->src[1]) : a_buf },
         pc, elements);
 }
 
@@ -14056,7 +14092,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_L2_NORM_CLIP:
-        ggml_vk_l2_norm_clip(ctx, compute_ctx, node);
+        ggml_vk_l2_norm_clip(ctx, compute_ctx, cgraph, node_idx);
 
         break;
     case GGML_OP_UNARY:
@@ -15906,30 +15942,60 @@ bool ggml_vk_can_fuse_rope_set_rows(ggml_backend_vk_context * ctx, const struct 
     return true;
 }
 
-bool ggml_vk_can_fuse_rms_norm_set_rows(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
-                                               int node_idx) {
-    const ggml_tensor * rms = cgraph->nodes[node_idx];
-    const ggml_tensor * view = cgraph->nodes[node_idx + 1];
-    const ggml_tensor * set_rows = cgraph->nodes[node_idx + 2];
+bool ggml_vk_can_fuse_norm_hadamard(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                    int node_idx, uint32_t max_cols) {
+    const ggml_tensor * norm    = cgraph->nodes[node_idx];
+    const ggml_tensor * mul_mat = cgraph->nodes[node_idx + 2];
 
-    // The RMS kernel reads F32 and writes directly to the F32 or F16 SET_ROWS destination.
-    if (rms->src[0]->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 ||
-        (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16) ||
+    // The product the separate MUL_MAT would compute as a transform, in blocks that tile rows of at most max_cols.
+    const int64_t n_rot = mul_mat->src[1]->ne[0];
+    return norm->type == GGML_TYPE_F32 && mul_mat->src[1]->type == GGML_TYPE_F32 &&
+           ggml_vk_can_use_fwht(ctx, mul_mat->src[1], mul_mat) &&
+           norm->ne[0] <= (int64_t) max_cols && norm->ne[0] % n_rot == 0;
+}
+
+bool ggml_vk_can_fuse_norm_set_rows(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                    int node_idx, bool rotate, uint32_t max_cols) {
+    const ggml_tensor * norm     = cgraph->nodes[node_idx];
+    const ggml_tensor * view     = cgraph->nodes[node_idx + (rotate ? 4 : 1)];
+    const ggml_tensor * set_rows = cgraph->nodes[node_idx + (rotate ? 5 : 2)];
+
+    // The norm writes directly to the F32, F16 or Q8_0 SET_ROWS destination.
+    if (norm->type != GGML_TYPE_F32 ||
+        (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16 && set_rows->type != GGML_TYPE_Q8_0) ||
         set_rows->src[1]->type != GGML_TYPE_I64 || !ggml_is_contiguous(set_rows->src[1]) ||
         set_rows->nb[0] != ggml_type_size(set_rows->type) || get_misalign_bytes(ctx, set_rows->src[1]) != 0) {
         return false;
     }
-    // As with the ROPE epilogue, each ne2 slice supplies one flattened row and ne3 is not encoded.
-    if (rms->ne[3] != 1 || !ggml_is_contiguous(rms->src[0]) || !ggml_is_contiguous(view)) {
+    // The q8_0 blocks and the rotation take rows of at most one element per invocation, the blocks whole.
+    if (set_rows->type == GGML_TYPE_Q8_0 &&
+        (norm->ne[0] % ggml_blck_size(GGML_TYPE_Q8_0) != 0 || norm->ne[0] > (int64_t) max_cols || get_misalign_bytes(ctx, set_rows) != 0)) {
         return false;
     }
-    if (view->ne[0] != rms->ne[0] * rms->ne[1] || view->ne[1] != rms->ne[2] ||
+    if (rotate && !ggml_vk_can_fuse_norm_hadamard(ctx, cgraph, node_idx, max_cols)) {
+        return false;
+    }
+    // As with the ROPE epilogue, each ne2 slice supplies one flattened row and ne3 is not encoded.
+    if (norm->ne[3] != 1 || !ggml_is_contiguous(view)) {
+        return false;
+    }
+    if (view->ne[0] != norm->ne[0] * norm->ne[1] || view->ne[1] != norm->ne[2] ||
         view->ne[2] != 1 || view->ne[3] != 1 ||
-        ggml_nelements(set_rows->src[1]) != rms->ne[2]) {
+        ggml_nelements(set_rows->src[1]) != norm->ne[2]) {
         return false;
     }
 
     return true;
+}
+
+bool ggml_vk_can_fuse_rms_norm_set_rows(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                               int node_idx, bool rotate) {
+    const ggml_tensor * rms = cgraph->nodes[node_idx];
+
+    // The RMS kernel reads F32; only its q8_0 store rotates.
+    return rms->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(rms->src[0]) &&
+           (!rotate || cgraph->nodes[node_idx + 5]->type == GGML_TYPE_Q8_0) &&
+           ggml_vk_can_fuse_norm_set_rows(ctx, cgraph, node_idx, rotate, rms_set_rows_block_size);
 }
 
 bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -16353,13 +16419,38 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_mode = RMS_NORM_MUL_ADD;
                 fusion_string = "RMS_NORM_MUL_ADD";
                 std::fill_n(op_srcs_fused_elementwise, 3, true);
+            } else if (ggml_can_fuse_subgraph(cgraph, i, rms_norm_hadamard_view_set_rows_pattern, { i + 5 }) &&
+                       ggml_check_edges(cgraph, i, norm_hadamard_view_set_rows_edges) &&
+                       ggml_vk_can_fuse_rms_norm_set_rows(ctx, cgraph, i, true)) {
+                ctx->num_additional_fused_ops = 5;
+                ctx->fused_rms_norm_mode = RMS_NORM_HADAMARD_VIEW_SET_ROWS;
+                fusion_string = "RMS_NORM_HADAMARD_VIEW_SET_ROWS";
+                std::fill_n(op_srcs_fused_elementwise, 6, false);
             } else if (ggml_can_fuse_subgraph(cgraph, i, rms_norm_view_set_rows_pattern, { i + 2 }) &&
                        ggml_check_edges(cgraph, i, rms_norm_view_set_rows_edges) &&
-                       ggml_vk_can_fuse_rms_norm_set_rows(ctx, cgraph, i)) {
+                       ggml_vk_can_fuse_rms_norm_set_rows(ctx, cgraph, i, false)) {
                 ctx->num_additional_fused_ops = 2;
                 ctx->fused_rms_norm_mode = RMS_NORM_VIEW_SET_ROWS;
                 fusion_string = "RMS_NORM_VIEW_SET_ROWS";
                 std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (ggml_can_fuse_subgraph(cgraph, i, l2_norm_clip_hadamard_view_set_rows_pattern, { i + 5 }) &&
+                       ggml_check_edges(cgraph, i, norm_hadamard_view_set_rows_edges) &&
+                       ggml_vk_can_fuse_norm_set_rows(ctx, cgraph, i, true, l2_norm_clip_block_size)) {
+                ctx->num_additional_fused_ops = 5;
+                fusion_string = "L2_NORM_CLIP_HADAMARD_VIEW_SET_ROWS";
+                std::fill_n(op_srcs_fused_elementwise, 6, false);
+            } else if (ggml_can_fuse_subgraph(cgraph, i, l2_norm_clip_view_set_rows_pattern, { i + 2 }) &&
+                       ggml_check_edges(cgraph, i, rms_norm_view_set_rows_edges) &&
+                       ggml_vk_can_fuse_norm_set_rows(ctx, cgraph, i, false, l2_norm_clip_block_size)) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "L2_NORM_CLIP_VIEW_SET_ROWS";
+                std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (ggml_can_fuse_subgraph(cgraph, i, l2_norm_clip_hadamard_pattern, { i + 3 }) &&
+                       ggml_check_edges(cgraph, i, norm_hadamard_edges) &&
+                       ggml_vk_can_fuse_norm_hadamard(ctx, cgraph, i, l2_norm_clip_block_size)) {
+                ctx->num_additional_fused_ops = 3;
+                fusion_string = "L2_NORM_CLIP_HADAMARD";
+                std::fill_n(op_srcs_fused_elementwise, 4, false);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 ctx->fused_rms_norm_mode = RMS_NORM_MUL;
@@ -16952,8 +17043,78 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
 
+        // ROPE, RMS_NORM or L2_NORM_CLIP at head [+ the rotation of a quantized cache] + VIEW + SET_ROWS, and L2_NORM_CLIP
+        // + the rotation (the rotated q): pull the rest of the pattern into the current set, right after head
+        auto const &pull_store = [&](int head) {
+            const ggml_op head_op = graph->nodes[head]->op;
+            if (head_op != GGML_OP_ROPE && head_op != GGML_OP_RMS_NORM && head_op != GGML_OP_L2_NORM_CLIP) {
+                return;
+            }
+            // the first unused node after from with op and src[s] == of; the store of a K follows the convolution of its V
+            const int end = std::min(head + 64, graph->n_nodes);
+            auto const &find_next = [&](int from, ggml_op op, int s, const ggml_tensor * of) -> int {
+                for (int k = from + 1; k < end; ++k) {
+                    if (!used[k] && graph->nodes[k]->op == op && graph->nodes[k]->src[s] == of) {
+                        return k;
+                    }
+                }
+                return -1;
+            };
+            std::vector<int> chain = { head };
+            bool rotate = false;
+            if (head_op != GGML_OP_ROPE) {
+                const int reshape = find_next(head, GGML_OP_RESHAPE, 0, graph->nodes[head]);
+                const int mul_mat = reshape < 0 ? -1 : find_next(reshape, GGML_OP_MUL_MAT, 1, graph->nodes[reshape]);
+                const int back    = mul_mat < 0 ? -1 : find_next(mul_mat, GGML_OP_RESHAPE, 0, graph->nodes[mul_mat]);
+                if (back >= 0 && ggml_get_op_params_i32(graph->nodes[mul_mat], 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+                    chain.insert(chain.end(), { reshape, mul_mat, back });
+                    rotate = true;
+                }
+            }
+            const int view     = find_next(chain.back(), GGML_OP_VIEW, 0, graph->nodes[chain.back()]);
+            const int set_rows = view < 0 ? -1 : find_next(view, GGML_OP_SET_ROWS, 0, graph->nodes[view]);
+            const bool store   = set_rows >= 0;
+            if (store) {
+                chain.insert(chain.end(), { view, set_rows });
+            } else if (!rotate || head_op != GGML_OP_L2_NORM_CLIP) {
+                return;
+            }
+            std::vector<ggml_op> ops;
+            for (int c : chain) {
+                ops.push_back(graph->nodes[c]->op);
+            }
+            const int last = chain.back();
+            if (!ggml_can_fuse_subgraph_ext(graph, chain.data(), (int) chain.size(), ops.data(), &last, 1)) {
+                return;
+            }
+            // the pulled nodes cannot need a node they would now precede
+            for (int c = head + 1; c < last; ++c) {
+                if (used[c] || is_empty(graph->nodes[c]) || std::find(chain.begin(), chain.end(), c) != chain.end()) {
+                    continue;
+                }
+                for (size_t m = 1; m < chain.size(); ++m) {
+                    if (is_src_of(graph->nodes[chain[m]], graph->nodes[c])) {
+                        return;
+                    }
+                }
+            }
+            if (!store) {
+                // the rotated rows are written while the inputs of the norm are read
+                for (ggml_tensor * src : graph->nodes[head]->src) {
+                    if (src) {
+                        params->add_alloc_dep(params->user_data, src, graph->nodes[last]);
+                    }
+                }
+            }
+            for (size_t m = 1; m < chain.size(); ++m) {
+                current_set.push_back(chain[m]);
+                used[chain[m]] = true;
+            }
+        };
+
         // First, grab the next unused node.
         current_set.push_back(first_unused);
+        pull_store(first_unused);
 
         // Loop through the next N nodes. Grab any that don't depend on other nodes that
         // haven't already been run. Nodes that have already been run have used[i] set
@@ -17042,43 +17203,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                         }
                     }
                 }
-                // Look for ROPE/RMS_NORM + VIEW + SET_ROWS and make them consecutive
-                if (graph->nodes[rope_idx]->op == GGML_OP_ROPE || graph->nodes[rope_idx]->op == GGML_OP_RMS_NORM) {
-                    int view_idx = -1;
-                    int set_rows_idx = -1;
-                    for (int k = rope_idx + 1; k < std::min(rope_idx + 15, graph->n_nodes); ++k) {
-                        if (used[k]) {
-                            continue;
-                        }
-                        if (view_idx == -1 && graph->nodes[k]->op == GGML_OP_VIEW && graph->nodes[k]->src[0] == graph->nodes[rope_idx]) {
-                            view_idx = k;
-                            continue;
-                        }
-                        if (view_idx != -1 && graph->nodes[k]->op == GGML_OP_SET_ROWS && graph->nodes[k]->src[0] == graph->nodes[view_idx]) {
-                            set_rows_idx = k;
-                            break;
-                        }
-                    }
-                    if (set_rows_idx != -1) {
-                        const int node_idxs[] = { rope_idx, view_idx, set_rows_idx };
-                        const ggml_op ops[] = { graph->nodes[rope_idx]->op, GGML_OP_VIEW, GGML_OP_SET_ROWS };
-                        bool can_pull = ggml_can_fuse_subgraph_ext(graph, node_idxs, 3, ops, &set_rows_idx, 1);
-
-                        for (int c = rope_idx + 1; can_pull && c < set_rows_idx; ++c) {
-                            if (!used[c] && c != view_idx && !is_empty(graph->nodes[c]) &&
-                                is_src_of(graph->nodes[set_rows_idx], graph->nodes[c])) {
-                                can_pull = false;
-                            }
-                        }
-
-                        if (can_pull) {
-                            current_set.push_back(view_idx);
-                            current_set.push_back(set_rows_idx);
-                            used[view_idx] = true;
-                            used[set_rows_idx] = true;
-                        }
-                    }
-                }
+                pull_store(rope_idx);
                 // Look for MUL_MAT_ID + ADD_ID + MUL
                 if (j > 0 &&
                     graph->nodes[j]->op == GGML_OP_ADD_ID &&

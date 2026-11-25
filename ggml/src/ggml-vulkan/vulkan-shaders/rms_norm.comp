@@ -48,6 +48,11 @@ layout (binding = 4) readonly buffer E {float data_e[];};
 
 layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 
+#if defined(NORM_STORE_Q8_0)
+// the q8_0 blocks of the store, through the binding of data_d
+layout (binding = 2) writeonly buffer DQ {block_q8_0 data_q[];};
+#endif
+
 #endif
 
 layout (constant_id = 1) const bool do_multiply = false;
@@ -56,6 +61,11 @@ layout (constant_id = 2) const bool do_post_multiply = false;
 #endif
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
+
+#if RMS_NORM_SET_ROWS_FUSION
+#define NORM_STORE_SIZE BLOCK_SIZE
+#include "norm_store.glsl"
+#endif
 
 void rms_norm(uint num_iters) {
     const uint ncols     = p.ne00;
@@ -80,6 +90,8 @@ void rms_norm(uint num_iters) {
 #if RMS_NORM_ROPE_FUSION
             // Per-row offset in shared memory
             uint32_t d_offset = 0;
+#elif RMS_NORM_SET_ROWS_FUSION && defined(NORM_STORE_Q8_0)
+            uint32_t d_offset = data_i[channel].x*p.nb21 + row*(ncols / QUANT_K_Q8_0) + get_doffset();
 #elif RMS_NORM_SET_ROWS_FUSION
             uint32_t d_offset = data_i[channel].x*p.nb21 + row*ncols + get_doffset();
 #else
@@ -178,11 +190,38 @@ void rms_norm(uint num_iters) {
                     }
                 }
             } else {
-                [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
-                    if (col >= ncols) {
-                        continue;
+#if RMS_NORM_SET_ROWS_FUSION
+                if (num_iters == 1) {
+                    // one element per invocation, through shared memory: the rotation of a quantized cache (param3 the
+                    // size of its blocks, 0 for none, param2 its scale), then the q8_0 blocks of the row, or the row
+                    // in f32 before its conversion, as the separate ops round it (a product converted at once rounds
+                    // the ties of f16 differently)
+                    const uint col = tid;
+                    if (col < ncols) {
+                        row_vals[col] = scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col]));
                     }
-                    data_d[d_offset + col] = FLOAT_TO_D(scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col])));
+                    if (p.param3 != 0) {
+                        norm_store_fwht(col, ncols, uint(p.param3), p.param2);
+                    }
+                    barrier();
+#if defined(NORM_STORE_Q8_0)
+                    if (col < ncols / QUANT_K_Q8_0) {
+                        norm_store_q8_0(col, d_offset + col);
+                    }
+#else
+                    if (col < ncols) {
+                        data_d[d_offset + col] = FLOAT_TO_D(row_vals[col]);
+                    }
+#endif
+                } else
+#endif
+                {
+                    [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+                        if (col >= ncols) {
+                            continue;
+                        }
+                        data_d[d_offset + col] = FLOAT_TO_D(scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col])));
+                    }
                 }
             }
 #endif

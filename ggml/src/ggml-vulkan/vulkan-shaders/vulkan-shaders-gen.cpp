@@ -875,6 +875,7 @@ void process_shaders() {
         string_to_spv("rms_norm_mul_add_bf16_bf16" + suffix, "rms_norm.comp", merge_maps({{"C_TYPE", "uint16_t"}, {"DATA_C_BF16", "1"}, {"RMS_NORM_ADD_FUSION", "1"}}, rms_bf16_dict));
         string_to_spv("rms_norm_set_rows_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_SET_ROWS_FUSION", "1"}}));
         string_to_spv("rms_norm_set_rows_f32_f16" + suffix, "rms_norm.comp", merge_maps({{"D_TYPE", "float16_t"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}, rms_dict)); // keep rms_dict last so 'merge_maps' overwrites the value for key 'D_TYPE'
+        string_to_spv("rms_norm_set_rows_f32_q8_0" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_SET_ROWS_FUSION", "1"}, {"NORM_STORE_Q8_0", "1"}}));
         string_to_spv("rms_norm_mul_rope_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"ROPE_D_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
         string_to_spv("rms_norm_mul_rope_f32_f16" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"ROPE_D_TYPE", "float16_t"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
     }
@@ -882,7 +883,10 @@ void process_shaders() {
     string_to_spv("rms_norm_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
-    string_to_spv("l2_norm_clip_f32", "l2_norm_clip.comp", {});
+    string_to_spv("l2_norm_clip_f32", "l2_norm_clip.comp", merge_maps(base_dict, {{"D_TYPE", "float"}}));
+    string_to_spv("l2_norm_clip_set_rows_f32",  "l2_norm_clip.comp", merge_maps(base_dict, {{"D_TYPE", "float"},     {"SET_ROWS", "1"}}));
+    string_to_spv("l2_norm_clip_set_rows_f16",  "l2_norm_clip.comp", merge_maps(base_dict, {{"D_TYPE", "float16_t"}, {"SET_ROWS", "1"}}));
+    string_to_spv("l2_norm_clip_set_rows_q8_0", "l2_norm_clip.comp", merge_maps(base_dict, {{"D_TYPE", "float"},     {"SET_ROWS", "1"}, {"NORM_STORE_Q8_0", "1"}}));
 
     string_to_spv("cpy_32", "copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
     string_to_spv("cpy_f32_f16", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});

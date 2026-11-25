@@ -3170,6 +3170,116 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM or GGML_OP_L2_NORM_CLIP, with the rotation of a quantized cache (llama_mul_mat_hadamard: GGML_OP_RESHAPE,
+// GGML_OP_MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD, GGML_OP_RESHAPE) and the store of the rows of each token
+// (GGML_OP_VIEW, GGML_OP_SET_ROWS), as the attention stores its K and V; the rotated rows without the store, as its Q
+struct test_norm_store : public test_case {
+    const bool l2;                   // GGML_OP_L2_NORM_CLIP, else GGML_OP_RMS_NORM
+    const std::array<int64_t, 3> ne; // [head size, heads, tokens]
+    const int64_t n_rot;             // the rotation's blocks, 0 for none
+    const ggml_type type;            // the cache, GGML_TYPE_COUNT for no store
+    const bool scale;                // the clip with a scale per head and channel
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_STORE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(l2, ne, n_rot, type, scale);
+    }
+
+    test_norm_store(bool l2 = true, std::array<int64_t, 3> ne = {128, 8, 3}, int64_t n_rot = 128, ggml_type type = GGML_TYPE_Q8_0,
+            bool scale = false)
+        : l2(l2), ne(ne), n_rot(n_rot), type(type), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * cur;
+        if (l2) {
+            ggml_tensor * s = nullptr;
+            if (scale) {
+                s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+                ggml_set_name(s, "scale");
+            }
+            cur = ggml_l2_norm_clip_ext(ctx, a, s, nullptr, 5.0f, 1e-6f);
+        } else {
+            cur = ggml_rms_norm(ctx, a, 1e-6f);
+        }
+
+        if (n_rot > 0) {
+            ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rot, n_rot);
+            ggml_set_name(rot, "rot");
+            cur = ggml_mul_mat(ctx, rot, ggml_reshape_2d(ctx, cur, n_rot, ggml_nelements(cur)/n_rot));
+            ggml_mul_mat_set_hint(cur, GGML_HINT_SRC0_IS_HADAMARD);
+            cur = ggml_reshape_3d(ctx, cur, ne[0], ne[1], ne[2]);
+        }
+
+        if (type != GGML_TYPE_COUNT) {
+            ggml_tensor * view = ggml_view_2d(ctx, cur, ne[0]*ne[1], ne[2], cur->nb[2], 0);
+
+            ggml_tensor * dst = ggml_new_tensor_2d(ctx, type, ne[0]*ne[1], ne[2]*2);
+            ggml_set_name(dst, "dst");
+
+            ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, ne[2]);
+            ggml_set_name(row_idxs, "row_idxs");
+
+            cur = ggml_set_rows(ctx, dst, view, row_idxs);
+        }
+
+        ggml_set_name(cur, "out");
+        return cur;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, ne[2]*2);
+            } else if (strcmp(t->name, "rot") == 0) {
+                // the Walsh-Hadamard matrix of llama_kv_cache
+                std::vector<float> data(n_rot*n_rot);
+                data[0] = 1.0f/sqrtf((float) n_rot);
+                for (int64_t s = 1; s < n_rot; s *= 2) {
+                    for (int64_t i = 0; i < s; i++) {
+                        for (int64_t j = 0; j < s; j++) {
+                            const float val = data[i*n_rot + j];
+                            data[(i + s)*n_rot + j]       =  val;
+                            data[i*n_rot + j + s]         =  val;
+                            data[(i + s)*n_rot + j + s]   = -val;
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "scale") == 0) {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else if (strcmp(t->name, "a") == 0) {
+                // rows of growing scale, so that some are clipped and some are not
+                std::vector<float> data(ggml_nelements(t));
+                std::mt19937 gen(1234);
+                std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+                for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                    const float row_scale = 0.05f + 2.0f*(float) (r % 9)/8.0f;
+                    for (int64_t i = 0; i < t->ne[0]; ++i) {
+                        data[r*t->ne[0] + i] = row_scale*dist(gen);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        // the backends quantize their own values to q8_0: a few of them off by one step
+        return type == GGML_TYPE_Q8_0 ? 3e-5 : 1e-7;
+    }
+};
+
 // GGML_OP_ARGMAX
 struct test_argmax : public test_case {
     const ggml_type type;
@@ -12523,6 +12633,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, {n, 1, 1, 1}, 1e-6f, false, multi_add, false, false, false, GGML_TYPE_F32));
         }
     }
+
+    // Inkling 2's K and V stores and Q at 1, 2 (two slots) and 512 tokens: the clipped K and the normalized V rotated by blocks
+    // of 128 and 64 into a q8_0 cache, or stored as they are; the clipped Q rotated
+    for (int64_t n_tokens : {1, 2, 512}) {
+        test_cases.emplace_back(new test_norm_store(true,  {128, 8, n_tokens}, 128, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_norm_store(true,  {128, 8, n_tokens}, 0,   GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_norm_store(true,  {128, 8, n_tokens}, 0,   GGML_TYPE_F16));
+        test_cases.emplace_back(new test_norm_store(true,  {128, 8, n_tokens}, 0,   GGML_TYPE_F32));
+        test_cases.emplace_back(new test_norm_store(false, {128, 8, n_tokens}, 64,  GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_norm_store(false, {128, 8, n_tokens}, 0,   GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_norm_store(true,  {128, 24, n_tokens}, 128, GGML_TYPE_COUNT, true));
+        test_cases.emplace_back(new test_norm_store(true,  {128, 8, n_tokens}, 128, GGML_TYPE_F16, true));
+    }
+    // rows the fused shaders do not take: past one element per invocation, a rotation over two rows
+    test_cases.emplace_back(new test_norm_store(true,  {1024, 2, 3}, 128,  GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_norm_store(false, {256,  2, 3}, 64,   GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_norm_store(true,  {64,   4, 3}, 128,  GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_norm_store(true,  {64,   4, 3}, 128,  GGML_TYPE_COUNT));
 
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
