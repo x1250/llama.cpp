@@ -2540,6 +2540,8 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        // the normalized states of the output rows, which the head turns into logits
+        ggml_tensor * build_output_rows(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
         // the final depth mix of the blocks and cur, normalized, all rows
         ggml_tensor * build_output_norm(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
         // the head over normalized states: the logits of the unpadded vocabulary

@@ -529,6 +529,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 }
 
 void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
+    cur = build_head(build_output_rows(cur, blocks));
+
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+}
+
+ggml_tensor * llama_model_inkling2::graph::build_output_rows(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
     cur = build_output_norm(cur, blocks);
     res->t_layer_inp[n_layer] = cur;
 
@@ -539,10 +546,7 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_head(cur);
-
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+    return cur;
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_output_norm(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {

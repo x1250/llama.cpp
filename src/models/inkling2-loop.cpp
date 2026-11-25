@@ -143,20 +143,30 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     for (int il = end; il < m.n_phys; ++il) {
         cur = build_layer(il, il, cur, blocks);
     }
-    build_output(cur, blocks);
-
-    if (m.contrasts(cparams, LLAMA_LOOP_CONTRAST_TYPE_LOGITS)) {
-        // the first pass through its own copy of the coda, which keeps that stream's KV and convolution state
-        for (int ip = end; ip < m.n_phys; ++ip) {
-            first = build_layer(m.first_coda_slot(ip), ip, first, first_blocks);
-        }
-        first = build_output_norm(first, first_blocks);
-        if (inp_out_ids) {
-            first = ggml_get_rows(ctx0, first, inp_out_ids);
-        }
-        res->t_logits = contrast(res->t_logits, build_head(first));
-        cb(res->t_logits, "result_output_contrast", -1);
+    if (!m.contrasts(cparams, LLAMA_LOOP_CONTRAST_TYPE_LOGITS)) {
+        build_output(cur, blocks);
+        return;
     }
+    cur = build_output_rows(cur, blocks);
+
+    // the first pass through its own copy of the coda, which keeps that stream's KV and convolution state
+    for (int ip = end; ip < m.n_phys; ++ip) {
+        first = build_layer(m.first_coda_slot(ip), ip, first, first_blocks);
+    }
+    first = build_output_norm(first, first_blocks);
+    if (inp_out_ids) {
+        first = ggml_get_rows(ctx0, first, inp_out_ids);
+    }
+
+    // both predictions through one product of the head, which reads its weights once
+    ggml_tensor * logits = build_head(ggml_concat(ctx0, cur, first, 1));
+    const int64_t n_rows = cur->ne[1];
+    ggml_tensor * last_logits  = ggml_view_2d(ctx0, logits, logits->ne[0], n_rows, logits->nb[1], 0);
+    ggml_tensor * first_logits = ggml_view_2d(ctx0, logits, logits->ne[0], n_rows, logits->nb[1], n_rows*logits->nb[1]);
+
+    cur = contrast(last_logits, first_logits);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
 }
 
 ggml_tensor * llama_model_inkling2_loop::graph::contrast(ggml_tensor * last, ggml_tensor * first) {
