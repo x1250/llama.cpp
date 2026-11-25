@@ -16542,6 +16542,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                         if (!src || src->op == GGML_OP_NONE) {
                             continue;
                         }
+                        // the tensor a SET_ROWS writes its rows into (a view of a multi-stream cache), not read
+                        if (cgraph->nodes[i + k]->op == GGML_OP_SET_ROWS && s == 2) {
+                            continue;
+                        }
                         if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
                             bool found = false;
                             for (int n = 0; n < k; ++n) {
