@@ -221,13 +221,10 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const 
     return std::make_unique<graph>(params);
 }
 
-// scale each row down to an L2 norm of at most threshold, after the optional per-channel scale
-ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold) {
-    if (scale) {
-        cur = ggml_mul(ctx0, cur, scale);
-    }
-
-    return ggml_l2_norm_clip(ctx0, cur, threshold, 1e-6f);
+// scale each row down to an L2 norm of at most threshold, after the optional per-channel scale; the optional post
+// multiplies each row after the clip
+ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, ggml_tensor * post, float threshold) {
+    return ggml_l2_norm_clip_ext(ctx0, cur, scale, post, threshold, 1e-6f);
 }
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries, [n_embd, n_tokens, n_query]
@@ -449,15 +446,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
         ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
 
-        Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
-        Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
-        Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
-        Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip);
+        // tau multiplies q and r of the full-attention layers after their clips
+        ggml_tensor * post = is_swa ? nullptr : tau;
 
-        if (!is_swa) {
-            Qcur = ggml_mul(ctx0, Qcur, tau);
-            Rcur = ggml_mul(ctx0, Rcur, tau);
-        }
+        Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, post,    hparams.f_qk_clip);
+        Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           nullptr, hparams.f_qk_clip);
+        Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
+        Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, post, hparams.f_relative_clip);
 
         cb(Qcur, "Qcur", il);
         cb(Kcur, "Kcur", il);
