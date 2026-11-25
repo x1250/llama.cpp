@@ -1065,3 +1065,62 @@ en ramas propias y en una de integración (`inkling-fuse`), cada uno con su arn�
   convoluciones dinámicas por token con sus taps (un op nuevo, ~−288 despachos); en CPU, los controladores fundidos con
   lotes de 9 a 32 tokens quedan hasta un 30 % bajo el camino sin fundir (el mul_mat por lotes usa el GEMM de
   llamafile). Las notas sobre upstream que encontraron las ramas están en `latent-defects.md`.
+
+## 14. El decode a profundidad y el muestreo en la CPU (2026-11-25, nada adoptado)
+
+Las dos palancas que quedaban sobre el decode después de la sección 11, medidas con producción descargada
+(`fadepth.sh`, `fadepth512.sh`, `bsamp*.sh` y `sampler-bench/` en la carpeta de evidencia).
+
+**El decode cae con la profundidad:** en la forma de producción con LoopCD da 32.0 t/s a 2k, 24.0 a 60k, 20.5 a 100k y
+16.6 a 163k (`lcdhead.out`). El perfil a 100k (llama-bench sin LoopCD, KV q8_0, ubatch 512) lo atribuye a las 8
+atenciones globales: 13.0 de 41.4 ms de GPU por token, 1.6 ms cada una para 218 MB de K/V, 136 GB/s.
+
+**El split_k de la atención no es la causa** (`fadepth512.out`, la base primera y última). Con un token y GQA, el despacho
+lanza 2 workgroups por unidad de cómputo, 80 en total (`ggml-vulkan.cpp`, la rama `gqa_ratio > 1`). Con más, empeora:
+
+| Workgroups por CU | 2 (upstream) | 4 | 8 | 16 |
+|---|---|---|---|---|
+| tg64 a 100k | 25.5-25.9 t/s | 23.5 | 23.8 | 22.6 |
+| Las 8 atenciones globales | 13.0 ms | | 15.7 ms | |
+
+A 2k las variantes quedan dentro de la deriva de la base (36.7 a 38.2 t/s), y con 1 por CU la atención a 100k tarda
+2.5 ms (`fadepth-op.log`).
+
+**La causa es la lectura de q8_0 en el shader escalar.** `test-backend-ops perf` sobre la forma del decode a 100k
+(casos nuevos en la rama `vk-fa-decode-split`, sin commit; `fadepth-op.log` y `fadepth-op2.log`):
+
+| K / V | Tiempo | Bytes | Ancho de banda |
+|---|---|---|---|
+| f16 / f16 | 2016 µs | 410 MB | 203 GB/s, el techo de la máquina |
+| q8_0 / q8_0 | 1443 µs | 218 MB | 151 GB/s |
+| q8_0 / f16 | 1697 µs | 314 MB | 185 GB/s |
+| f16 / q8_0 | 1687 µs | 314 MB | 186 GB/s |
+
+- Despejando con los mixtos, K y V en q8_0 se leen a ~160 GB/s cada uno: el producto entero de K (MMQ) y el dequant
+  de V de a 4 valores con lecturas de 16 bits pierden por igual.
+- El sesgo relativo suma 10 % (1540 contra 1399 µs).
+- Llevar q8_0 al ritmo de f16 dejaría cada atención global en ~1.07 ms. Con LoopCD son 9 visitas globales: ~4 ms por
+  token a 100k (+9 %), proporcional a la profundidad y nada a contexto corto.
+- Es una reescritura del camino q8_0 del shader escalar de upstream, sin implementar.
+
+**El muestreo en la GPU** (`--backend-sampling`, también un campo de cada petición):
+- **Rinde:** una petición de 31.9 a 33.6 t/s (+5 %, `fadepth.out`). El servidor de diagnóstico (`DEBUG_TIMINGS` y un
+  reloj dentro de `common_sampler_sample`, sin commit) da 1.26 ms de muestreo por token en la CPU, de los que leer los
+  logits son 0.12, contra 0.22 ms en la GPU, con el mismo decode (29.5 ms; `bsamp-diag.out`).
+- **El costo en la CPU es `dist`:** el softmax y la selección sobre los 201024 tokens. Los demás muestreadores de
+  producción salen sin trabajar (`sampler-bench/chain_bench.cpp`).
+- **Muestrea la misma distribución:**
+  - greedy, idéntico en las dos rutas (`bsamp2.out`);
+  - en 8 prefijos de un razonamiento, las 20 probabilidades más altas difieren a lo sumo en 2e-7;
+  - 300 muestras por ruta en el prefijo de mayor entropía dan chi² de 6.3 (CPU) y 3.5 (GPU), con el límite en 12.6
+    (`bsamp3.out`).
+  - En `bsamp2.out` la CPU agotó los 1500 tokens razonando en 4 de 6 peticiones y la GPU en 1 de 6. Con 6 por lado no
+    es significativo, y las probabilidades fijas muestran que es azar.
+- **No llega al uso con agente:** con herramientas, Inkling arma una gramática perezosa (`common/parsers/inkling.cpp`)
+  y `common_sampler_init` apaga el muestreo en la GPU para toda la petición.
+  - Upstream lo trabaja en dos PR abiertos el 2026-11-25. El #31672 muestrea en la GPU, verifica ese token contra la
+    gramática en la CPU y remuestrea solo si es rechazado (+360 −63). El #31912 lleva la gramática al backend (+9181,
+    borrador).
+- **Las compuertas no lo verían:** `repeat_probe`, la de historia y `depth_equiv` piden log-probs sin
+  `post_sampling_probs`, y eso apaga el muestreo en la GPU. Adoptarlo pide compuertas propias: decodes greedy repetidos
+  comparados por tokens, el mismo después de la imagen de 2048 × 2048 en el otro slot, y los dos slots a la vez.
