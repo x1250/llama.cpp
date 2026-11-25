@@ -8018,8 +8018,12 @@ struct test_topk_moe : public test_case {
     ggml_tensor * logits {};
     ggml_tensor * exp_probs_b {};
     const bool norm_bias;
+    // the expert scales of build_moe_ffn (NVFP4 experts), in the weight context: one multiplied into the router weights,
+    // one gathered
+    const bool expert_scales;
     ggml_tensor * weights {};
     ggml_tensor * selected_experts {};
+    ggml_tensor * gathered {};
 
     test_topk_moe(std::array<int64_t, 4> ne              = { 10, 5, 1, 1 },
                   int                    n_expert_used   = 1,
@@ -8028,7 +8032,8 @@ struct test_topk_moe : public test_case {
                   MoeGatingFunc          gating_func     = GATING_FUNC_SOFTMAX,
                   float                  scale_w         = 0.0f,
                   int                    n_expert_groups = 1,
-                  bool                   norm_bias       = false) :
+                  bool                   norm_bias       = false,
+                  bool                   expert_scales   = false) :
         ne(ne),
         n_expert_used(n_expert_used),
         with_norm(with_norm),
@@ -8036,14 +8041,23 @@ struct test_topk_moe : public test_case {
         gating_func(gating_func),
         scale_w(scale_w),
         n_expert_groups(n_expert_groups),
-        norm_bias(norm_bias) {
+        norm_bias(norm_bias),
+        expert_scales(expert_scales) {
         GGML_ASSERT(n_expert_used <= ne[0]);
         GGML_ASSERT(ne[0] % n_expert_groups == 0);
         GGML_ASSERT(n_expert_used <= ne[0] / n_expert_groups);
         GGML_ASSERT(!norm_bias || with_norm);
     }
 
-    std::string vars() override { return VARS_TO_STR8(ne, n_expert_used, with_norm, norm_bias, bias_probs, gating_func, scale_w, n_expert_groups); }
+    std::string vars() override {
+        std::string v = VARS_TO_STR8(ne, n_expert_used, with_norm, norm_bias, bias_probs, gating_func, scale_w, n_expert_groups);
+        if (expert_scales) {
+            v += "," + VAR_TO_STR(expert_scales);
+        }
+        return v;
+    }
+
+    bool use_weight_context() override { return expert_scales; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -8153,6 +8167,10 @@ struct test_topk_moe : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, nullptr);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         const int n_expert = ne[0];
         const int n_tokens = ne[1];
         const int n_exp_per_group = n_expert / n_expert_groups;
@@ -8222,11 +8240,31 @@ struct test_topk_moe : public test_case {
             weights = ggml_scale(ctx, weights, scale_w);
         }
 
+        if (expert_scales) {
+            // build_expert_scale: an [n_expert] vector gathered by the selected experts of every token
+            auto gather_expert_scale = [&](const char * name) {
+                ggml_tensor * s = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_expert);
+                ggml_set_name(s, name);
+                s = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, s, 1, n_expert, 1), 1, n_expert, n_tokens, 1);
+                return ggml_get_rows(ctx, s, selected_experts); // [1, n_expert_used, n_tokens]
+            };
+            weights = ggml_mul(ctx, weights, gather_expert_scale("down_s"));
+            ggml_build_forward_expand(gf, weights);
+            gathered = gather_expert_scale("up_s");
+            ggml_set_name(gathered, "gathered");
+            ggml_build_forward_expand(gf, gathered);
+        }
+
         ggml_set_name(weights, "weights");
         return weights;
     }
-    // Verify two outputs
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
+    // Verify two outputs, and the gathered expert scale
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (gathered) {
+            return { selected_experts, weights, gathered };
+        }
+        return { selected_experts, weights };
+    }
 
     // allow output in arbitrary order
     double err(const float * a, const float * b, size_t n) override {
@@ -14277,10 +14315,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_topk_moe({128,  3, 1, 1}, 128, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
         test_cases.emplace_back(new test_topk_moe({160,  4, 1, 1}, 160, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
     }
-    // Inkling 2: 8 of 128 experts, the weights scaled by 8; one and two tokens, and prompt ubatches
-    for (int64_t n_tokens : {1, 2, 512, 2048}) {
-        test_cases.emplace_back(new test_topk_moe({128, n_tokens, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
+    // Inkling 2: 8 of 128 experts, the weights scaled by 8; one and two tokens, and prompt ubatches; without the expert
+    // scales (Q8_0 experts) and with them (NVFP4)
+    for (bool expert_scales : {false, true}) {
+        for (int64_t n_tokens : {1, 2, 512, 2048}) {
+            test_cases.emplace_back(new test_topk_moe({128, n_tokens, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true, expert_scales));
+        }
     }
+    // the expert scales after the weights of the other routers: a reshape of the division, a SCALE, a reshape of the
+    // softmax of the selected weights, and the GET_ROWS of the weights
+    test_cases.emplace_back(new test_topk_moe({128, 22, 1, 1}, 8, true,  false, GATING_FUNC_SOFTMAX,        0.0f, 1, false, true));
+    test_cases.emplace_back(new test_topk_moe({256,  7, 1, 1}, 8, true,  true,  GATING_FUNC_SIGMOID,        2.5f, 1, false, true));
+    test_cases.emplace_back(new test_topk_moe({ 64,  5, 1, 1}, 4, false, false, GATING_FUNC_SOFTMAX_WEIGHT, 0.0f, 1, false, true));
+    test_cases.emplace_back(new test_topk_moe({  8, 22, 1, 1}, 2, false, false, GATING_FUNC_SOFTMAX,        0.0f, 1, false, true));
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));

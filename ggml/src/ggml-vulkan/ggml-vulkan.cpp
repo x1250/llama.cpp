@@ -4511,7 +4511,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     for (uint32_t use_push = 0; use_push < 2; ++use_push) {
         for (uint32_t i = 0; i < num_topk_moe_pipelines; ++i) {
-            ggml_vk_create_pipeline2(device, device->pipeline_topk_moe[i][use_push], "topk_moe_f32_"+std::to_string(i), topk_moe_f32_len, topk_moe_f32_data, "main", 4, sizeof(vk_op_topk_moe_push_constants), {1, 1, 1}, {device->subgroup_size, 1u<<i, use_push}, 1, true, true, device->subgroup_size);
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_moe[i][use_push], "topk_moe_f32_"+std::to_string(i), topk_moe_f32_len, topk_moe_f32_data, "main", 7, sizeof(vk_op_topk_moe_push_constants), {1, 1, 1}, {device->subgroup_size, 1u<<i, use_push}, 1, true, true, device->subgroup_size);
         }
     }
 
@@ -12542,7 +12542,14 @@ void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cg
     ggml_tensor * bias = sigmoid_bias                             ? cgraph->nodes[node_idx + 2]->src[1] :
                          mode == TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS ? cgraph->nodes[node_idx + 3]->src[1] :
                                                                    logits;
-    ggml_tensor * weights = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+    // the weights are the last node, or the one before the gathered expert scale (RESHAPE, REPEAT, GET_ROWS)
+    ggml_tensor * weights = cgraph->nodes[node_idx + (ctx->fused_topk_moe_gather ? ctx->fused_topk_moe_gather - 3 :
+                                                                                   ctx->num_additional_fused_ops)];
+    // the expert scales: the [n_expert] vectors under the RESHAPE and REPEAT of their GET_ROWS
+    ggml_tensor * fold_scale   = ctx->fused_topk_moe_fold ?
+                                 cgraph->nodes[node_idx + ctx->fused_topk_moe_fold]->src[0]->src[0]->src[0] : nullptr;
+    ggml_tensor * gathered     = ctx->fused_topk_moe_gather ? cgraph->nodes[node_idx + ctx->fused_topk_moe_gather] : nullptr;
+    ggml_tensor * gather_scale = gathered ? gathered->src[0]->src[0]->src[0] : nullptr;
     ggml_tensor * ids = sigmoid_bias                             ? cgraph->nodes[node_idx + 4] :
                         mode == TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS ? cgraph->nodes[node_idx + 5] :
                         mode == TOPK_MOE_LATE_SOFTMAX             ? cgraph->nodes[node_idx + 1] :
@@ -12621,21 +12628,32 @@ void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cg
     // this router gives the bytes of the unfused ops: the experts in the order of ARGSORT, ties included, and the sum
     // and division of SUM_ROWS, SCALE and DIV
     pc.argsort_select = mode == TOPK_MOE_SIGMOID_NORM_EPS_BIAS;
+    // the SCALE of the weights comes before the folded expert scale
+    ggml_tensor * scale = ctx->fused_topk_moe_fold ? cgraph->nodes[node_idx + ctx->fused_topk_moe_fold - 3] : weights;
     if (ctx->fused_topk_moe_scale) {
-        GGML_ASSERT(weights->op == GGML_OP_SCALE);
-        pc.output_scale = ggml_get_op_params_f32(weights, 0);
-        pc.output_bias = ggml_get_op_params_f32(weights, 1);
+        GGML_ASSERT(scale->op == GGML_OP_SCALE);
+        pc.output_scale = ggml_get_op_params_f32(scale, 0);
+        pc.output_bias = ggml_get_op_params_f32(scale, 1);
     } else {
         pc.output_scale = 1.0f;
         pc.output_bias = 0.0f;
     }
+    pc.has_fold = fold_scale != nullptr;
+    pc.has_gather = gathered != nullptr;
 
     GGML_ASSERT(n_expert_used <= n_experts);
+    GGML_ASSERT(!gathered || ggml_are_same_shape(gathered, weights));
+
+    // the bindings of absent expert scales are never read nor written
+    vk_subbuffer fold_buf = fold_scale ? ggml_vk_tensor_subbuffer(ctx, fold_scale) : logits_buf;
+    vk_subbuffer gather_buf = gather_scale ? ggml_vk_tensor_subbuffer(ctx, gather_scale) : logits_buf;
+    vk_subbuffer gathered_buf = gathered ? ggml_vk_tensor_subbuffer(ctx, gathered) : weights_buf;
 
     const uint32_t rows_per_block = 4;
     std::array<uint32_t, 3> elements = { CEIL_DIV(n_rows, rows_per_block), 1, 1 };
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {logits_buf, bias_buf, weights_buf, ids_buf}, pc, elements);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                              {logits_buf, bias_buf, weights_buf, ids_buf, fold_buf, gather_buf, gathered_buf}, pc, elements);
 }
 
 void ggml_vk_rope(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx, bool backprop) {
@@ -15442,6 +15460,81 @@ static bool ggml_vk_match_ops(const struct ggml_cgraph * cgraph, int node_idx,
     return true;
 }
 
+// A SCALE of the weights after the topk_moe pattern that ends at last_idx, as the reshape of a division or as the
+// GET_ROWS of the weights, which the shader applies as it writes them.
+static bool ggml_vk_topk_moe_scale(const struct ggml_cgraph * cgraph, int last_idx) {
+    return ggml_can_fuse_subgraph(cgraph, last_idx - 1, { GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_SCALE }, { last_idx + 1 }) ||
+           ggml_can_fuse_subgraph(cgraph, last_idx, { GGML_OP_GET_ROWS, GGML_OP_SCALE }, { last_idx + 1 });
+}
+
+// The expert scales of build_moe_ffn after the weights of a topk_moe fusion (its nodes first_idx to weights_idx), which
+// its shader computes too, reading each [n_expert] vector by expert: first one multiplied into the weights (RESHAPE,
+// REPEAT and GET_ROWS by the selected experts, then MUL), then one gathered for the experts' first product (RESHAPE,
+// REPEAT, GET_ROWS). fold and gather get the offsets of their GET_ROWS from first_idx (0: none). Returns the nodes they
+// add after weights_idx.
+static int ggml_vk_topk_moe_expert_scales(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                          int first_idx, int weights_idx, int & fold, int & gather) {
+    fold   = 0;
+    gather = 0;
+
+    // the selected experts: the view of the ARGSORT among the fused nodes
+    int ids_idx = -1;
+    for (int i = first_idx; i < weights_idx && ids_idx < 0; ++i) {
+        if (cgraph->nodes[i]->op == GGML_OP_VIEW && cgraph->nodes[i]->src[0]->op == GGML_OP_ARGSORT) {
+            ids_idx = i;
+        }
+    }
+    if (ids_idx < 0) {
+        return 0;
+    }
+    const ggml_tensor * ids      = cgraph->nodes[ids_idx];
+    const int64_t       n_expert = ids->src[0]->ne[0];
+
+    // an expert scale gathered by the selected experts at node_idx, its vector in device memory
+    auto const is_expert_scale = [&](int node_idx) -> bool {
+        if (!ggml_vk_match_ops(cgraph, node_idx, topk_moe_expert_scale)) {
+            return false;
+        }
+        const ggml_tensor * reshape  = cgraph->nodes[node_idx];
+        const ggml_tensor * repeat   = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * get_rows = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * scale    = reshape->src[0];
+        return repeat->src[0] == reshape && get_rows->src[0] == repeat && get_rows->src[1] == ids &&
+               reshape->ne[0] == 1 && get_rows->type == GGML_TYPE_F32 &&
+               scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale) && ggml_nelements(scale) == n_expert &&
+               scale->buffer && ggml_backend_buffer_is_vk(scale->buffer) && get_misalign_bytes(ctx, scale) == 0;
+    };
+    // the nodes first_idx to last as one fusion that writes only the outputs
+    auto const can_fuse = [&](int last, std::initializer_list<int> outputs) -> bool {
+        std::array<ggml_op, 31> ops;
+        const int count = last - first_idx + 1;
+        if (count > (int) ops.size()) {
+            return false;
+        }
+        for (int k = 0; k < count; ++k) {
+            ops[k] = cgraph->nodes[first_idx + k]->op;
+        }
+        return ggml_can_fuse_subgraph(cgraph, first_idx, count, ops.data(), outputs.begin(), (int) outputs.size());
+    };
+
+    const int pattern_weights = weights_idx;
+    int last = weights_idx;
+    if (is_expert_scale(last + 1) && last + 4 < cgraph->n_nodes) {
+        const ggml_tensor * mul = cgraph->nodes[last + 4];
+        if (mul->op == GGML_OP_MUL && mul->src[0] == cgraph->nodes[weights_idx] && mul->src[1] == cgraph->nodes[last + 3] &&
+            ggml_are_same_shape(mul, cgraph->nodes[weights_idx]) && can_fuse(last + 4, { ids_idx, last + 4 })) {
+            fold        = last + 3 - first_idx;
+            weights_idx = last + 4;
+            last       += 4;
+        }
+    }
+    if (is_expert_scale(last + 1) && can_fuse(last + 3, { ids_idx, weights_idx, last + 3 })) {
+        gather = last + 3 - first_idx;
+        last  += 3;
+    }
+    return last - pattern_weights;
+}
+
 // Nodes after the gated delta net at node_idx that fuse with it, 0 if none: the op writes its state snapshots straight
 // into the destination of the copy that follows it (the recurrent cache rows of each rollback slot) and skips the
 // snapshot part of its own output; the attention scores still go to its output, which the rest of the graph reads.
@@ -15968,11 +16061,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
         // the fused result in an elementwise-way. This affects whether the memory for
         // the src is allowed to overlap the memory for the destination.
-        // The array is sized to handle the largest fusion (asserted later).
-        bool op_srcs_fused_elementwise[13];
+        // The array is sized to handle the largest fusion (asserted later): a topk_moe pattern of 12 nodes, its SCALE
+        // and two expert scales.
+        bool op_srcs_fused_elementwise[20];
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
+        ctx->fused_topk_moe_fold = 0;
+        ctx->fused_topk_moe_gather = 0;
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_gdn_snapshots = false;
@@ -16180,11 +16276,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
             if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
                 // Look for an additional scale op to fuse - occurs in deepseek2 and nemotron3 nano.
-                if (ggml_can_fuse_subgraph(cgraph, i + ctx->num_additional_fused_ops - 1, { GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_SCALE }, { i + ctx->num_additional_fused_ops + 1 }) ||
-                    ggml_can_fuse_subgraph(cgraph, i + ctx->num_additional_fused_ops, { GGML_OP_GET_ROWS, GGML_OP_SCALE }, { i + ctx->num_additional_fused_ops + 1 })) {
+                if (ggml_vk_topk_moe_scale(cgraph, i + ctx->num_additional_fused_ops)) {
                     ctx->fused_topk_moe_scale = true;
                     ctx->num_additional_fused_ops++;
                     op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = false;
+                }
+                // and the expert scales after the weights: the shader multiplies one into them and writes the other
+                const int weights_ofs = ctx->num_additional_fused_ops;
+                const int n_scales = ggml_vk_topk_moe_expert_scales(ctx, cgraph, i, i + weights_ofs,
+                                                                    ctx->fused_topk_moe_fold, ctx->fused_topk_moe_gather);
+                if (n_scales) {
+                    ctx->num_additional_fused_ops += n_scales;
+                    std::fill_n(op_srcs_fused_elementwise + weights_ofs + 1, n_scales, false);
+                    if (ctx->fused_topk_moe_gather) {
+                        // the weights before the gathered scale's RESHAPE, REPEAT and GET_ROWS
+                        ctx->fused_ops_write_mask |= 1 << (ctx->fused_topk_moe_gather - 3);
+                    }
                 }
             }
         }
@@ -16194,23 +16301,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // Check whether fusion would overwrite src operands while they're still in use.
         // If so, disable fusion.
         if (ctx->num_additional_fused_ops) {
-            // There are up to two output nodes - topk_moe has two.
-            uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
-            ggml_tensor *output_nodes[2] {};
-            output_nodes[0] = cgraph->nodes[i + ctx->num_additional_fused_ops];
-            if (bits) {
-                int output_idx = find_first_set(bits);
-                GGML_ASSERT(bits == (1u << output_idx));
-                output_nodes[1] = cgraph->nodes[i + output_idx];
+            // Every node that writes memory is an output: topk_moe writes up to three (the ids, the weights and a
+            // gathered expert scale).
+            ggml_tensor *output_nodes[3] {};
+            int n_output_nodes = 0;
+            for (uint32_t bits = ctx->fused_ops_write_mask; bits; bits &= bits - 1) {
+                GGML_ASSERT(n_output_nodes < 3);
+                output_nodes[n_output_nodes++] = cgraph->nodes[i + find_first_set(bits)];
             }
 
             bool need_disable = false;
 
-            for (int j = 0; j < 2; ++j) {
+            for (int j = 0; j < n_output_nodes; ++j) {
                 ggml_tensor *dst = output_nodes[j];
-                if (!dst) {
-                    continue;
-                }
                 // Loop over all srcs of all nodes in the fusion. If the src overlaps
                 // the destination and the src is not an intermediate node that's being
                 // elided, then disable fusion.
@@ -16240,6 +16343,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
+                ctx->fused_topk_moe_fold = 0;
+                ctx->fused_topk_moe_gather = 0;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_gdn_snapshots = false;
@@ -16280,6 +16385,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
                 if (ctx->fused_topk_moe_scale) {
                     label += "_SCALE";
+                }
+                if (ctx->fused_topk_moe_fold) {
+                    label += "_FOLD";
+                }
+                if (ctx->fused_topk_moe_gather) {
+                    label += "_GATHER";
                 }
                 ggml_vk_count_fusion(ctx->device, label.c_str());
             }
@@ -16417,6 +16528,48 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         return true;
     };
+
+    // the topk_moe patterns, in the order graph_compute tries them (a longer one before the one it starts with)
+    const std::initializer_list<ggml_op> * topk_moe_patterns[] = {
+        &topk_moe_early_softmax_norm, &topk_moe_sigmoid_norm_bias, &topk_moe_sigmoid_norm_eps_bias,
+        &topk_moe_sqrt_softplus_norm_bias, &topk_moe_early_softmax, &topk_moe_late_softmax,
+    };
+
+    // the nodes a topk_moe fusion takes when pattern starts at start, 0 if it does not: the pattern, then its SCALE and
+    // the expert scales after it, which graph_compute fuses with it
+    auto const &topk_moe_extent = [&](const std::initializer_list<ggml_op> &pattern, int start) -> int {
+        if (start + (int) pattern.size() > graph->n_nodes) {
+            return 0;
+        }
+        for (size_t j = 0; j < pattern.size(); ++j) {
+            if (graph->nodes[start + j]->op != pattern.begin()[j]) {
+                return 0;
+            }
+        }
+        int last = start + (int) pattern.size() - 1;
+        if (ggml_vk_topk_moe_scale(graph, last)) {
+            last++;
+        }
+        int fold = 0;
+        int gather = 0;
+        last += ggml_vk_topk_moe_expert_scales(ctx, graph, start, last, fold, gather);
+        return last - start + 1;
+    };
+
+    // the nodes of every topk_moe fusion, which no set takes ahead of its first node: the expert scales' RESHAPE and
+    // REPEAT do not depend on the router, and an earlier set would pull them away from it
+    std::vector<bool> in_topk_moe(graph->n_nodes, false);
+    for (int start = 0; start < graph->n_nodes; ++start) {
+        for (const auto * pattern : topk_moe_patterns) {
+            const int n = topk_moe_extent(*pattern, start);
+            if (n) {
+                std::fill_n(in_topk_moe.begin() + start, n, true);
+                start += n - 1;
+                break;
+            }
+        }
+    }
+
     while (first_unused < graph->n_nodes) {
         std::vector<int> current_set;
 
@@ -16434,16 +16587,21 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return false;
         };
 
+        // the next n nodes in their order
+        auto const &keep_nodes = [&](int n) {
+            for (int j = 0; j < n; ++j) {
+                new_order.push_back(graph->nodes[first_unused + j]);
+                used_node_set.insert(graph->nodes[first_unused + j]);
+                used[first_unused + j] = true;
+            }
+            while (first_unused < graph->n_nodes && used[first_unused]) {
+                first_unused++;
+            }
+        };
+
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (match_pattern(pattern, first_unused)) {
-                for (size_t j = 0; j < pattern.size(); ++j) {
-                    new_order.push_back(graph->nodes[first_unused + j]);
-                    used_node_set.insert(graph->nodes[first_unused + j]);
-                    used[first_unused + j] = true;
-                }
-                while (first_unused < graph->n_nodes && used[first_unused]) {
-                    first_unused++;
-                }
+                keep_nodes((int) pattern.size());
                 return true;
             }
             return false;
@@ -16461,10 +16619,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                    !used[start] && !used[start + 1] && !used[start + 3];
         };
 
-        auto const &add_pattern_alloc_deps = [&](const std::initializer_list<ggml_op> &pattern, int last_node) {
+        auto const &add_pattern_alloc_deps = [&](int n_nodes, int last_node) {
             // Keep external inputs alive through the fused output.
             std::set<ggml_tensor *> seen;
-            for (size_t j = 0; j < pattern.size(); ++j) {
+            for (int j = 0; j < n_nodes; ++j) {
                 ggml_tensor * node = graph->nodes[first_unused + j];
                 for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
                     ggml_tensor * src = node->src[s];
@@ -16476,38 +16634,30 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
         };
 
+        // the pattern with its SCALE and expert scales (topk_moe_extent), or the pattern alone if a set took any of them
         auto const &keep_topk_moe_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (!match_pattern(pattern, first_unused)) {
                 return false;
             }
-
-            int last_node = first_unused + (int) pattern.size() - 1;
-            // Some TOPK_MOE variants fuse a trailing scale.
-            if (last_node + 1 < graph->n_nodes && graph->nodes[last_node + 1]->op == GGML_OP_SCALE) {
-                last_node++;
+            int n_nodes = topk_moe_extent(pattern, first_unused);
+            for (int j = (int) pattern.size(); j < n_nodes; ++j) {
+                if (used[first_unused + j]) {
+                    n_nodes = (int) pattern.size();
+                }
             }
-
-            add_pattern_alloc_deps(pattern, last_node);
-
-            return keep_pattern(pattern);
+            add_pattern_alloc_deps(n_nodes, first_unused + n_nodes - 1);
+            keep_nodes(n_nodes);
+            return true;
         };
 
-        if (keep_topk_moe_pattern(topk_moe_early_softmax_norm)) {
-            continue;
+        bool kept_topk_moe = false;
+        for (const auto * pattern : topk_moe_patterns) {
+            if (keep_topk_moe_pattern(*pattern)) {
+                kept_topk_moe = true;
+                break;
+            }
         }
-        if (keep_topk_moe_pattern(topk_moe_sigmoid_norm_bias)) {
-            continue;
-        }
-        if (keep_topk_moe_pattern(topk_moe_sigmoid_norm_eps_bias)) {
-            continue;
-        }
-        if (keep_topk_moe_pattern(topk_moe_sqrt_softplus_norm_bias)) {
-            continue;
-        }
-        if (keep_topk_moe_pattern(topk_moe_early_softmax)) {
-            continue;
-        }
-        if (keep_topk_moe_pattern(topk_moe_late_softmax)) {
+        if (kept_topk_moe) {
             continue;
         }
         if (keep_pattern(snake_pattern)) {
@@ -16546,7 +16696,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
         if (match_pattern(hc_post_gate_pattern, first_unused)) {
-            add_pattern_alloc_deps(hc_post_gate_pattern, first_unused + (int) hc_post_gate_pattern.size() - 1);
+            add_pattern_alloc_deps((int) hc_post_gate_pattern.size(), first_unused + (int) hc_post_gate_pattern.size() - 1);
             keep_pattern(hc_post_gate_pattern);
             continue;
         }
@@ -16586,12 +16736,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 !is_computed(graph->nodes[j + 1]->src[1])) {
                 continue;
             }
-            if (match_pattern(topk_moe_early_softmax_norm, j) ||
-                match_pattern(topk_moe_sigmoid_norm_bias, j) ||
-                match_pattern(topk_moe_sigmoid_norm_eps_bias, j) ||
-                match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
-                match_pattern(topk_moe_early_softmax, j) ||
-                match_pattern(topk_moe_late_softmax, j) ||
+            if (in_topk_moe[j] ||
                 match_pattern(snake_pattern, j) ||
                 in_qsa_pattern(j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
@@ -16755,7 +16900,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 if (used[j]) {
                     continue;
                 }
-                if (!is_empty(graph->nodes[j])) {
+                if (!is_empty(graph->nodes[j]) || in_topk_moe[j]) {
                     continue;
                 }
                 bool ok = true;

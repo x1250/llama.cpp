@@ -32,6 +32,8 @@ layout (push_constant) uniform parameter
     float norm_scale;
     float norm_bias;
     uint argsort_select;
+    uint has_fold;
+    uint has_gather;
 };
 
 layout(local_size_x_id = 0, local_size_y = 4, local_size_z = 1) in;
@@ -50,6 +52,10 @@ layout (binding = 0, std430) readonly buffer Logits {float logits[];};
 layout (binding = 1, std430) readonly buffer BiasProbs {float bias[];};
 layout (binding = 2, std430) writeonly buffer Weights {float weights[];};
 layout (binding = 3, std430) writeonly buffer Ids {uint ids[];};
+// two expert scales, [n_experts] each: one multiplied into the weights, one written beside them by selected expert
+layout (binding = 4, std430) readonly buffer FoldScale {float fold_scale[];};
+layout (binding = 5, std430) readonly buffer GatherScale {float gather_scale[];};
+layout (binding = 6, std430) writeonly buffer Gathered {float gathered[];};
 
 const float INFINITY = 1.0 / 0.0;
 
@@ -100,10 +106,11 @@ void softmax_warp_inplace(inout float vals[experts_per_thread], const uint limit
 // The experts in the order of ARGSORT, the unfused path, so that ties resolve as there (the argmax loop of main takes
 // the lowest expert of a tie): its bitonic network over the selection scores, with the experts past n_experts above
 // every score, read from the top. Expert e starts at position e, in lane e % WARP_SIZE and slot e / WARP_SIZE; the
-// k-th selected expert, at position n_experts - 1 - k at the end, is written as k and its weight goes to lane
-// k % WARP_SIZE, slot k / WARP_SIZE, as the argmax loop leaves it.
+// k-th selected expert, at position n_experts - 1 - k at the end, is written as k and goes with its weight to lane
+// k % WARP_SIZE, slot k / WARP_SIZE, as the argmax loop leaves them.
 void select_argsort(const float probs[experts_per_thread], const float selection_probs[experts_per_thread],
-                    const uint lane, const uint ids_offset, inout float output_weights[experts_per_thread]) {
+                    const uint lane, const uint ids_offset, inout float output_weights[experts_per_thread],
+                    inout uint selected_experts[experts_per_thread]) {
     float score[experts_per_thread];
     uint  expert[experts_per_thread];
     [[unroll]]
@@ -171,6 +178,7 @@ void select_argsort(const float probs[experts_per_thread], const float selection
 
             if (k < n_expert_used) {
                 output_weights[i]   = weight;
+                selected_experts[i] = selected;
                 ids[ids_offset + k] = selected;
             }
         }
@@ -235,14 +243,17 @@ void main() {
     float wt_sum = 0.f;
 
     float output_weights[experts_per_thread];
+    // the k-th selected expert, held where its weight is
+    uint selected_experts[experts_per_thread];
 
     [[unroll]]
     for (int i = 0; i < experts_per_thread; i++) {
         output_weights[i] = 0.f;
+        selected_experts[i] = 0;
     }
 
     if (argsort_select != 0) {
-        select_argsort(probs, selection_probs, lane, ids_offset, output_weights);
+        select_argsort(probs, selection_probs, lane, ids_offset, output_weights, selected_experts);
     } else {
         // at this point, each thread holds a portion of softmax,
         // we do the argmax reduce over n_expert_used, each time marking
@@ -277,6 +288,7 @@ void main() {
 
             if ((k & (WARP_SIZE - 1)) == lane) {
                 output_weights[k / WARP_SIZE] = max_val;
+                selected_experts[k / WARP_SIZE] = max_expert;
             }
 
             if ((max_expert & (WARP_SIZE - 1)) == lane) {
@@ -326,7 +338,15 @@ void main() {
     for (uint i = 0; i < experts_per_thread; ++i) {
         uint idx = i * WARP_SIZE + lane;
         if (idx < n_expert_used) {
-            weights[weights_offset + idx] = output_scale * output_weights[i] + output_bias;
+            float weight = output_scale * output_weights[i] + output_bias;
+            // the MUL of an expert scale after the SCALE, and the GET_ROWS of another one
+            if (has_fold != 0) {
+                weight *= fold_scale[selected_experts[i]];
+            }
+            weights[weights_offset + idx] = weight;
+            if (has_gather != 0) {
+                gathered[weights_offset + idx] = gather_scale[selected_experts[i]];
+            }
         }
     }
 }

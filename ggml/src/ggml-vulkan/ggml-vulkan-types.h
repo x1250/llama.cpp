@@ -552,6 +552,10 @@ static constexpr std::initializer_list<ggml_op> topk_moe_sigmoid_norm_eps_bias{ 
                                                                                 GGML_OP_RESHAPE,  GGML_OP_SUM_ROWS, GGML_OP_SCALE,
                                                                                 GGML_OP_DIV,      GGML_OP_RESHAPE };
 
+// an expert scale of build_moe_ffn after a topk_moe pattern: an [n_expert] vector reshaped, repeated over the tokens
+// and gathered by the selected experts; multiplied into the weights by a MUL, or gathered for an expert product
+static constexpr std::initializer_list<ggml_op> topk_moe_expert_scale{ GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_GET_ROWS };
+
 static constexpr std::initializer_list<ggml_op> topk_moe_sqrt_softplus_norm_bias{ GGML_OP_UNARY,    GGML_OP_SQRT,
                                                                                   GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                                   GGML_OP_ARGSORT,  GGML_OP_VIEW,
@@ -1396,6 +1400,10 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+    // the expert scales a topk_moe fusion computes too, as the offset of their GET_ROWS from its first node (0: none):
+    // one multiplied into the weights, one written gathered
+    int fused_topk_moe_fold {};
+    int fused_topk_moe_gather {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
