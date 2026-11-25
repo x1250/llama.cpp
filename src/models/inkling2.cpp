@@ -215,8 +215,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
-    ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
-    x = ggml_concat(ctx0, past, x, 0);
+    // the input on the convolution's shape, read by the columns and by the residual
+    ggml_tensor * rows = ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs);
+
+    ggml_tensor * x = ggml_concat(ctx0, past, ggml_transpose(ctx0, rows), 0);
 
     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
 
@@ -245,8 +247,14 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     }
 
     // the residual and the scale on the convolution's shape, right after it: a backend can apply both as it writes it
-    out = ggml_add(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs), out);
+    out = ggml_add(ctx0, rows, out);
     out = ggml_scale(ctx0, out, 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+
+    // the convolution right after the copy of its state: a backend can compute both from the history and the input in
+    // one pass; the taps of a dynamic one read the columns, and its nodes keep the order of their uses
+    if (!dynamic) {
+        ggml_build_forward_expand(gf, out);
+    }
 
     return ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
 }
