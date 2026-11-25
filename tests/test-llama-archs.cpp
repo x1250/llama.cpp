@@ -162,6 +162,10 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
             tmp16[i] = ggml_fp32_to_fp16(tmp[i]);
         }
         ggml_backend_tensor_set(tensor, tmp16.data(), 0, ggml_nbytes(tensor));
+    } else if (tensor->type == GGML_TYPE_BF16) {
+        std::vector<ggml_bf16_t> tmp16(tmp.size());
+        ggml_fp32_to_bf16_row(tmp.data(), tmp16.data(), tmp.size());
+        ggml_backend_tensor_set(tensor, tmp16.data(), 0, ggml_nbytes(tensor));
     } else {
         GGML_ABORT("fatal error");
     }
@@ -855,6 +859,17 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         gguf_add_tensor(ms.gguf_ctx, &t);
         ggml_format_name(&t, "convnext.%" PRIu32 ".dw.weight", il);
         gguf_add_tensor(ms.gguf_ctx, &t);
+
+        // the loop controller matrices of inkling2_loop are BF16, as in the checkpoint: the type its fused controllers take
+        if (arch == LLM_ARCH_INKLING2_LOOP) {
+            t.type = GGML_TYPE_BF16;
+            for (const char * ctrl : {"q", "k", "v", "ffn"}) {
+                for (const char * proj : {"down", "gain", "forget"}) {
+                    ggml_format_name(&t, "blk.%" PRIu32 ".loop_%s_ctrl_%s.weight", il, ctrl, proj);
+                    gguf_add_tensor(ms.gguf_ctx, &t);
+                }
+            }
+        }
     }
     return ret;
 }

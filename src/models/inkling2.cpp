@@ -251,16 +251,56 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     return ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
 }
 
-// mix a cross-pass message into a looped layer input: (1 - tanh(forget))*cur + tanh(gain)*message, forget and gain
-// projected from cur and message
-ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
-    ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
-    gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
+// mix the cross-pass messages of controllers ctrl0 to ctrl0 + n - 1 into looped layer inputs: (1 - tanh(forget))*cur +
+// tanh(gain)*message, forget and gain projected from cur and message. cur [n_embd, n_tokens, 1 or n] holds the n inputs
+// or one input for all, messages [n_embd, n_tokens, LOOP_CTRL_COUNT]; out receives the n mixed inputs [n_embd, n_tokens]
+void llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * messages, const loop_layer & loop, int ctrl0, int n,
+        ggml_tensor ** out) {
+    const float eps = 1e-6f;
 
-    ggml_tensor * gain   = build_lora_mm(loop.ctrl_gain[ctrl],   gate);
-    ggml_tensor * forget = build_lora_mm(loop.ctrl_forget[ctrl], gate);
+    ggml_tensor * down[LOOP_CTRL_COUNT];
+    ggml_tensor * gain[LOOP_CTRL_COUNT];
+    ggml_tensor * forget[LOOP_CTRL_COUNT];
 
-    return ggml_tanh_blend(ctx0, cur, message, forget, gain);
+    // a batch of up to 32 tokens takes the fused ops, one pass for the down products and one for the rest; they read
+    // every matrix once per token, which a prompt batch cannot afford. They take BF16 matrices as they are, without
+    // what build_lora_mm adds: an adapter, a Hadamard fold
+    bool fused = n_tokens <= 32;
+    for (int c = 0; c < n; ++c) {
+        down[c]   = loop.ctrl_down[ctrl0 + c];
+        gain[c]   = loop.ctrl_gain[ctrl0 + c];
+        forget[c] = loop.ctrl_forget[ctrl0 + c];
+        for (ggml_tensor * w : {down[c], gain[c], forget[c]}) {
+            fused = fused && w->type == GGML_TYPE_BF16 && !(hdmd && hdmd->rot.count(w));
+            for (const auto & lora : *loras) {
+                fused = fused && lora.first->get_weight(w) == nullptr;
+            }
+        }
+    }
+
+    if (fused) {
+        ggml_tensor * msg = ggml_view_3d(ctx0, messages, n_embd, n_tokens, n, messages->nb[1], messages->nb[2], ctrl0*messages->nb[2]);
+
+        ggml_tensor * gate  = ggml_rms_norm_concat_mul_mat(ctx0, cur, msg, down, n, eps);
+        ggml_tensor * mixed = ggml_tanh_blend_mul_mat(ctx0, cur, msg, gate, forget, gain, n);
+        for (int c = 0; c < n; ++c) {
+            out[c] = ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[1], c*mixed->nb[2]);
+        }
+        return;
+    }
+
+    for (int c = 0; c < n; ++c) {
+        ggml_tensor * inp = n == 1 ? cur : ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], (cur->ne[2] == 1 ? 0 : c)*cur->nb[2]);
+        ggml_tensor * msg = ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[1], (ctrl0 + c)*messages->nb[2]);
+
+        ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, inp, eps), ggml_rms_norm(ctx0, msg, eps), 0);
+        gate = build_lora_mm(down[c], gate);
+
+        ggml_tensor * g = build_lora_mm(gain[c],   gate);
+        ggml_tensor * f = build_lora_mm(forget[c], gate);
+
+        out[c] = ggml_tanh_blend(ctx0, inp, msg, f, g);
+    }
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_inputs() {
@@ -298,30 +338,22 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     const int64_t n_embd_head  = hparams.n_embd_head_k(il);
     const int64_t n_embd_k_gqa = n_embd_head*n_head_kv;
 
-    // the message of controller ctrl, [n_embd, n_tokens]
-    auto message = [&](int ctrl) {
-        return ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[1], ctrl*messages->nb[2]);
-    };
-
     ggml_tensor * state   = recr->mctx->get_r_l(il);
     ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
     history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
 
     ggml_tensor * inpSA = cur;
 
-    // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
-    ggml_tensor * inputs[3] = {cur, cur, cur};
-    if (layer.attn_res_query) {
-        ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
-        for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[1], (is_swa ? 0 : j)*mixed->nb[2]);
-        }
-    }
+    // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V, [n_embd, n_tokens, 1 or 3]
+    ggml_tensor * mixed = layer.attn_res_query ? mix(blocks, cur, layer.attn_res_query) : cur;
 
+    ggml_tensor * inputs[3] = {cur, cur, cur};
     if (messages) {
         // the messages make the Q, K and V inputs of a SWA layer differ
+        control(mixed, messages, *loop, LOOP_CTRL_Q, 3, inputs);
+    } else if (layer.attn_res_query) {
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = control(inputs[j], message(LOOP_CTRL_Q + j), *loop, LOOP_CTRL_Q + j);
+            inputs[j] = ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[1], (is_swa ? 0 : j)*mixed->nb[2]);
         }
     }
 
@@ -403,7 +435,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     // MoE
     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query), n_embd, n_tokens);
     if (messages) {
-        cur = control(cur, message(LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN);
+        control(cur, messages, *loop, LOOP_CTRL_FFN, 1, &cur);
     }
     cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
 
