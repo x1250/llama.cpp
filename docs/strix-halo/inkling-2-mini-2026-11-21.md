@@ -968,9 +968,31 @@ hilos (sección 8.3) sigue abierto y vale 0.7 ms por token.
   propósito y su efecto se juzga en las respuestas.
 - **Verificado:** con la fuerza 0 los logits son los de master (KLD 0, 100 % de top igual); el contraste en logits es
   exacto contra `last + s·(last − una pasada)` en el modelo sintético (`test-llama-archs --loop-contrast`).
-- **Costo:** unos 11 GiB más de memoria cargada (37.9 contra 49.2 GiB de MemAvailable; la estimación era 5, y la
-  diferencia no está explicada). Una petición decodifica a 28.3 t/s con LoopCD; sin él el server daba 32-33 t/s
-  (sección 0), sin un A/B de los dos en una misma cadena.
+- **Costo, medido el 2026-11-25** en la forma de producción, con la base primero y al final de la cadena
+  (`lcdhead.sh` en la carpeta de evidencia):
+  - Memoria: 4.30 GiB más (58.45 contra 54.15 GiB del servidor recién cargado, `srv_mem.py`). Es la cuenta de
+    `config.ini`: los 4.25 GiB de la capa global 23 a 1048576 x 2 en q8_0, más poco de las 5 capas de ventana. Los
+    "11 GiB" que este punto decía antes comparaban MemAvailable de dos días y estados distintos de la máquina.
+  - Decode: 5.6 ms por token, un 18 %. Una petición da 36.9-37.3 t/s sin LoopCD y 30.1-30.9 t/s con él; dos a la vez
+    dan 53.5 y 44.9-45.2 t/s en total.
+- **El head en un solo producto** (`c73afe5ca`): las dos predicciones pasan juntas por un producto de 2 columnas, y
+  los pesos del head (2304 x 201024, 469 MiB en Q8_0) se leen una vez por token en vez de dos. El contraste sigue en
+  los logits porque el softcap de 30 después del head no es lineal.
+  - Una petición sube a 32.3-33.3 t/s (+7 %) y dos a la vez a 47.5 t/s (+5 %); instalado (`lcdhead-install.sh`), 33.3-33.8 t/s. Del costo de LoopCD quedan unos 3.3 ms
+    por token: la copia de las 6 capas de la coda.
+  - En Vulkan el producto de 2 columnas va por MMVQ, que cuantiza la entrada a Q8_1 (`ggml_vk_should_use_mmvq`:
+    "MMVQ is generally good for batches"). Con una columna y pesos Q8_0 en RDNA no la cuantiza. Es la precisión que
+    el head ya tenía con dos slots en un ubatch y en los modos de 3 tokens. Contra la base, la secuencia de 2k-163k da
+    un KL medio de 1-2e-5 por zona, dos órdenes bajo las referencias de redondeo.
+  - Compuertas: los modos p y d sin contraste son idénticos a la base, y los modos pL y dL con contraste dan KLD 0.
+    En el modo d, `llama-perplexity` da 99.976 % de top igual también para la base contra sí misma (dos veces,
+    `lcdhead-d.sh`). Es un empate en las log-probs cuantizadas que guarda el archivo base, no una diferencia del
+    build; el FAIL de `lcdhead.sh` en ese modo es su criterio de 100 %. También pasan `repeat_probe` (5 corridas
+    idénticas), la secuencia 2k-163k contra sí misma y `server_check`, `inkling_repeat` y `vision_check`.
+  - No adoptado, sin medir: juntar también las dos pasadas por la coda. Las proyecciones de la atención se leerían
+    una vez, pero los expertos solo se comparten cuando las dos pasadas eligen los mismos, y la atención sigue
+    separada porque cada pasada tiene su caché. Lo estimo en 1 ms por token como mucho, y exige que cada capa sirva a
+    dos cachés a la vez.
 
 ## 12. DFlash2 de incoai, no adoptado (2026-11-25)
 
