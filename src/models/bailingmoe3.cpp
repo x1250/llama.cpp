@@ -186,6 +186,21 @@ ggml_tensor * llama_model_bailingmoe3::graph::build_causal_conv1d(
     return ggml_reshape_4d(ctx0, out, head_dim, n_head, n_seq_tokens, n_seqs);
 }
 
+// The MLA projections write each head's rotary channels pair-interleaved, [x0, y0, x1, y1, ...] (the reference's
+// rope_interleave). NORM rope rotates those adjacent pairs as they are; M-RoPE, the rope of the VL files, rotates the
+// pairs (i, i + n_rot/2), so for it the channels are reordered to [x0, x1, ..., y0, y1, ...]. q and k get the same order,
+// so at text positions their product is the reference's.
+static ggml_tensor * bailingmoe3_rope_input(ggml_context * ctx, const llama_hparams & hparams, ggml_tensor * x) {
+    if (!hparams.use_mrope()) {
+        return x;
+    }
+    const int64_t n_rot = x->ne[0];
+    ggml_tensor * pairs = ggml_view_4d(ctx, x, 2, n_rot / 2, x->ne[1], x->ne[2],
+            2 * ggml_element_size(x), x->nb[1], x->nb[2], 0);
+    pairs = ggml_cont(ctx, ggml_permute(ctx, pairs, 1, 0, 2, 3));
+    return ggml_reshape_3d(ctx, pairs, n_rot, x->ne[1], x->ne[2]);
+}
+
 llama_model_bailingmoe3::graph::graph(const llm_graph_params & params) :
     llm_build_delta_net_base(params) {
     ggml_tensor * inpL = build_inp_embd(model.tok_embd);
@@ -296,8 +311,8 @@ llama_model_bailingmoe3::graph::graph(const llm_graph_params & params) :
                     ggml_row_size(kv_all->type, kv_lora_rank + qk_rope_head_dim),
                     ggml_row_size(kv_all->type, kv_lora_rank));
 
-            q_pe = build_rope(q_pe, inp_pos, il);
-            k_pe = build_rope(k_pe, inp_pos, il);
+            q_pe = build_rope(bailingmoe3_rope_input(ctx0, hparams, q_pe), inp_pos, il);
+            k_pe = build_rope(bailingmoe3_rope_input(ctx0, hparams, k_pe), inp_pos, il);
             kv = build_norm(kv, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
 
             q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
@@ -449,8 +464,8 @@ llama_model_bailingmoe3::graph_mtp::graph_mtp(const llm_graph_params & params) :
             ggml_row_size(kv_all->type, kv_lora_rank + qk_rope_head_dim),
             ggml_row_size(kv_all->type, kv_lora_rank));
 
-    q_pe = build_rope(q_pe, inp_pos, il);
-    k_pe = build_rope(k_pe, inp_pos, il);
+    q_pe = build_rope(bailingmoe3_rope_input(ctx0, hparams, q_pe), inp_pos, il);
+    k_pe = build_rope(bailingmoe3_rope_input(ctx0, hparams, k_pe), inp_pos, il);
     kv = build_norm(kv, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
 
     q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
