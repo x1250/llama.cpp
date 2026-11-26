@@ -275,6 +275,7 @@ enum mtmd_pos_type {
     MTMD_POS_TYPE_HUNYUANVL, // HunyuanVL mrope + BOI/EOI/newline layout with XD-RoPE dim-3
     MTMD_POS_TYPE_SENSENOVA_U1, // U1 uses zero-based H/W and one temporal position per image
     MTMD_POS_TYPE_CANVAS,    // MiniCPM-V 4.7: overview + slices in one chunk, sharing one 2D canvas (see mtmd_image_tokens::canvas_tile_grid)
+    MTMD_POS_TYPE_LING3VL,   // Ling 3 VL: one temporal position per image, H/W centered on it
     MTMD_POS_TYPE_COUNT,     // for validation
 };
 
@@ -2127,6 +2128,10 @@ struct mtmd_tokenizer {
                     image_tokens->pos       = MTMD_POS_TYPE_HUNYUANVL;
                     image_tokens->image_idx = n_images_added;
                     GGML_ASSERT(n_tokens == (size_t)image_tokens->n_tokens());
+                }
+                // Ling 3 VL (the reference's get_rope_index) puts the image's center on its temporal position
+                else if (ctx->proj_type_v() == PROJECTOR_TYPE_LING3VL) {
+                    image_tokens->pos = MTMD_POS_TYPE_LING3VL;
                 }
 
                 mtmd_image_f32_batch batch_f32;
@@ -5093,6 +5098,15 @@ mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * ima
                 pos.y = i / image_tokens->nx;
                 pos.z = 0;
             } break;
+        case MTMD_POS_TYPE_LING3VL:
+            {
+                // x and y are negative for an image near the start of the context: the fields carry them in
+                // two's complement to the llama_pos of the batch
+                pos.t = pos_0;
+                pos.x = pos_0 + (llama_pos) (i % image_tokens->nx) - (llama_pos) (image_tokens->nx - 1) / 2;
+                pos.y = pos_0 + (llama_pos) (i / image_tokens->nx) - (llama_pos) (image_tokens->ny - 1) / 2;
+                pos.z = 0;
+            } break;
         case MTMD_POS_TYPE_HUNYUANVL:
             {
                 // HunyuanVL layout: [BOI] [row0 tokens + newline] ... [row(ny-1) tokens + newline] [EOI]
@@ -5146,6 +5160,7 @@ llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
         case MTMD_POS_TYPE_NORMAL:
             return image_tokens->n_tokens();
         case MTMD_POS_TYPE_SENSENOVA_U1:
+        case MTMD_POS_TYPE_LING3VL:
             return 1;
         case MTMD_POS_TYPE_HUNYUANVL:
             // HunyuanVL: the sequential (dim-0) position advances by the full token count
