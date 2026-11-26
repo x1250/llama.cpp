@@ -55,7 +55,6 @@ cada petición (sección 9.6 de ese documento) y, desde el 2026-11-26, los de Li
 | Desde `2c92c5e27`, con un caché de varios streams (`-np 2` sin caché unificado), corren en todo modelo las fusiones de upstream `ROPE_VIEW_SET_ROWS`, `RMS_NORM_MUL_ROPE_VIEW_SET_ROWS` y `RMS_NORM_VIEW_SET_ROWS`, que antes la comprobación de solapamiento descartaba. Las de RMS_NORM se verificaron bit a bit en las formas de Inkling; las de RoPE no se compararon con el camino sin fundir, y su epílogo f16 puede tener los empates de 1 ulp que tuvo el de RMS_NORM (37 de 524288 valores, corregido en `a3761d654`). Inkling no usa RoPE; ningún otro modelo de producción corre en llama-server | El epílogo f16 de `rope` + SET_ROWS redondea la fila en registros, sin el paso por memoria compartida en f32 | Medir el camino fundido contra el separado en un modelo con RoPE y dos slots antes de servirlo así |
 | En CPU, los controladores del loop de inkling2 fundidos (`RMS_NORM_CONCAT_MUL_MAT`, `TANH_BLEND_MUL_MAT`) con lotes de 9 a 32 tokens quedan de 3 a 30 % bajo el camino sin fundir según la corrida (96 controladores: 34.5-38.4 ms contra 26.5-37.3 a 32 tokens; más rápidos de 1 a 8 tokens), 2026-11-25, `fusions/ctrl/REPORT.md`. Solo con inferencia en CPU | El mul_mat sin fundir de lotes usa el GEMM de llamafile; el op fundido hace un producto BF16 por token | Si se sirve en CPU: un GEMM por bloques de filas y tokens en el kernel fundido, o el grafo sin fundir en CPU |
 | El RoPE de ggml deja una deriva sistemática de fase en los pares de alta frecuencia, que crece con la distancia entre q y k. Con base 6e6 en Vulkan, en los pares 2 y 3 es de -0.0021 y -0.0014 rad a 32k y de -0.017 y -0.011 a 262k; dar la frecuencia con una división la baja a -0.0002 y -0.0005 rad a 32k. En Ling-3.2-air ese cambio movió la perplexity de wikitext a 32k de 14.85 a 14.75 (`rope_angle`, 2026-11-26, `ling-3.2-air-2026-11-26.md`, sección 6). Afecta a todo modelo con RoPE; en producción ya no ocurre: ling32air usa la división desde `46ad2807f` e inkling2mini no usa RoPE. Sí ocurre en el respaldo `ENGINE=llama` de qwen38flash | La frecuencia del slot i se arma como `theta_scale^i`: con i productos en CPU y con un `pow` en Vulkan (`rope_funcs.glsl`). El error es fijo para cada slot, por eso es una deriva y no ruido. Es código de upstream | Sin diseñar. Candidato: una tabla de frecuencias por slot, calculada en doble precisión en el host, como los factores de `46ad2807f`. Cambia el redondeo de todo modelo con RoPE: pide la compuerta de calidad de cada modelo de producción |
-| Un video a Ling 3 VL no lleva las posiciones de la referencia. Sin medir, y no visto en el uso | mtmd le da a `LING3VL` la plantilla de video por defecto. La referencia (`get_rope_index` con `video_grid_thw`) pone los cuadros de un video en un solo segmento `video_start`, a `t = s + 2k` | Sin diseñar: la plantilla de video de Ling y sus posiciones, verificadas con `pos_check` |
 
 - El respaldo con `ENGINE=llama` corre ahora el qwen4exp de upstream, no el del fork: sin la FA dispersa ni el PLE lazy
   del fork, ni sus compuertas de historia y de calidad. La prueba de humo a 32k sin MTP pasó razonamiento, tool call y
@@ -82,6 +81,12 @@ Disparado por la prueba del build instalado (2026-11-19):
 | Síntoma | Arreglo |
 |---|---|
 | Con DFlash2, toda petición con imagen falla con HTTP 500 (`inconsistent sequence positions` en el contexto del draft) | El draft con `dflash.rope.dimension_sections` (`upstream-sync-2026-11-19.md`, sección 5) |
+
+Pedido por el Director (2026-11-26, Ling-3.2-air, `ling-3.2-air-2026-11-26.md`, sección 7):
+
+| Síntoma | Arreglo |
+|---|---|
+| Un video a Ling 3 VL llegaba con la plantilla genérica de mtmd (prefijo "Video:", marcas cada 5 s, otro muestreo): el segundo en que aparece un objeto, 2 de 8 como opción múltiple | `c2c45429e`: la plantilla de su procesador, 8 de 8 |
 
 Disparado por la prueba del Director con inkling2mini (2026-11-22):
 

@@ -7,7 +7,8 @@ first agent sessions in pi the model degenerated at long context with both GGUFs
 defects: the rope of the MLA layers (fixed in the fork by `3e6dd9641`, section 2) and the Ling 3 parser keeping the
 newline before a tool call in the content, which grew by one newline per turn (fixed by `d3c2177fd`, section 5). Images
 reached the model on other rope bands and at other positions than the reference's (fixed by `46ad2807f` and
-`d2f46fb65`, section 6). Evidence: `~/ProjectHub/llama.cpp-evidence/ling32air/`.
+`d2f46fb65`, section 6), and videos in a generic layout (fixed by `c2c45429e`, section 7). Evidence:
+`~/ProjectHub/llama.cpp-evidence/ling32air/`.
 
 ## 1. Symptom
 
@@ -137,10 +138,57 @@ is `imgrope.sh` (build, `test-backend-ops`, the perplexity, install, reload) and
 repeated and without fusions); outputs in `runs/` (`img-*.log`, `imgturns-*.log`, `poscheck-*.log`,
 `rope-angle.log`, `ppl-imgrope*.log`, `ppl-C-*.log`).
 
-Video is not covered: Ling 3 VL takes mtmd's default video template, and the reference spaces the frames of a video
-by 2 within one `video_start` segment (`latent-defects.md`).
+The references disagree on the image positions. The HF modeling file that ships with the weights and SGLang center
+the image; inclusionAI's vLLM fork (`inclusionAI/vllm-ling-v3`, `get_mrope_input_positions`, written in September,
+images only) uses the Qwen layout, the one mtmd had. An A/B decided it (`posab.sh`, the same 148 questions, the bands
+fixed in both):
 
-## 7. Memory
+| Build | Exact | Mean gold probability | 4x8 grid |
+|---|---|---|---|
+| Before both fixes | 110/148 | 0.640 | 30/64 |
+| Bands fixed, Qwen positions (vLLM's) | 122/148 | 0.708 | 41/64 |
+| Bands fixed, centered positions (HF, SGLang; `d2f46fb65`) | **127/148** | **0.719** | **46/64** |
+
+The centered positions have the higher gold probability in all four tasks; most of the gain is the bands'.
+
+## 7. Video (`c2c45429e`)
+
+Ling 3 VL took mtmd's default video template: a "Video:" prefix, `[XmY.YYs]` stamps every 5 s and frames at the
+generic rate. The model's processor (`processing_bailingmm2.py`, with `use_interleaved_frame_timestamp: true` in
+`preprocessor_config.json`, and `bailingmm_utils_video.py` v1, its default) lays a video out as
+`<|video_start|>` + `<X.X seconds><|vision_start|>` frame pair `<|vision_end|>` per pair + `<|video_end|>`, with:
+
+- 2 fps, at least 1 frame and at most 32, an even number (`v1_smart_nframes`), the frames of
+  `np.linspace(0, n - 1, k, dtype=int)` (truncated; Qwen3-VL rounds);
+- 4718592 pixels shared by the frames, counted in pairs, at least 43008 per frame (`v1_fetch_video`, its
+  `smart_resize`): a 10 s 1080p video gives 20 frames of 896x512, a 20-minute one 32 frames of 704x384;
+- each pair stamped at the mean of `i / fps` of its two frames, the fps of the sampled frames over the source (not the
+  source frames' own times); an odd last frame is padded with a copy and stamped as itself.
+
+`MTMD_VIDEO_TEMPLATE_LING3VL` gives that layout (`mtmd_video_config_init`, `mtmd_image_preprocessor_ling3vl`, the video
+helper's indices and stamps), with `<|video_start|>`/`<|video_end|>` as Ling's video markers. Each pair is placed as an
+image (one temporal position, H/W centered, `d2f46fb65`): with interleaved stamps every pair is its own
+`<|vision_start|>` segment, as SGLang's `bailing_3drope_get_input_positions_tensor` treats them. The HF modeling file
+reads the flag from `text_config`, where `config.json` does not set it, and would then give the frames text positions;
+SGLang's comment says the per-frame segments are the intended layout.
+
+| Check | Before | After |
+|---|---|---|
+| `test-mtmd-impl` `test_video_ling3vl`: frame counts, sizes and sequences of five videos from the reference's own functions (`img/ref_video.py`) | | 28 assertions passed |
+| The prompt mtmd builds for two encoded videos against the processor's, and its positions (`img/vid_seq_check.py`) | | identical, 0 positions differ |
+| 40 synthetic videos, greedy, thinking off (`img/vid_ab.py`): the second at which a square appears, answer within 1 s | 6/8, probability 0.18 | **8/8, 0.99** |
+| the same as a multiple choice (the options' probabilities after "The black square appears at second") | 2/8, share 0.30 | **8/8, 0.87** |
+| the direction of a moving dot, answered in one word | 0/16 (prose) | 8/16 |
+| the same as a multiple choice | 16/16, 0.97 | 15/16, 0.87 |
+| the order of three colors (answer and multiple choice) | 16/16 | 16/16 |
+| A two-turn conversation on one video | | right, the second turn reads 25 tokens over 2330 cached |
+
+The direction's multiple choice is not a measure for "up": the four options take 2-23 % of the next token in both
+builds (the model says "upward"), and the one item it misses answers "towards the top" in prose. A 6 s video takes
+~1400 tokens with the processor's sampling (12 frames) and took ~2950 with the generic one. The chain is `vidchain.sh`
+(build, unit tests, the image positions byte-identical to the build before, reload).
+
+## 8. Memory
 
 `srv_mem.py` with production loaded (262144 x 2, KV f16, mmproj on the GPU): 77.9 GiB at load (72.3 of weights, 0.8 of
 mmproj, 4.9 of KV and buffers), 78.0 after the replays. The checkpoints (8 per slot, ~73 MiB each) and the prompt cache
