@@ -5,8 +5,9 @@ layers 5, 11, ..., 41), 512 experts with 8 active, an MTP head (blk.42, unused: 
 x 2 slots with the manufacturer's sampling (temperature 1.0, top_p 0.95, top_k 20, thinking on). In the Director's
 first agent sessions in pi the model degenerated at long context with both GGUFs it ran on. There were two llama.cpp
 defects: the rope of the MLA layers (fixed in the fork by `3e6dd9641`, section 2) and the Ling 3 parser keeping the
-newline before a tool call in the content, which grew by one newline per turn (fixed by `d3c2177fd`, section 5).
-Evidence: `~/ProjectHub/llama.cpp-evidence/ling32air/`.
+newline before a tool call in the content, which grew by one newline per turn (fixed by `d3c2177fd`, section 5). Images
+reached the model on other rope bands and at other positions than the reference's (fixed by `46ad2807f` and
+`d2f46fb65`, section 6). Evidence: `~/ProjectHub/llama.cpp-evidence/ling32air/`.
 
 ## 1. Symptom
 
@@ -79,15 +80,65 @@ the same (no report or PR on 2026-11-26).
 The Director's existing pi sessions keep the grown runs (and the loops) in their history: a model reading them copies
 them again, so they are not reusable; new sessions start clean.
 
-## 6. What still differs from the reference: images
+## 6. Images (`46ad2807f`, `d2f46fb65`)
 
-At image positions the sections differ besides the pairs. The reference's `apply_video_rope` puts T on the 8 lowest
-frequencies (pairs 24-31) and alternates H and W over pairs 0-23; ggml's M-RoPE with `[8, 12, 12]` puts T on pairs 0-7,
-H on 8-19 and W on 20-31. An image's 2D positions therefore reach the model on other frequency bands than it was
-trained with. This occurs in our use whenever an image is sent to ling32air (the mmproj is loaded). The fix that keeps
-ggml's kernels: reorder the channels so each M-RoPE section holds the reference's pairs of that section, and give the
-rope a frequency-factor tensor that sets each reordered pair back to its reference frequency
-(`ggml_rope_multi` takes `freq_factors`). Not done yet: it awaits the Director's decision.
+After the rope fix two differences from the reference remained at image positions. Both occur whenever an image is
+sent to ling32air (the mmproj is loaded), and the Director sends images.
+
+- **The bands** (`46ad2807f`, `src/models/bailingmoe3.cpp`). The reference's `apply_video_rope` gives the 32 rotary
+  pairs, from the highest frequency, to H and W alternating pair by pair over the first 24 (H on the even ones) and to
+  T on the last 8. ggml's M-RoPE with `[8, 12, 12]` gives contiguous slots to T (0-7), H (8-19) and W (20-31). The q
+  and k channels now go to the slot of their section (`bailingmoe3_rope_input`: three strided views and two
+  concats), and the MLA layers get a `rope_freqs` tensor made at load (`load_tensors`) that gives each slot the
+  frequency of its pair. `get_rope_params` sets the rope base to 1 for those layers, so the frequency comes from one
+  division and not from `theta_scale^i` (see below); a `--rope-freq-base` override does not apply to them, and YaRN is
+  off (its ramp follows the slot order; the reference has no rope scaling). The sections are checked at load.
+- **The positions** (`d2f46fb65`, `tools/mtmd/mtmd.cpp`). The reference's `get_rope_index` puts an image at
+  `t = s`, `h = s + row - (ny-1)//2`, `w = s + col - (nx-1)//2`, and the text after it goes on at `s + 1`
+  ("body-diagonal symmetry", as SGLang's `BailingMRotaryEmbedding`). mtmd gave `LING3VL` the Qwen layout
+  (`h = s + row`, `w = s + col`, the text after at `s + max(nx, ny)`), so each image also moved the positions of all
+  the text after it. A position type of its own (`MTMD_POS_TYPE_LING3VL`, like SenseNova U1's) gives the reference's.
+  Near the start of the context x and y are negative; `mtmd_decoder_pos` carries them in two's complement to the
+  batch's `llama_pos`.
+
+The frequency from one division. A first version kept the rope base and gave the factors `theta_scale_f32^i / freq`,
+so that they cancelled the f32 rounding of `theta_scale`: in numpy (which rounds a power correctly) its angles matched
+the plain rope's. On the kernels they did not: the CPU builds `theta_scale^i` from i products and Vulkan from a
+`pow`, a systematic phase drift that grows with the distance between q and k, and that version had the high
+frequencies on the high slots, where it is largest. `rope_angle` (the angle of every slot of `ggml_rope_multi` at text
+positions, against the exact angle of its pair; mean signed error over the top 1024 positions, pairs 2-3, Vulkan):
+
+| Layout | Drift at 32k (rad) | Drift at 262k (rad) | Max error at 262k (rad) | wikitext PPL, 32k |
+|---|---|---|---|---|
+| Plain rope in its own slots (`3e6dd9641`) | -0.0021 / -0.0014 | -0.017 / -0.011 | 0.024 | 14.85 |
+| Factors over `theta_scale^i` (first version) | -0.0044 / -0.0039 (up to -0.0084 on pair 1) | -0.036 / -0.031 (-0.068) | 0.086 | 14.89 |
+| Rope base 1, factor `1/freq` (`46ad2807f`) | -0.0002 / -0.0005 | -0.0015 / -0.0037 | 0.024 | **14.75** |
+
+Pairs 0 and 1 drift the same in the plain rope and in the adopted layout (-0.0013 at 32k): the frequency there is
+exact in both and the drift is Vulkan's `sin`/`cos` of large arguments. The perplexity is deterministic (14.7478 twice, and the same with
+`GGML_VK_DISABLE_FUSION=1`), and its order follows the drift. That the plain rope drifts more than one division is
+upstream code for every RoPE model, recorded in `latent-defects.md`.
+
+| Check | Before | After |
+|---|---|---|
+| q.k at image positions against `apply_video_rope` + `apply_rotary_pos_emb_interleave` (numpy, double, positions near 200k, `img/mrope_check.py`) | max diff 14 | 1.4e-14 |
+| The positions mtmd gives a prompt with three non-square images (20x40, 28x14, 3x3 merged tokens) against a port of `get_rope_index` (`img/pos_check`, the projector loaded on the CPU, the text model with `no_alloc`) | 1224 of 1234 differ | 0 differ |
+| `test-backend-ops` ROPE and CONCAT, Vulkan against the CPU | | 510/510, 236/236 |
+| 148 spatial questions on synthetic non-square images, greedy, thinking off (`img/img_ab.py`): exact answers, mean probability of the gold answer (teacher-forced) | 110/148, 0.640 | **127/148, 0.719** |
+| of those, the cell of a red circle in a 4x8 / 8x4 grid | 30/64, 0.465 | 46/64, 0.608 |
+| the 3x4 grids | 33/36, 0.896 | 33/36, 0.895 |
+| five digits in order along a non-square image | 23/24, 0.957 | 24/24, 0.997 |
+| left/right, above/below (the probability splits between "Left" and "left", so only the count measures position) | 24/24 | 24/24 |
+| A three-turn conversation, two images, one slot (`img/img_turns.py`) | right, cache reused | right, cache reused, no position error |
+| The 2048x2048 screenshot (`img_big.py`) | | 13.2 s, transcribed, health ok |
+
+The A/B ran against production (262144 x 2), the before on build `b2491-3e6dd9641`, the after on this one. The chain
+is `imgrope.sh` (build, `test-backend-ops`, the perplexity, install, reload) and `pplnoise.sh` (the perplexity
+repeated and without fusions); outputs in `runs/` (`img-*.log`, `imgturns-*.log`, `poscheck-*.log`,
+`rope-angle.log`, `ppl-imgrope*.log`, `ppl-C-*.log`).
+
+Video is not covered: Ling 3 VL takes mtmd's default video template, and the reference spaces the frames of a video
+by 2 within one `video_start` segment (`latent-defects.md`).
 
 ## 7. Memory
 
