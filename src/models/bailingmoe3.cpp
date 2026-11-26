@@ -2,6 +2,8 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <cmath>
+#include <map>
 
 void llama_model_bailingmoe3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      hparams.f_norm_rms_eps);
@@ -32,6 +34,14 @@ void llama_model_bailingmoe3::load_arch_hparams(llama_model_loader & ml) {
 
     GGML_ASSERT(hparams.kda_safe_gate);
     GGML_ASSERT(hparams.kda_gate_lower_bound < 0.0f);
+
+    // the reference alternates H and W pair by pair, so they have one section size, and its T, H and W cover the pairs
+    if (hparams.use_mrope() && (hparams.rope_sections[1] != hparams.rope_sections[2] || hparams.rope_sections[3] != 0 ||
+            hparams.rope_sections[0] + 2*hparams.rope_sections[1] != (int) hparams.n_rot() / 2)) {
+        throw std::runtime_error(format("bailingmoe3: unsupported rope sections [%d, %d, %d, %d] for n_rot %u",
+                hparams.rope_sections[0], hparams.rope_sections[1], hparams.rope_sections[2], hparams.rope_sections[3],
+                hparams.n_rot()));
+    }
 
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
         hparams.is_recr_impl[il] = hparams.n_head_kv(il) == 0;
@@ -153,6 +163,113 @@ void llama_model_bailingmoe3::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
+// The MLA projections write each head's rotary channels pair-interleaved, [x0, y0, x1, y1, ...] (the reference's
+// rope_interleave), pair j at frequency j. NORM rope, the rope of the text-only files, rotates those adjacent pairs as
+// they are. The VL files use M-RoPE, which rotates the pairs (i, i + n_rot/2) and gives the slots i, from the highest
+// frequency, to T, H and W in contiguous sections; the reference's apply_video_rope alternates H and W pair by pair
+// over the first 2*s_hw pairs (H on the even ones) and gives T the last s_t. So slot i holds the reference's pair
+// bailingmoe3_mrope_pair(i): bailingmoe3_rope_input moves the channels there, and the frequency factors of
+// load_tensors give each slot the frequency of its pair. Text positions are equal in T, H and W, so there only the
+// frequencies matter.
+static int64_t bailingmoe3_mrope_pair(const llama_hparams & hparams, int64_t slot) {
+    const int64_t s_t  = hparams.rope_sections[0];
+    const int64_t s_hw = hparams.rope_sections[1];
+    if (slot < s_t) {
+        return 2*s_hw + slot;
+    }
+    if (slot < s_t + s_hw) {
+        return 2*(slot - s_t);
+    }
+    return 2*(slot - s_t - s_hw) + 1;
+}
+
+// [n_rot, heads, tokens] pair-interleaved -> [n_rot, heads, tokens] with x of the pairs in slot order, then y
+static ggml_tensor * bailingmoe3_rope_input(ggml_context * ctx, const llama_hparams & hparams, ggml_tensor * x) {
+    if (!hparams.use_mrope()) {
+        return x;
+    }
+    const int64_t s_t  = hparams.rope_sections[0];
+    const int64_t s_hw = hparams.rope_sections[1];
+    const size_t  es   = ggml_element_size(x);
+
+    // the pairs of one section, every stride-th from first, as [pairs, (x, y), heads, tokens]
+    auto section = [&](int64_t n_pairs, int64_t first, int64_t stride) {
+        ggml_tensor * pairs = ggml_view_4d(ctx, x, 2, n_pairs, x->ne[1], x->ne[2],
+                2*stride*es, x->nb[1], x->nb[2], 2*first*es);
+        return ggml_permute(ctx, pairs, 1, 0, 2, 3);
+    };
+    ggml_tensor * slots = ggml_concat(ctx, section(s_t, 2*s_hw, 1), section(s_hw, 0, 2), 0);
+    slots = ggml_concat(ctx, slots, section(s_hw, 1, 2), 0);
+    return ggml_reshape_3d(ctx, slots, x->ne[0], x->ne[1], x->ne[2]);
+}
+
+bool llama_model_bailingmoe3::load_tensors(llama_model_loader & ml) {
+    if (!llama_model_base::load_tensors(ml)) {
+        return false;
+    }
+    if (!hparams.use_mrope()) {
+        return true;
+    }
+
+    // the frequency factors of the M-RoPE slots, the rope_freqs of every attention layer, one tensor per buffer type
+    const int64_t n_pairs = hparams.n_rot() / 2;
+    std::map<ggml_backend_buffer_type_t, std::pair<ggml_context_ptr, ggml_tensor *>> ctx_map;
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        auto & layer = layers[il];
+        if (layer.wkv_a_mqa == nullptr) {
+            continue;
+        }
+        auto & [ctx, freqs] = ctx_map[derived_buft(layer.wkv_a_mqa)];
+        if (!ctx) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ctx.reset(ggml_init(params));
+            if (!ctx) {
+                throw std::runtime_error("bailingmoe3: failed to create the context of the M-RoPE frequency factors");
+            }
+            freqs = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_pairs);
+            ggml_set_name(freqs, "rope_freqs.mrope");
+        }
+        layer.rope_freqs = freqs;
+    }
+
+    // a slot rotates at theta_scale^i / factor, and get_rope_params makes theta_scale 1: the factor is the inverse of
+    // the frequency of the slot's pair. A frequency built as theta_scale^i carries the rounding of i products (CPU) or
+    // of the pow (Vulkan), a phase drift that grows with the distance between q and k; here the high frequencies sit on
+    // high slots, where it is largest, and a frequency from one division drifts less than the plain rope's
+    const double freq_base = hparams.rope_freq_base_train;
+    std::vector<float> factors(n_pairs);
+    for (int64_t i = 0; i < n_pairs; ++i) {
+        factors[i] = pow(freq_base, 2.0*bailingmoe3_mrope_pair(hparams, i)/hparams.n_rot());
+    }
+
+    for (auto & [buft, entry] : ctx_map) {
+        ggml_tensor * freqs = entry.second;
+        alloc_derived(std::move(entry.first), buft);
+        if (!ml.no_alloc) {
+            ggml_backend_tensor_set(freqs, factors.data(), 0, ggml_nbytes(freqs));
+        }
+    }
+
+    return true;
+}
+
+llama_rope_params llama_model_bailingmoe3::get_rope_params(const llama_cparams & cparams, int il) const {
+    auto res = llama_model::get_rope_params(cparams, il);
+
+    // the M-RoPE factors of load_tensors carry each slot's whole frequency, from the trained base (a rope base override
+    // does not apply); YaRN's ramp would follow the slot order, not the frequency, and the reference has no rope scaling
+    if (hparams.use_mrope() && res.factors != nullptr) {
+        res.freq_base  = 1.0f;
+        res.ext_factor = 0.0f;
+    }
+
+    return res;
+}
+
 std::unique_ptr<llm_graph_context> llama_model_bailingmoe3::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(params);
@@ -184,21 +301,6 @@ ggml_tensor * llama_model_bailingmoe3::graph::build_causal_conv1d(
     ggml_tensor * out = ggml_ssm_conv(ctx0, conv_x, conv_weight);
     out = ggml_silu(ctx0, ggml_reshape_2d(ctx0, out, d_inner, n_tokens));
     return ggml_reshape_4d(ctx0, out, head_dim, n_head, n_seq_tokens, n_seqs);
-}
-
-// The MLA projections write each head's rotary channels pair-interleaved, [x0, y0, x1, y1, ...] (the reference's
-// rope_interleave). NORM rope rotates those adjacent pairs as they are; M-RoPE, the rope of the VL files, rotates the
-// pairs (i, i + n_rot/2), so for it the channels are reordered to [x0, x1, ..., y0, y1, ...]. q and k get the same order,
-// so at text positions their product is the reference's.
-static ggml_tensor * bailingmoe3_rope_input(ggml_context * ctx, const llama_hparams & hparams, ggml_tensor * x) {
-    if (!hparams.use_mrope()) {
-        return x;
-    }
-    const int64_t n_rot = x->ne[0];
-    ggml_tensor * pairs = ggml_view_4d(ctx, x, 2, n_rot / 2, x->ne[1], x->ne[2],
-            2 * ggml_element_size(x), x->nb[1], x->nb[2], 0);
-    pairs = ggml_cont(ctx, ggml_permute(ctx, pairs, 1, 0, 2, 3));
-    return ggml_reshape_3d(ctx, pairs, n_rot, x->ne[1], x->ne[2]);
 }
 
 llama_model_bailingmoe3::graph::graph(const llm_graph_params & params) :
