@@ -1120,9 +1120,17 @@ struct mtmd_context {
                     img_end = "<|vision_end|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_qwen3vl>(models.v.get());
                 } break;
+            case PROJECTOR_TYPE_LING3VL:
+                {
+                    // <|vision_start|> ... (image embeddings) ... <|vision_end|>, a video between <|video_start|> and <|video_end|>
+                    img_beg = "<|vision_start|>";
+                    img_end = "<|vision_end|>";
+                    vid_beg = "<|video_start|>";
+                    vid_end = "<|video_end|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_ling3vl>(models.v.get());
+                } break;
             case PROJECTOR_TYPE_QWEN2VL:
             case PROJECTOR_TYPE_QWEN25VL:
-            case PROJECTOR_TYPE_LING3VL:
             case PROJECTOR_TYPE_MIMOVL:
             case PROJECTOR_TYPE_MAGEVL:
                 {
@@ -4703,14 +4711,21 @@ mtmd_video_config mtmd_video_config_init(mtmd_video_template tmpl, const mtmd_im
 
     // matches Qwen3VLVideoProcessor and Lfm3VlVideoProcessor: 2 fps sampling with a [4, 768] frame clamp
     // LFM3-Omni samples at most 384 frames and hears the soundtrack
+    // Ling 3 VL (bailingmm_utils_video.py v1_smart_nframes): 2 fps, at least 1 frame and at most 32, an even number
     cfg.fps = 2.0f;
     if (src_n_frames <= 0 || src_fps <= 0.0f) {
         return cfg;
     }
 
-    int32_t n = (int32_t)((double) src_n_frames / src_fps * cfg.fps);
-    n = std::clamp(n, 4, tmpl == MTMD_VIDEO_TEMPLATE_LFM3_OMNI ? 384 : 768);
-    n = std::min(n, src_n_frames);
+    int32_t n;
+    if (tmpl == MTMD_VIDEO_TEMPLATE_LING3VL) {
+        const int32_t max_frames = std::max(1, std::min(32, src_n_frames) / 2 * 2);
+        n = (int32_t) std::min({ std::max(1.0, (double) src_n_frames / src_fps * cfg.fps), (double) max_frames, (double) src_n_frames });
+    } else {
+        n = (int32_t)((double) src_n_frames / src_fps * cfg.fps);
+        n = std::clamp(n, 4, tmpl == MTMD_VIDEO_TEMPLATE_LFM3_OMNI ? 384 : 768);
+        n = std::min(n, src_n_frames);
+    }
     cfg.n_frames = n;
 
     mtmd_image_size size;
@@ -4731,6 +4746,9 @@ mtmd_video_config mtmd_get_video_config(const mtmd_context * ctx,
             break;
         case PROJECTOR_TYPE_QWEN3VL:
             tmpl = MTMD_VIDEO_TEMPLATE_QWEN3VL;
+            break;
+        case PROJECTOR_TYPE_LING3VL:
+            tmpl = MTMD_VIDEO_TEMPLATE_LING3VL;
             break;
         default:
             break;

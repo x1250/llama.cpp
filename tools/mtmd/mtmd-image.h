@@ -168,6 +168,12 @@ struct mtmd_image_preprocessor_lfm3vl : mtmd_image_preprocessor_qwen3vl {
     mtmd_image_size target_size(const mtmd_image_size & original_size) const override;
 };
 
+// Ling 3 VL, same as qwen3vl, video frames are sized as its processor (bailingmm_utils_video.py v1_fetch_video)
+struct mtmd_image_preprocessor_ling3vl : mtmd_image_preprocessor_qwen3vl {
+    using mtmd_image_preprocessor_qwen3vl::mtmd_image_preprocessor_qwen3vl;
+    bool get_video_frame_size(int n_frames, int width, int height, mtmd_image_size & out) const override;
+};
+
 // GLM 5.3 flash, similar to dyn_size, but each edge is aligned up to patch_size*n_merge, and max budget is met by a search over the height with the width scaled proportionally
 struct mtmd_image_preprocessor_glm5v : mtmd_image_preprocessor {
     mtmd_image_preprocessor_glm5v(const mtmd_model * model) : mtmd_image_preprocessor(model) {}

@@ -509,6 +509,53 @@ MAKE_TEST(test_video_sequence_qwen3vl) {
     }
 }
 
+// Ling 3 VL: the frames, sizes and stamps of its processor (bailingmm_utils_video.py v1, image_processing_bailingmm2.py)
+MAKE_TEST(test_video_ling3vl) {
+    mtmd_hparams hparams;
+    hparams.patch_size = 16;
+    hparams.n_merge = 2;
+    const mtmd_image_preprocessor_ling3vl preproc(hparams);
+
+    // { source video, expected number of frames, frame size and sequence from the reference's own functions }
+    const std::vector<std::tuple<mtmd_helper_video_stream_info, int32_t, mtmd_image_size, std::string>> cases = {
+        { {  720, 358, 24.0f, 240, -1.0f }, 20, { 704, 352 },
+            "<0.2 seconds>[0][12]<1.2 seconds>[25][37]<2.2 seconds>[50][62]<3.2 seconds>[75][88]<4.2 seconds>[100][113]"
+            "<5.2 seconds>[125][138]<6.2 seconds>[150][163]<7.2 seconds>[176][188]<8.2 seconds>[201][213]<9.2 seconds>[226][239]" },
+        // odd frame count: the reference pads the last group with a copy of its frame, stamped as the frame
+        { {  640, 480, 10.0f,  35, -1.0f },  7, { 640, 480 },
+            "<0.2 seconds>[0][5]<1.2 seconds>[11][17]<2.2 seconds>[22][28]<3.0 seconds>[34]" },
+        // shorter than half a second at 2 fps: one frame
+        { {  320, 240, 30.0f,   3, -1.0f },  1, { 320, 256 }, "<0.0 seconds>[0]" },
+        { { 1920, 1080, 30.0f, 300, -1.0f }, 20, { 896, 512 },
+            "<0.2 seconds>[0][15]<1.2 seconds>[31][47]<2.2 seconds>[62][78]<3.2 seconds>[94][110]<4.2 seconds>[125][141]"
+            "<5.2 seconds>[157][173]<6.2 seconds>[188][204]<7.2 seconds>[220][236]<8.2 seconds>[251][267]<9.2 seconds>[283][299]" },
+        // at most 32 frames, the pixels shared by them
+        { {  480, 854, 25.0f, 1500, -1.0f }, 32, { 384, 704 },
+            "<0.9 seconds>[0][48]<4.7 seconds>[96][145]<8.4 seconds>[193][241]<12.2 seconds>[290][338]<15.9 seconds>[386][435]"
+            "<19.7 seconds>[483][531]<23.4 seconds>[580][628]<27.2 seconds>[676][725]<30.9 seconds>[773][822]<34.7 seconds>[870][918]"
+            "<38.4 seconds>[967][1015]<42.2 seconds>[1063][1112]<45.9 seconds>[1160][1208]<49.7 seconds>[1257][1305]<53.4 seconds>[1353][1402]"
+            "<57.2 seconds>[1450][1499]" },
+    };
+
+    for (const auto & [src, expected_n_frames, expected_size, expected] : cases) {
+        const std::string name = std::to_string(src.n_frames) + " frames of " + std::to_string(src.width) + "x" + std::to_string(src.height);
+        const mtmd_video_config cfg = mtmd_video_config_init(MTMD_VIDEO_TEMPLATE_LING3VL, &preproc, src.width, src.height, src.n_frames, src.fps);
+        t.assert_equal(name + " fps", 2.0f, cfg.fps);
+        t.assert_equal(name + " n_frames", expected_n_frames, cfg.n_frames);
+        test_video_source video(src.n_frames);
+        video.configure(cfg, src, 0.0f);
+        video.src_alive = true;
+        t.assert_equal(name + " frame size", image_size_to_str(expected_size), image_size_to_str({ (int) video.info.width, (int) video.info.height }));
+        t.assert_equal(name + " sequence", expected, video_sequence_to_str(t, video));
+    }
+
+    // a 20-minute 1920x1080 video: 32 frames
+    mtmd_image_size size;
+    t.assert_true("32 frames of 1920x1080 have a frame size", preproc.get_video_frame_size(32, 1920, 1080, size));
+    t.assert_equal("32 frames of 1920x1080 frame size", std::string("704x384"), image_size_to_str(size));
+    t.assert_equal("36000 frames n_frames", 32, mtmd_video_config_init(MTMD_VIDEO_TEMPLATE_LING3VL, &preproc, 1920, 1080, 36000, 30.0f).n_frames);
+}
+
 // the soundtrack of each group comes after its frames
 MAKE_TEST(test_video_sequence_lfm3_omni) {
     mtmd_hparams hparams;

@@ -916,6 +916,32 @@ mtmd_image_preproc_out mtmd_image_preprocessor_qwen3vl::resize_to(const mtmd_ima
 }
 
 //
+// mtmd_image_preprocessor_ling3vl
+//
+
+bool mtmd_image_preprocessor_ling3vl::get_video_frame_size(int n_frames, int width, int height, mtmd_image_size & out) const {
+    // v1_fetch_video: min_pixels 43008 and a total of 4718592 pixels shared by the frames, counted in pairs; its
+    // smart_resize clamps each edge to the factor before the pixel checks and compares with the budget in float
+    const int    factor     = hparams.patch_size * hparams.n_merge;
+    const double min_pixels = 43008;
+    const double max_pixels = std::max(4718592.0 / n_frames * 2, (double) (int64_t) (min_pixels * 1.05));
+
+    int h_bar = std::max(factor, static_cast<int>(std::nearbyint(static_cast<double>(height) / factor)) * factor);
+    int w_bar = std::max(factor, static_cast<int>(std::nearbyint(static_cast<double>(width)  / factor)) * factor);
+    if (static_cast<double>(h_bar) * w_bar > max_pixels) {
+        const double beta = std::sqrt(static_cast<double>(height) * width / max_pixels);
+        h_bar = static_cast<int>(std::floor(height / beta / factor)) * factor;
+        w_bar = static_cast<int>(std::floor(width  / beta / factor)) * factor;
+    } else if (static_cast<double>(h_bar) * w_bar < min_pixels) {
+        const double beta = std::sqrt(min_pixels / (static_cast<double>(height) * width));
+        h_bar = static_cast<int>(std::ceil(height * beta / factor)) * factor;
+        w_bar = static_cast<int>(std::ceil(width  * beta / factor)) * factor;
+    }
+    out = { std::max(factor, w_bar), std::max(factor, h_bar) };
+    return true;
+}
+
+//
 // mtmd_image_preprocessor_lfm3vl
 //
 

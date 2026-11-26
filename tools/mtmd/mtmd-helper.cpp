@@ -578,7 +578,8 @@ mtmd_helper_video_seq::~mtmd_helper_video_seq() {
 }
 
 int32_t mtmd_helper_video_seq::ts_per_n_frames() const {
-    return tmpl == MTMD_VIDEO_TEMPLATE_LFM3 || tmpl == MTMD_VIDEO_TEMPLATE_LFM3_OMNI || tmpl == MTMD_VIDEO_TEMPLATE_QWEN3VL ? 2 : 0;
+    return tmpl == MTMD_VIDEO_TEMPLATE_LFM3 || tmpl == MTMD_VIDEO_TEMPLATE_LFM3_OMNI || tmpl == MTMD_VIDEO_TEMPLATE_QWEN3VL ||
+           tmpl == MTMD_VIDEO_TEMPLATE_LING3VL ? 2 : 0;
 }
 
 void mtmd_helper_video_seq::configure(const mtmd_video_config & cfg, const mtmd_helper_video_stream_info & src, float fps_target_arg) {
@@ -599,11 +600,13 @@ void mtmd_helper_video_seq::configure(const mtmd_video_config & cfg, const mtmd_
         target_frames = n;
         fps_target    = (float) n / duration;
 
-        // same frames as the reference processors: round(linspace(0, n_frames - 1, n))
+        // same frames as the reference processors: round(linspace(0, n_frames - 1, n)); Ling 3 VL's truncates
+        // (np.linspace(..., dtype=int)), and linspace ends exactly on the last frame
         const double step = n > 1 ? (double) (src.n_frames - 1) / (n - 1) : 0.0;
         frame_indices.resize(n);
         for (int32_t i = 0; i < n; i++) {
-            frame_indices[i] = (int32_t) std::nearbyint(i * step);
+            frame_indices[i] = tmpl != MTMD_VIDEO_TEMPLATE_LING3VL ? (int32_t) std::nearbyint(i * step)
+                             : i == n - 1 && n > 1 ? src.n_frames - 1 : (int32_t) (i * step);
         }
         src_fps      = src.fps;
         n_src_frames = src.n_frames;
@@ -777,7 +780,13 @@ int32_t mtmd_helper_video_seq::read_next(mtmd_bitmap ** out_bitmap, char ** out_
                 // stamp from the source frames; a short last group repeats its last frame
                 const size_t first = idx;
                 const size_t last  = std::min(first + ts_per_n_frames - 1, frame_indices.size() - 1);
-                ts_s = (frame_indices[first] / src_fps + frame_indices[last] / src_fps) / 2.0;
+                if (tmpl == MTMD_VIDEO_TEMPLATE_LING3VL) {
+                    // Ling 3 VL's processor stamps frame i at i / fps, the fps of the sampled frames over the source
+                    const double fps_smp = (double) frame_indices.size() / n_src_frames * src_fps;
+                    ts_s = (first / fps_smp + last / fps_smp) / 2.0;
+                } else {
+                    ts_s = (frame_indices[first] / src_fps + frame_indices[last] / src_fps) / 2.0;
+                }
             }
             snprintf(ts_buf, sizeof(ts_buf), "<%.1f seconds>", ts_s);
             pending_frame = frame;
