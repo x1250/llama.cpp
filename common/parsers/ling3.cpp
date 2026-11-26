@@ -96,8 +96,11 @@ common_chat_params common_chat_params_init_ling3(const common_chat_template &   
                                     p.optional(p.literal(THINK_END)));
 
         // content between the think block and the first tool call, plus any
-        // trailing text after the last tool call, are plain content
-        auto content = p.optional(p.content(p.until_one_of({ CALL_START })));
+        // trailing text after the last tool call, are plain content. The
+        // whitespace before a call is not content: the template writes its own
+        // newline there, so kept it would come back one newline longer each turn
+        auto content_text = p.zero_or_more(p.negate(p.space() + p.literal(CALL_START)) + p.any());
+        auto content      = p.optional(p.content(content_text)) + p.space();
 
         // a trailing end-of-turn token is consumed instead of leaking into content
         auto tail = p.optional(p.content(p.until(ROLE_END))) + p.optional(p.literal(ROLE_END));

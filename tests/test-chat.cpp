@@ -4986,13 +4986,28 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_rules({ "ling3-tool-0", "ling3-arg-0-0" })
             .run();
 
-        // Closed think block, prose, then a tool call.
+        // Closed think block, prose, then a tool call. The whitespace before the
+        // call is the template's separator, not content.
         tst.test("Let me check the time.\n</think>\nChecking it now.\n" + get_time_call)
             .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
             .tools({ get_time_tool })
             .expect_reasoning("Let me check the time.\n")
-            .expect_content("Checking it now.\n")
+            .expect_content("Checking it now.")
             .expect_tool_calls({ { "get_time", R"({"city": "Paris"})", "" } })
+            .run();
+
+        tst.test("</think>\nChecking it now.\n\n\n" + get_time_call)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .expect_content("Checking it now.")
+            .expect_tool_calls({ { "get_time", R"({"city": "Paris"})", "" } })
+            .run();
+
+        // Whitespace that no tool call follows stays content.
+        tst.test("</think>\nNo call here.\n\n")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .expect_content("No call here.\n\n")
             .run();
 
         // Prose after the last tool call is content, not a parse failure.
