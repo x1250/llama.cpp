@@ -9140,12 +9140,20 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 32, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    // A ratio wider than a tile (MLA: every head on one K/V head) folds in groups of its largest divisor that fits.
+    // One query keeps the unfolded path: the scalar shader with a row per head is faster there.
+    uint32_t gqa_fold = qk_ratio;
+    if (neq1 > 1) {
+        while (gqa_fold > max_gqa || qk_ratio % gqa_fold != 0) {
+            --gqa_fold;
+        }
+    }
+    if (N <= 8 && gqa_fold > 1 && gqa_fold <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
         // and change addressing calculations to index Q's dimension 2.
-        gqa_ratio = qk_ratio;
+        gqa_ratio = gqa_fold;
         N = gqa_ratio;
         workgroups_y /= gqa_ratio;
     }
