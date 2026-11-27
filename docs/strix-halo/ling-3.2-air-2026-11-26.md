@@ -1,13 +1,14 @@
 # Ling-3.2-air on llama-server, and the rope of its MLA layers (2026-11-26)
 
 Ling-3.2-air (inclusionAI, arch `bailingmoe3`) was installed as `ling32air` in strix-halo: 42 layers (35 KDA, 7 MLA at
-layers 5, 11, ..., 41), 512 experts with 8 active, an MTP head (blk.42, unused: MTP is off), vision, 262144 of context
+layers 5, 11, ..., 41), 512 experts with 8 active, an MTP head (blk.42, MTP n-max 2 since `bd9a9b80d`, section 9), vision, 262144 of context
 x 2 slots with the manufacturer's sampling (temperature 1.0, top_p 0.95, top_k 20, thinking on). In the Director's
 first agent sessions in pi the model degenerated at long context with both GGUFs it ran on. There were two llama.cpp
 defects: the rope of the MLA layers (fixed in the fork by `3e6dd9641`, section 2) and the Ling 3 parser keeping the
 newline before a tool call in the content, which grew by one newline per turn (fixed by `d3c2177fd`, section 5). Images
 reached the model on other rope bands and at other positions than the reference's (fixed by `46ad2807f` and
-`d2f46fb65`, section 6), and videos in a generic layout (fixed by `c2c45429e`, section 7). Evidence:
+`d2f46fb65`, section 6), and videos in a generic layout (fixed by `c2c45429e`, section 7). MTP decoded at half the speed of no draft at
+127k because the attention of 2 to 8 queries ran one workgroup per head (fixed by `bd9a9b80d`, section 9). Evidence:
 `~/ProjectHub/llama.cpp-evidence/ling32air/`.
 
 ## 1. Symptom
@@ -194,3 +195,66 @@ builds (the model says "upward"), and the one item it misses answers "towards th
 mmproj, 4.9 of KV and buffers), 78.0 after the replays. The checkpoints (8 per slot, ~73 MiB each) and the prompt cache
 (4 GiB) add up to ~5.1 GiB more: `kv_gb` 11 in `config.ini` (it was 18, an estimate, which kept the launcher's gate
 ~7 GiB above what the server uses). The load dropped MemAvailable from 107.6 to 27.4 GB.
+
+## 9. Speed: MTP and the attention of 2 to 8 queries (`bd9a9b80d`)
+
+Production ran without a draft (35.2 t/s at short context, 20.2 at 127k). The MTP head of the GGUF was measured first
+with production's build (`perf.sh`, `runs/perf.out`, production sampling, base first): at short context n-max 2 gave
+58.2 t/s in code and 48.8 in prose, but at 127k it decoded 10.0 t/s against 20.2 without a draft (n-max 1: 7.3, n-max 3:
+11.5), with 0.91 of the drafts accepted. A ubatch of 2048 read the 32k prompt at 441 t/s against 385, and reset the
+compute ring at ~51k (one submission over 2 s): not adoptable.
+
+**Cause.** The per-op profile (`faprof.sh`, `GGML_VK_PERF_LOGGER`) and the op alone (`fa/fa_bench.cpp`: the MLA
+attention as the graph builds it, 576/512 dims, 32 heads on one K/V head, V a view of K, checked against the CPU
+backend) show it in the 7 MLA layers. The Vulkan flash attention folds the heads that share a K/V head into the rows of
+one workgroup only when the ratio fits a tile (`max_gqa`, 16 rows on coopmat1). MLA's ratio is 32, so the verification
+batch (2 to 8 queries) ran one workgroup per head, each reading the whole K/V: at 33k cells 7.5 ms per op against 0.8
+for one query, at 131k 30 ms against 3.0. One query takes the scalar shader with a row per head and does not suffer.
+
+**Fix.** A ratio wider than a tile folds in groups of its largest divisor that fits (2 groups of 16 heads); one query
+keeps the unfolded path. The op, median ms (`fa_bench`, base / new):
+
+| cells | 1 query | 2 | 3 | 4 | 8 |
+|---|---|---|---|---|---|
+| 8192 | 0.21 / 0.18 | 1.93 / 0.30 | 1.94 / 0.37 | 1.94 / 0.47 | 1.94 / 0.87 |
+| 33024 | 0.84 / 0.80 | 7.55 / 1.18 | 7.55 / 1.46 | 7.54 / 2.06 | 7.57 / 3.57 |
+| 131072 | 3.02 / 3.05 | 30.2 / 4.53 | 29.8 / 5.51 | 29.7 / 8.21 | 29.9 / 14.4 |
+
+The new op is closer to the CPU result: at 131k and 2 queries the largest difference is 6.7e-5 against 5.5e-4.
+
+**Gates** (`fa/mlaadopt.sh`, `fa/mlainstall.sh`): `test-backend-ops -o FLASH_ATTN_EXT` 5693/5693. Quality with
+llama-perplexity over the depth text: ubatches of 2048 (which the change does not reach) give the base exactly (KLD 0);
+ubatches of 3 at 4096 context give KLD 0.0245 and 95.53 % of the same top token, at 16k 0.0830 and 94.96 %. The
+reference is the base with `-fa off` (0.0302 / 95.48 % and 0.1006 / 94.47 %), as in Inkling: `GGML_VK_DISABLE_FUSION=1`
+changes nothing in Ling (KLD 0), so "twice the reference" would refuse any change. Ling with ubatches of 3 is very
+sensitive to rounding: two exact attentions (`-fa on` and `-fa off`) differ by KLD 0.10 at 16k. The 32k mode of
+`quality_gate.inc.sh` does not fit beside the model: llama-perplexity keeps every logit of the context in memory (32768
+x 157184 floats, 20.6 GB) and the MemFree fuse cut it twice at 5.7 GiB. Determinism with MTP n-max 2: `apex_det.py` 9/9
+identical before and after the 2048x2048 image on slot 1, and the three decodes at 127k identical in every
+configuration. The history gate on the installed build (NP=2 at 57344 cells, the 40k greedy decode with
+log-probabilities, fresh against after the image): 1024/1024 tokens identical without a draft and with MTP n-max 2 (37.4
+against 27.5 t/s there).
+
+**Speed** (`runs/mlaadopt.out`, production sampling, 512 tokens; at depth 384 greedy tokens over a 127k cached prefix):
+
+| | code | prose | Spanish | thinking | 2 requests | 127k prefill | 127k decode |
+|---|---|---|---|---|---|---|---|
+| base | 35.2 | 35.2 | 35.3 | 35.3 | 52.7 | 148 | 20.2 |
+| new, no draft | 35.1 | 35.0 | 35.2 | 35.3 | 52.7 | | |
+| new, MTP n-max 1 | 51.6 | 46.2 | 47.8 | 48.0 | 69.2 | 132 | 26.5 |
+| new, MTP n-max 2 | 59.4 | 46.9 | 50.2 | 52.3 | 71.0 | 131 | 30.6 |
+| new, MTP n-max 3 | 58.2 | 43.4 | 45.7 | 49.2 | 64.1 | 132 | 19.7 |
+| base, repeated | 35.2 | 35.2 | 35.2 | 35.2 | 52.6 | 150 | 20.1 |
+
+Production takes MTP n-max 2 (`run-server.sh`, family `ling`): +33-69 % at short context, +35 % with two requests and
++51 % at 127k. The cost is the prefill, which the MTP head reads too: -12 % at 127k, -9 % at 32k (351 against 385 t/s in
+`perf.out`). Production with MTP n-max 2 takes 80.4 GiB at load (`srv_mem.py`), 2.5 more than without a draft (section
+8): `kv_gb` 13 in `config.ini`. The greedy texts at 127k differ between the configurations from the first token: each
+decode re-reads the last 4 prompt tokens, a 4-query ubatch that now takes the folded path, and at that depth the model's
+choice between near-tied tokens follows the rounding (MTP n-max 3 against n-max 2 differ after 32 characters). The draft
+acceptance at depth follows the text: n-max 3 accepted 0.79 before the fix and 0.46 after, on another text.
+
+**Open.** The attention of one query at 131k reads ~285 MB at ~93 GB/s (the machine reaches ~203): K is read once for
+K.Q and again for V, which is the first 512 channels of the same rows. A kernel that reads each row once would take it
+from ~3.0 to ~1.6 ms per op at that bandwidth. The prefill attention grows with depth (the 7 ops take 58 % of a
+512-token ubatch at 24k).
